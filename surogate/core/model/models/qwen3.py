@@ -1,5 +1,4 @@
 from surogate.core.config.enums import LLMModelType, ChatTemplateType
-from surogate.core.model.architecture import ModelArchitecture
 from surogate.core.model.registry import register_model, ModelTemplate
 from surogate.core.model.loader import get_model_tokenizer_with_flash_attn
 
@@ -24,8 +23,7 @@ register_model(
         LLMModelType.qwen3,
         ChatTemplateType.qwen3,
         get_model_tokenizer_with_flash_attn,
-        architectures=['Qwen3ForCausalLM'],
-        model_arch=ModelArchitecture.llama))
+        architectures=['Qwen3ForCausalLM']))
 
 
 """

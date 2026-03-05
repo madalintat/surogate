@@ -31,7 +31,7 @@ class PromptTokenizingStrategy:
         self.template.set_mode(mode)
         self.template.task_type = task
         if self.template is None:
-            raise ValueError(f"Chat Template not found for the architecture {model_template.model_arch}.")
+            raise ValueError(f"Chat Template not found for the architecture {model_template.architectures}.")
 
         self.tokenizer: PreTrainedTokenizerBase = tokenizer
 

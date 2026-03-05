@@ -2,8 +2,7 @@ import json
 import re
 from typing import List, Tuple, Union, Optional
 
-from surogate.core.infer.protocol import Function
-from surogate.core.model.agent_templates import BaseAgentTemplate
+from surogate.core.model.agent_templates.base import BaseAgentTemplate, Function
 
 class HermesAgentTemplate(BaseAgentTemplate):
 

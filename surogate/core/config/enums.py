@@ -49,17 +49,3 @@ class LLMModelType:
 class MLLMModelType:
     qwen2_5_vl = 'qwen2_5_vl'
     qwen3_vl = 'qwen3_vl'
-
-class RMModelType:
-    internlm2_reward = 'internlm2_reward'
-    qwen2_reward = 'qwen2_reward'
-    qwen2_5_prm = 'qwen2_5_prm'
-    qwen2_5_math_reward = 'qwen2_5_math_reward'
-    llama3_2_reward = 'llama3_2_reward'
-    gemma_reward = 'gemma_reward'
-
-class RerankerModelType:
-    bge_reranker = 'bge_reranker'
-    modern_bert_gte_reranker = 'modern_bert_gte_reranker'
-    jina_reranker_m0 = 'jina_reranker_m0'
-    qwen3_reranker = 'qwen3_reranker'

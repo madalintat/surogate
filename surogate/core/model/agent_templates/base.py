@@ -34,7 +34,6 @@ class ReactCompatMixin:
             if action_content is None and key == keyword.action.lower():
                 action_content = content
             elif action_content is not None and key == keyword.action_input.lower():
-                from surogate.core.infer.protocol import Function
                 functions.append(Function(name=action_content, arguments=content))
                 action_content = None
 
@@ -149,3 +148,15 @@ class BaseAgentTemplate(ReactCompatMixin, ABC):
     @abstractmethod
     def _format_tools(self, tools: List[Union[str, dict]], system: str, user_message=None) -> str:
         pass
+
+
+@dataclass
+class Function:
+    name: str
+    arguments: Optional[str]
+
+    def __post_init__(self):
+        if not isinstance(self.arguments, str):
+            self.arguments = json.dumps(self.arguments)
+        self.name = self.name.strip()
+        self.arguments = self.arguments.strip()

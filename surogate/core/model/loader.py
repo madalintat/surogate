@@ -9,14 +9,11 @@ import transformers
 from packaging import version
 
 from surogate.core.hub.huggingface import HuggingFaceHub
-from surogate.core.model.attn import AttnImpl
 from surogate.core.model.hf_config import HfConfigFactory
 from surogate.core.model.model_info import ModelInfo
 from surogate.core.model.registry import MODEL_MAPPING, ModelTemplate
 from surogate.core.model.utils import fix_do_sample_warning, get_default_torch_dtype
-from surogate.core.model.patcher import get_lm_head_model, \
-    patch_getattr, \
-    patch_automodel, patch_awq_compat
+from surogate.core.model.patcher import get_lm_head_model, patch_getattr
 from surogate.utils.logger import get_logger
 
 logger = get_logger()
@@ -121,16 +118,10 @@ def get_model_and_tokenizer_from_local(
     if load_model:
         logger.info(f'model_kwargs: {model_kwargs}')
         automodel_class = automodel_class or AutoModelForCausalLM
-        context_kwargs = {
-            'model_info': model_info,
-            'model_template': model_template,
-            'automodel_class': automodel_class,
-        }
         if model is None:
-            context = partial(patch_automodel, **context_kwargs)
-            with context():
-                model = automodel_class.from_pretrained(
+            model = automodel_class.from_pretrained(
                     model_dir, config=model_config, trust_remote_code=True, **model_kwargs)
+                
 
         # fix not save modeling_xxx.py (transformers 4.45)
         # https://github.com/huggingface/transformers/issues/24737
@@ -195,7 +186,7 @@ def get_model_info_and_template(
     if model_type is not None:
         model_template = MODEL_MAPPING[model_type]
     else:
-        model_template = ModelTemplate(None, 'dummy', get_model_and_tokenizer_from_local, model_arch=None)
+        model_template = ModelTemplate(None, 'dummy', get_model_and_tokenizer_from_local)
         logger.info(f'Temporarily create model_meta: {model_template}')
 
     if torch_dtype is None:
@@ -217,7 +208,6 @@ def get_model_tokenizer_with_flash_attn(
     model_config = kwargs.get('model_config')
     if model_config is None:
         model_config = AutoConfig.from_pretrained(model_dir, trust_remote_code=True)
-    AttnImpl.update_attn_impl(model_config, kwargs.get('attn_impl'), kwargs.get('attn_impl_keys'))
     kwargs['model_config'] = model_config
     return get_model_and_tokenizer_from_local(model_dir, model_info, model_kwargs, load_model, **kwargs)
 

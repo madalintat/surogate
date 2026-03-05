@@ -4,8 +4,7 @@ from typing import Dict, Optional, Callable, Tuple, List, Type, Any, Union
 import torch
 from torch import nn
 from transformers import PreTrainedModel, PreTrainedTokenizerBase
-from surogate.core.config.enums import MLLMModelType, RMModelType, RerankerModelType
-from surogate.core.model.architecture import ModelArchitecture, MLLMComponents
+from surogate.core.config.enums import MLLMModelType
 
 MODEL_MAPPING: Dict[str, 'ModelTemplate'] = {}
 
@@ -14,8 +13,6 @@ class ModelTemplate:
     model_type: Optional[str]
     chat_template: Optional[str]
     get_function: Callable[..., Tuple[Optional[PreTrainedModel], PreTrainedTokenizerBase]]
-    model_arch: Optional[ModelArchitecture] = None
-    model_components: Optional[MLLMComponents] = None
     architectures: List[str] = field(default_factory=list)
     additional_saved_files: List[str] = field(default_factory=list)
     torch_dtype: Optional[torch.dtype] = None
@@ -32,12 +29,9 @@ class ModelTemplate:
 
 
 def register_model(model_template: ModelTemplate) -> None:
-    from .architecture import get_model_architecture
     model_type = model_template.model_type
     if model_type in MODEL_MAPPING:
         raise ValueError(f'The `{model_type}` has already been registered in the MODEL_MAPPING.')
-    if model_template.model_arch:
-        model_template.model_components = get_model_architecture(model_template.model_arch)
     MODEL_MAPPING[model_type] = model_template
 
 def get_matched_model_types(architectures: Optional[List[str]]) -> List[str]:
