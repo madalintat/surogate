@@ -1413,6 +1413,70 @@ std::vector<Operation> mamba_out_proj_backward(const BackwardRuleContext& ctx) {
 }
 
 // -----------------------------------------------------------------------------
+// Qwen3.5 chunk gated delta rule backward rule
+// Forward: out, final_state = chunk_gated_delta_rule(q, k, v, g, beta, initial_state?)
+// Backward: dq, dk, dv, dg, d_beta, d_initial_state =
+//           chunk_gated_delta_rule_backward(d_out, d_final_state, q, k, v, g, beta, initial_state?)
+// -----------------------------------------------------------------------------
+std::vector<Operation> chunk_gated_delta_rule_backward_rule(const BackwardRuleContext& ctx) {
+    std::vector<Operation> ops;
+
+    const auto& fwd = ctx.fwd_op;
+    if (fwd.inputs.size() < 5) {
+        return ops;
+    }
+
+    std::string q = fwd.inputs[0];
+    std::string k = fwd.inputs[1];
+    std::string v = fwd.inputs[2];
+    std::string g = fwd.inputs[3];
+    std::string beta = fwd.inputs[4];
+    std::string initial_state = (fwd.inputs.size() > 5) ? fwd.inputs[5] : "";
+
+    auto resolve_ref = [&](const std::string& name) -> std::string {
+        if (name.empty()) return "";
+        return ctx.is_param(name) ? name : saved_ref(name);
+    };
+
+    std::vector<std::string> inputs;
+    inputs.push_back(ctx.d_output);  // d_out
+    inputs.push_back(ctx.d_outputs.size() > 1 ? ctx.d_outputs[1] : "");  // d_final_state (optional)
+    inputs.push_back(resolve_ref(q));
+    inputs.push_back(resolve_ref(k));
+    inputs.push_back(resolve_ref(v));
+    inputs.push_back(resolve_ref(g));
+    inputs.push_back(resolve_ref(beta));
+    if (!initial_state.empty()) {
+        inputs.push_back(resolve_ref(initial_state));
+    }
+
+    std::vector<std::string> outputs;
+    outputs.push_back(ctx.needs_grad(0) ? ctx.d_inputs[0] : "");  // d_q
+    outputs.push_back(ctx.needs_grad(1) ? ctx.d_inputs[1] : "");  // d_k
+    outputs.push_back(ctx.needs_grad(2) ? ctx.d_inputs[2] : "");  // d_v
+    outputs.push_back(ctx.needs_grad(3) ? ctx.d_inputs[3] : "");  // d_g
+    outputs.push_back(ctx.needs_grad(4) ? ctx.d_inputs[4] : "");  // d_beta
+    if (!initial_state.empty() && ctx.needs_grad(5)) {
+        outputs.push_back(ctx.d_inputs[5]);  // d_initial_state
+    }
+
+    AttrMap attrs = copy_attrs(
+        fwd.attrs,
+        {"chunk_size", "scale", "use_qk_l2norm_in_kernel"},
+        "chunk_gated_delta_rule");
+
+    ops.push_back(make_operation(
+        "chunk_gated_delta_rule_backward_" + std::to_string(ctx.op_counter++),
+        "chunk_gated_delta_rule_backward",
+        "chunk_gated_delta_rule_backward",
+        inputs,
+        outputs,
+        attrs));
+
+    return ops;
+}
+
+// -----------------------------------------------------------------------------
 // EP Dispatch backward rule
 // Forward: recv_sorted, recv_scatter = ep_dispatch(permuted, routing, scatter, ...)
 // Backward: d_permuted = ep_dispatch_backward(d_recv_sorted)
@@ -1545,6 +1609,7 @@ void register_builtin_backward_rules() {
     reg.register_rule("mamba_ssm_scan", mamba_ssm_scan_backward);
     reg.register_rule("mamba_gated_rmsnorm", mamba_gated_rmsnorm_backward);
     reg.register_rule("mamba_out_proj", mamba_out_proj_backward);
+    reg.register_rule("chunk_gated_delta_rule", chunk_gated_delta_rule_backward_rule);
 }
 
 } // namespace dsl

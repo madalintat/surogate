@@ -264,6 +264,11 @@ CompiledOpType op_type_from_string(const std::string& op_type) {
         {"mamba_ssm_scan", CompiledOpType::MambaSsmScan},
         {"mamba_gated_rmsnorm", CompiledOpType::MambaGatedRMSNorm},
         {"mamba_out_proj", CompiledOpType::MambaOutProj},
+        // Qwen3.5 gated delta rule forward operations
+        {"chunk_gated_delta_rule", CompiledOpType::ChunkGatedDeltaRule},
+        {"fused_recurrent_gated_delta_rule", CompiledOpType::FusedRecurrentGatedDeltaRule},
+        // Qwen3.5 gated delta rule backward operations
+        {"chunk_gated_delta_rule_backward", CompiledOpType::ChunkGatedDeltaRuleBackward},
         // Mamba/SSM backward operations
         {"mamba_split_proj_backward", CompiledOpType::MambaSplitProjBackward},
         {"mamba_conv1d_backward", CompiledOpType::MambaConv1dBackward},
@@ -896,6 +901,31 @@ CompiledAttrs GraphCompiler::resolve_attrs(const Operation& op, CompiledOpType t
         }
     }
 
+    // Qwen3.5 gated delta rule attributes
+    if (type == CompiledOpType::ChunkGatedDeltaRule ||
+        type == CompiledOpType::FusedRecurrentGatedDeltaRule ||
+        type == CompiledOpType::ChunkGatedDeltaRuleBackward) {
+        if (auto* attr = find_attr(op.attrs, "chunk_size")) {
+            if (auto v = attr_int(*attr)) {
+                attrs.chunk_size = static_cast<int>(*v);
+            }
+        }
+        if (auto* attr = find_attr(op.attrs, "scale")) {
+            if (auto v = attr_double(*attr)) {
+                attrs.delta_rule_scale = static_cast<float>(*v);
+            } else if (auto v_int = attr_int(*attr)) {
+                attrs.delta_rule_scale = static_cast<float>(*v_int);
+            }
+        }
+        if (auto* attr = find_attr(op.attrs, "use_qk_l2norm_in_kernel")) {
+            if (auto v = attr_bool(*attr)) {
+                attrs.use_qk_l2norm_in_kernel = *v;
+            } else if (auto v_int = attr_int(*attr)) {
+                attrs.use_qk_l2norm_in_kernel = (*v_int != 0);
+            }
+        }
+    }
+
     // Pre-resolve tensor IDs for side-channel lookups (avoids runtime string hash)
     if (!attrs.shape_like.empty()) {
         // Strip __saved_ prefix if present for shape_like references
@@ -1475,6 +1505,50 @@ void GraphCompiler::infer_output_shapes(
                     out_shape.push_back(b_shape[b_shape.size() - 1]);
                 }
                 output_shapes.push_back(out_shape);
+            }
+            break;
+        }
+
+        case CompiledOpType::ChunkGatedDeltaRule:
+        case CompiledOpType::FusedRecurrentGatedDeltaRule: {
+            // Inputs:
+            //   q [B, T, H, K], k [B, T, H, K], v [B, T, H, V], g [B, T, H], beta [B, T, H]
+            //   initial_state [B, H, K, V] (optional)
+            // Outputs:
+            //   out [B, T, H, V], final_state [B, H, K, V] (optional by caller contract)
+            if (input_shapes.size() >= 3 &&
+                !input_shapes[0].empty() &&
+                !input_shapes[2].empty() &&
+                input_shapes[0].size() == 4 &&
+                input_shapes[2].size() == 4) {
+                const auto& q_shape = input_shapes[0];
+                const auto& v_shape = input_shapes[2];
+                output_shapes.push_back({q_shape[0], q_shape[1], q_shape[2], v_shape[3]});
+                output_shapes.push_back({q_shape[0], q_shape[2], q_shape[3], v_shape[3]});
+            }
+            break;
+        }
+
+        case CompiledOpType::ChunkGatedDeltaRuleBackward: {
+            // Inputs:
+            //   d_out [B,T,H,V], d_final_state [B,H,K,V] (optional), q [B,T,H,K], k [B,T,H,K],
+            //   v [B,T,H,V], g [B,T,H], beta [B,T,H], initial_state [B,H,K,V] (optional)
+            // Outputs:
+            //   d_q, d_k, d_v, d_g, d_beta, d_initial_state
+            if (input_shapes.size() >= 7 &&
+                input_shapes[2].size() == 4 &&
+                input_shapes[4].size() == 4 &&
+                input_shapes[5].size() == 3 &&
+                input_shapes[6].size() == 3) {
+                const auto& q_shape = input_shapes[2];
+                const auto& v_shape = input_shapes[4];
+                const auto& g_shape = input_shapes[5];
+                output_shapes.push_back(q_shape);  // d_q
+                output_shapes.push_back(q_shape);  // d_k
+                output_shapes.push_back(v_shape);  // d_v
+                output_shapes.push_back(g_shape);  // d_g
+                output_shapes.push_back(g_shape);  // d_beta
+                output_shapes.push_back({q_shape[0], q_shape[2], q_shape[3], v_shape[3]});  // d_initial_state
             }
             break;
         }
@@ -2509,6 +2583,71 @@ CompiledGraph GraphCompiler::compile(const Graph& graph, long B, long T) {
                         ref.dtype = compiled.inputs[0].dtype;
                         if (ref.shape.empty()) {
                             ref.shape = compiled.inputs[0].shape;
+                        }
+                    }
+                } else if (compiled.type == CompiledOpType::ChunkGatedDeltaRule ||
+                           compiled.type == CompiledOpType::FusedRecurrentGatedDeltaRule) {
+                    // output[0] = out [B, T, H, V] (match value dtype)
+                    // output[1] = final_state [B, H, K, V] (kept in FP32 for cache stability)
+                    if (i == 0) {
+                        if (compiled.inputs.size() > 2) {
+                            ref.dtype = compiled.inputs[2].dtype;
+                        } else if (!compiled.inputs.empty()) {
+                            ref.dtype = compiled.inputs[0].dtype;
+                        }
+                        if (ref.shape.empty() &&
+                            compiled.inputs.size() > 2 &&
+                            compiled.inputs[0].shape.size() == 4 &&
+                            compiled.inputs[2].shape.size() == 4) {
+                            const auto& q_shape = compiled.inputs[0].shape;
+                            const auto& v_shape = compiled.inputs[2].shape;
+                            ref.shape = {q_shape[0], q_shape[1], q_shape[2], v_shape[3]};
+                        }
+                    } else if (i == 1) {
+                        ref.dtype = ETensorDType::FP32;
+                        if (ref.shape.empty() &&
+                            compiled.inputs.size() > 2 &&
+                            compiled.inputs[0].shape.size() == 4 &&
+                            compiled.inputs[2].shape.size() == 4) {
+                            const auto& q_shape = compiled.inputs[0].shape;
+                            const auto& v_shape = compiled.inputs[2].shape;
+                            ref.shape = {q_shape[0], q_shape[2], q_shape[3], v_shape[3]};
+                        }
+                    }
+                } else if (compiled.type == CompiledOpType::ChunkGatedDeltaRuleBackward) {
+                    // output[0] d_q, output[1] d_k -> q dtype/shape
+                    // output[2] d_v -> v dtype/shape
+                    // output[3] d_g -> g dtype/shape
+                    // output[4] d_beta -> beta dtype/shape
+                    // output[5] d_initial_state -> FP32 [B,H,K,V]
+                    if (i == 0 || i == 1) {
+                        if (compiled.inputs.size() > 2) {
+                            ref.dtype = compiled.inputs[2].dtype;
+                            ref.shape = compiled.inputs[2].shape;
+                        }
+                    } else if (i == 2) {
+                        if (compiled.inputs.size() > 4) {
+                            ref.dtype = compiled.inputs[4].dtype;
+                            ref.shape = compiled.inputs[4].shape;
+                        }
+                    } else if (i == 3) {
+                        if (compiled.inputs.size() > 5) {
+                            ref.dtype = compiled.inputs[5].dtype;
+                            ref.shape = compiled.inputs[5].shape;
+                        }
+                    } else if (i == 4) {
+                        if (compiled.inputs.size() > 6) {
+                            ref.dtype = compiled.inputs[6].dtype;
+                            ref.shape = compiled.inputs[6].shape;
+                        }
+                    } else if (i == 5) {
+                        ref.dtype = ETensorDType::FP32;
+                        if (compiled.inputs.size() > 4 &&
+                            compiled.inputs[2].shape.size() == 4 &&
+                            compiled.inputs[4].shape.size() == 4) {
+                            const auto& q_shape = compiled.inputs[2].shape;
+                            const auto& v_shape = compiled.inputs[4].shape;
+                            ref.shape = {q_shape[0], q_shape[2], q_shape[3], v_shape[3]};
                         }
                     }
                 } else {

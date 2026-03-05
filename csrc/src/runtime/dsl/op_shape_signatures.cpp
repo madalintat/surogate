@@ -2184,6 +2184,276 @@ void register_builtin_shape_signatures() {
     }
 
     // ------------------------------------------------------------------------
+    // Qwen3.5 gated delta rule forward ops
+    // chunk_gated_delta_rule / fused_recurrent_gated_delta_rule
+    // ------------------------------------------------------------------------
+    {
+        OpShapeSignature sig;
+        sig.op_name = "chunk_gated_delta_rule";
+        sig.min_inputs = 5;
+        sig.max_inputs = 6;
+        sig.min_outputs = 1;
+        sig.max_outputs = 2;
+        sig.validator = [](const auto& inputs, const auto& outputs,
+                          const AttrMap&, const ShapeEnv&) {
+            if (inputs.size() < 5 || outputs.empty()) {
+                return std::make_optional(
+                    ShapeValidationError{"chunk_gated_delta_rule: requires 5-6 inputs and 1-2 outputs"});
+            }
+
+            const auto& q = inputs[0];
+            const auto& k = inputs[1];
+            const auto& v = inputs[2];
+            const auto& g = inputs[3];
+            const auto& beta = inputs[4];
+
+            if (auto err = validators::check_rank(q, 4, "q", "chunk_gated_delta_rule")) return err;
+            if (auto err = validators::check_rank(k, 4, "k", "chunk_gated_delta_rule")) return err;
+            if (auto err = validators::check_rank(v, 4, "v", "chunk_gated_delta_rule")) return err;
+            if (auto err = validators::check_rank(g, 3, "g", "chunk_gated_delta_rule")) return err;
+            if (auto err = validators::check_rank(beta, 3, "beta", "chunk_gated_delta_rule")) return err;
+
+            if (q[0] != k[0] || q[1] != k[1] || q[2] != k[2] || q[3] != k[3]) {
+                return std::make_optional(
+                    ShapeValidationError{"chunk_gated_delta_rule: q and k must have the same shape"});
+            }
+            if (q[0] != v[0] || q[1] != v[1] || q[2] != v[2]) {
+                return std::make_optional(
+                    ShapeValidationError{"chunk_gated_delta_rule: q/k and v must share B/T/H"});
+            }
+            if (g[0] != q[0] || g[1] != q[1] || g[2] != q[2]) {
+                return std::make_optional(
+                    ShapeValidationError{"chunk_gated_delta_rule: g must be [B,T,H]"});
+            }
+            if (beta[0] != q[0] || beta[1] != q[1] || beta[2] != q[2]) {
+                return std::make_optional(
+                    ShapeValidationError{"chunk_gated_delta_rule: beta must be [B,T,H]"});
+            }
+
+            if (inputs.size() > 5 && !inputs[5].empty()) {
+                const auto& initial_state = inputs[5];
+                if (auto err = validators::check_rank(initial_state, 4, "initial_state", "chunk_gated_delta_rule")) {
+                    return err;
+                }
+                if (initial_state[0] != q[0] || initial_state[1] != q[2] ||
+                    initial_state[2] != q[3] || initial_state[3] != v[3]) {
+                    return std::make_optional(
+                        ShapeValidationError{"chunk_gated_delta_rule: initial_state must be [B,H,K,V]"});
+                }
+            }
+
+            if (!outputs[0].empty()) {
+                const auto& out = outputs[0];
+                if (auto err = validators::check_rank(out, 4, "out", "chunk_gated_delta_rule")) return err;
+                if (out[0] != q[0] || out[1] != q[1] || out[2] != q[2] || out[3] != v[3]) {
+                    return std::make_optional(
+                        ShapeValidationError{"chunk_gated_delta_rule: out must be [B,T,H,V]"});
+                }
+            }
+            if (outputs.size() > 1 && !outputs[1].empty()) {
+                const auto& final_state = outputs[1];
+                if (auto err = validators::check_rank(final_state, 4, "final_state", "chunk_gated_delta_rule")) {
+                    return err;
+                }
+                if (final_state[0] != q[0] || final_state[1] != q[2] ||
+                    final_state[2] != q[3] || final_state[3] != v[3]) {
+                    return std::make_optional(
+                        ShapeValidationError{"chunk_gated_delta_rule: final_state must be [B,H,K,V]"});
+                }
+            }
+
+            return std::optional<ShapeValidationError>();
+        };
+        reg.register_signature(sig);
+    }
+
+    {
+        OpShapeSignature sig;
+        sig.op_name = "fused_recurrent_gated_delta_rule";
+        sig.min_inputs = 5;
+        sig.max_inputs = 6;
+        sig.min_outputs = 1;
+        sig.max_outputs = 2;
+        sig.validator = [](const auto& inputs, const auto& outputs,
+                          const AttrMap&, const ShapeEnv&) {
+            if (inputs.size() < 5 || outputs.empty()) {
+                return std::make_optional(
+                    ShapeValidationError{"fused_recurrent_gated_delta_rule: requires 5-6 inputs and 1-2 outputs"});
+            }
+
+            const auto& q = inputs[0];
+            const auto& k = inputs[1];
+            const auto& v = inputs[2];
+            const auto& g = inputs[3];
+            const auto& beta = inputs[4];
+
+            if (auto err = validators::check_rank(q, 4, "q", "fused_recurrent_gated_delta_rule")) return err;
+            if (auto err = validators::check_rank(k, 4, "k", "fused_recurrent_gated_delta_rule")) return err;
+            if (auto err = validators::check_rank(v, 4, "v", "fused_recurrent_gated_delta_rule")) return err;
+            if (auto err = validators::check_rank(g, 3, "g", "fused_recurrent_gated_delta_rule")) return err;
+            if (auto err = validators::check_rank(beta, 3, "beta", "fused_recurrent_gated_delta_rule")) return err;
+
+            if (q[0] != k[0] || q[1] != k[1] || q[2] != k[2] || q[3] != k[3]) {
+                return std::make_optional(
+                    ShapeValidationError{"fused_recurrent_gated_delta_rule: q and k must have the same shape"});
+            }
+            if (q[0] != v[0] || q[1] != v[1] || q[2] != v[2]) {
+                return std::make_optional(
+                    ShapeValidationError{"fused_recurrent_gated_delta_rule: q/k and v must share B/T/H"});
+            }
+            if (g[0] != q[0] || g[1] != q[1] || g[2] != q[2]) {
+                return std::make_optional(
+                    ShapeValidationError{"fused_recurrent_gated_delta_rule: g must be [B,T,H]"});
+            }
+            if (beta[0] != q[0] || beta[1] != q[1] || beta[2] != q[2]) {
+                return std::make_optional(
+                    ShapeValidationError{"fused_recurrent_gated_delta_rule: beta must be [B,T,H]"});
+            }
+
+            if (inputs.size() > 5 && !inputs[5].empty()) {
+                const auto& initial_state = inputs[5];
+                if (auto err = validators::check_rank(
+                    initial_state, 4, "initial_state", "fused_recurrent_gated_delta_rule")) {
+                    return err;
+                }
+                if (initial_state[0] != q[0] || initial_state[1] != q[2] ||
+                    initial_state[2] != q[3] || initial_state[3] != v[3]) {
+                    return std::make_optional(
+                        ShapeValidationError{"fused_recurrent_gated_delta_rule: initial_state must be [B,H,K,V]"});
+                }
+            }
+
+            if (!outputs[0].empty()) {
+                const auto& out = outputs[0];
+                if (auto err = validators::check_rank(out, 4, "out", "fused_recurrent_gated_delta_rule")) return err;
+                if (out[0] != q[0] || out[1] != q[1] || out[2] != q[2] || out[3] != v[3]) {
+                    return std::make_optional(
+                        ShapeValidationError{"fused_recurrent_gated_delta_rule: out must be [B,T,H,V]"});
+                }
+            }
+            if (outputs.size() > 1 && !outputs[1].empty()) {
+                const auto& final_state = outputs[1];
+                if (auto err = validators::check_rank(
+                    final_state, 4, "final_state", "fused_recurrent_gated_delta_rule")) {
+                    return err;
+                }
+                if (final_state[0] != q[0] || final_state[1] != q[2] ||
+                    final_state[2] != q[3] || final_state[3] != v[3]) {
+                    return std::make_optional(
+                        ShapeValidationError{"fused_recurrent_gated_delta_rule: final_state must be [B,H,K,V]"});
+                }
+            }
+
+            return std::optional<ShapeValidationError>();
+        };
+        reg.register_signature(sig);
+    }
+
+    // ------------------------------------------------------------------------
+    // Qwen3.5 chunk gated delta rule backward
+    // ------------------------------------------------------------------------
+    {
+        OpShapeSignature sig;
+        sig.op_name = "chunk_gated_delta_rule_backward";
+        sig.min_inputs = 7;
+        sig.max_inputs = 8;
+        sig.min_outputs = 5;
+        sig.max_outputs = 6;
+        sig.validator = [](const auto& inputs, const auto& outputs,
+                          const AttrMap&, const ShapeEnv&) {
+            if (inputs.size() < 7 || outputs.size() < 5) {
+                return std::make_optional(
+                    ShapeValidationError{"chunk_gated_delta_rule_backward: requires 7-8 inputs and 5-6 outputs"});
+            }
+
+            const auto& d_out = inputs[0];
+            const auto& q = inputs[2];
+            const auto& k = inputs[3];
+            const auto& v = inputs[4];
+            const auto& g = inputs[5];
+            const auto& beta = inputs[6];
+
+            if (auto err = validators::check_rank(d_out, 4, "d_out", "chunk_gated_delta_rule_backward")) return err;
+            if (auto err = validators::check_rank(q, 4, "q", "chunk_gated_delta_rule_backward")) return err;
+            if (auto err = validators::check_rank(k, 4, "k", "chunk_gated_delta_rule_backward")) return err;
+            if (auto err = validators::check_rank(v, 4, "v", "chunk_gated_delta_rule_backward")) return err;
+            if (auto err = validators::check_rank(g, 3, "g", "chunk_gated_delta_rule_backward")) return err;
+            if (auto err = validators::check_rank(beta, 3, "beta", "chunk_gated_delta_rule_backward")) return err;
+
+            if (!inputs[1].empty()) {
+                if (auto err = validators::check_rank(
+                    inputs[1], 4, "d_final_state", "chunk_gated_delta_rule_backward")) {
+                    return err;
+                }
+            }
+            if (inputs.size() > 7 && !inputs[7].empty()) {
+                if (auto err = validators::check_rank(
+                    inputs[7], 4, "initial_state", "chunk_gated_delta_rule_backward")) {
+                    return err;
+                }
+            }
+
+            if (q[0] != k[0] || q[1] != k[1] || q[2] != k[2] || q[3] != k[3]) {
+                return std::make_optional(
+                    ShapeValidationError{"chunk_gated_delta_rule_backward: q and k must have the same shape"});
+            }
+            if (q[0] != v[0] || q[1] != v[1] || q[2] != v[2]) {
+                return std::make_optional(
+                    ShapeValidationError{"chunk_gated_delta_rule_backward: q/k and v must share B/T/H"});
+            }
+            if (d_out[0] != v[0] || d_out[1] != v[1] || d_out[2] != v[2] || d_out[3] != v[3]) {
+                return std::make_optional(
+                    ShapeValidationError{"chunk_gated_delta_rule_backward: d_out must be [B,T,H,V]"});
+            }
+            if (g[0] != q[0] || g[1] != q[1] || g[2] != q[2]) {
+                return std::make_optional(
+                    ShapeValidationError{"chunk_gated_delta_rule_backward: g must be [B,T,H]"});
+            }
+            if (beta[0] != q[0] || beta[1] != q[1] || beta[2] != q[2]) {
+                return std::make_optional(
+                    ShapeValidationError{"chunk_gated_delta_rule_backward: beta must be [B,T,H]"});
+            }
+
+            if (!outputs[0].empty() && outputs[0] != q) {
+                return std::make_optional(
+                    ShapeValidationError{"chunk_gated_delta_rule_backward: d_q must match q shape"});
+            }
+            if (!outputs[1].empty() && outputs[1] != k) {
+                return std::make_optional(
+                    ShapeValidationError{"chunk_gated_delta_rule_backward: d_k must match k shape"});
+            }
+            if (!outputs[2].empty() && outputs[2] != v) {
+                return std::make_optional(
+                    ShapeValidationError{"chunk_gated_delta_rule_backward: d_v must match v shape"});
+            }
+            if (!outputs[3].empty() && outputs[3] != g) {
+                return std::make_optional(
+                    ShapeValidationError{"chunk_gated_delta_rule_backward: d_g must match g shape"});
+            }
+            if (!outputs[4].empty() && outputs[4] != beta) {
+                return std::make_optional(
+                    ShapeValidationError{"chunk_gated_delta_rule_backward: d_beta must match beta shape"});
+            }
+            if (outputs.size() > 5 && !outputs[5].empty()) {
+                const auto& d_initial_state = outputs[5];
+                if (auto err = validators::check_rank(
+                    d_initial_state, 4, "d_initial_state", "chunk_gated_delta_rule_backward")) {
+                    return err;
+                }
+                if (d_initial_state[0] != q[0] || d_initial_state[1] != q[2] ||
+                    d_initial_state[2] != q[3] || d_initial_state[3] != v[3]) {
+                    return std::make_optional(
+                        ShapeValidationError{
+                            "chunk_gated_delta_rule_backward: d_initial_state must be [B,H,K,V]"});
+                }
+            }
+
+            return std::optional<ShapeValidationError>();
+        };
+        reg.register_signature(sig);
+    }
+
+    // ------------------------------------------------------------------------
     // MoE Sigmoid: probs = moe_sigmoid(logits)
     // Input: [num_tokens, num_experts], Output: [num_tokens, num_experts]
     // ------------------------------------------------------------------------

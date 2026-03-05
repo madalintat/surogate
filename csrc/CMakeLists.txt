@@ -332,6 +332,7 @@ target_sources(surogate-common PRIVATE
     src/runtime/ops/mamba_ssm_scan.cpp
     src/runtime/ops/mamba_gated_rmsnorm.cpp
     src/runtime/ops/mamba_out_proj.cpp
+    src/runtime/ops/gated_delta_rule.cpp
 
     src/config/pretrained_config.cpp
 
@@ -375,6 +376,7 @@ target_sources(surogate-common PRIVATE
     src/kernels/moe_kernels.cu
     src/kernels/ep_dispatch.cu
     src/kernels/mamba_kernels.cu
+    src/kernels/gated_delta_rule.cu
     src/kernels/rope.cu
     src/kernels/mrope.cu
     src/kernels/mask_scatter.cu
@@ -564,6 +566,7 @@ if (BUILD_TESTS OR BUILD_TESTS_UNIT OR BUILD_TESTS_INTEGRATION)
             src/testing/kernels/test-classifier.cu
             src/testing/kernels/test-grad-clip.cu
             src/testing/kernels/test-multi-tensor-norm.cu
+            src/testing/kernels/test-gated-delta-rule.cu
 
             # Quantization
             src/testing/quantization/test-qlora.cu
