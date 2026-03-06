@@ -151,6 +151,13 @@ __device__ void wmma_tn(
         }
 }
 
+__device__ __forceinline__ float warp_reduce_sum_f32(float x) {
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        x += __shfl_down_sync(0xffffffff, x, offset);
+    }
+    return x;
+}
+
 // ============================================================================
 // Forward multi-kernel workspace layout (per chunk)
 // ============================================================================
@@ -3570,7 +3577,6 @@ __global__ void gdr_bwd_phase3_wmma(
     ChunkWorkspaceLayout cwl = make_chunk_ws(Lp, Kdim, Vdim);
     float* cws = chunk_workspace + (long)block_id * chunk_ws_stride;
     float* M_ws  = cws + cwl.M_off;
-    float* W     = cws + cwl.W_off;
     float* VNEW  = cws + cwl.VNEW_off;
     float* DU    = cws + cwl.DU_off;
     float* DW    = cws + cwl.DW_off;
@@ -3676,31 +3682,61 @@ __global__ void gdr_bwd_phase3_wmma(
     __syncthreads();
 
     // DU += k@ds, then apply gating: DU → d_pre
-    // Also compute DG gating contributions and DG[L-1] += eg_last * Σ(ds*h_in)
     for (int idx = tid; idx < L * Vdim; idx += nthr) {
         const int i = idx / Vdim;
         const float e_i = expf(g_last_p3 - smem_gcum[i]);
         const float kds_val = scratch1[idx];
-        const float v_new = VNEW[idx];
-        const float pre = v_new / e_i;
         const float d_vnew = DU[idx] + kds_val;
         const float d_pre = d_vnew * e_i;
-        const float d_e_state = kds_val * pre;
 
         DU[idx] = d_pre;  // overwrite DU with d_pre
+    }
+    __syncthreads();
 
-        atomicAdd(&DG[L - 1],  d_e_state * e_i);
-        atomicAdd(&DG[i],     -d_e_state * e_i);
+    // DG gating contribution:
+    //   DG[i]     -= Σ_v (k@ds)[i,v] * VNEW[i,v]
+    //   DG[L - 1] += Σ_i,v (k@ds)[i,v] * VNEW[i,v]
+    float dg_last_local = 0.0f;
+    for (int i = tid; i < L; i += nthr) {
+        float row_sum = 0.0f;
+        for (int vv = 0; vv < Vdim; ++vv) {
+            row_sum += scratch1[i * Vdim + vv] * VNEW[i * Vdim + vv];
+        }
+        DG[i] -= row_sum;
+        dg_last_local += row_sum;
+    }
+
+    const float dg_last_warp = warp_reduce_sum_f32(dg_last_local);
+    if ((tid & 31) == 0) {
+        scratch1[tid / 32] = dg_last_warp;
+    }
+    __syncthreads();
+    if (tid == 0) {
+        float block_sum = 0.0f;
+        for (int w = 0; w < nthr / 32; ++w) {
+            block_sum += scratch1[w];
+        }
+        DG[L - 1] += block_sum;
     }
     __syncthreads();
 
     // DG[L-1] += eg_last * Σ(ds * h_in)
-    if (tid == 0) scratch1[0] = 0.0f;
+    float ds_h_local = 0.0f;
+    for (long idx = tid; idx < kv; idx += nthr) {
+        ds_h_local += dh_chunk[idx] * h_in[idx];
+    }
+    const float ds_h_warp = warp_reduce_sum_f32(ds_h_local);
+    if ((tid & 31) == 0) {
+        scratch1[tid / 32] = ds_h_warp;
+    }
     __syncthreads();
-    for (long idx = tid; idx < kv; idx += nthr)
-        atomicAdd(&scratch1[0], dh_chunk[idx] * h_in[idx]);
-    __syncthreads();
-    if (tid == 0) DG[L - 1] += scratch1[0] * eg_last_p3;
+    if (tid == 0) {
+        float block_sum = 0.0f;
+        for (int w = 0; w < nthr / 32; ++w) {
+            block_sum += scratch1[w];
+        }
+        DG[L - 1] += block_sum * eg_last_p3;
+    }
     __syncthreads();
 
     // ================================================================
@@ -3766,7 +3802,7 @@ __global__ void gdr_bwd_phase3_wmma(
     wmma_tn<TQ>(buf1, Lp, buf2, Vdim, scratch1, Vdim, Lp, Vdim, Lp);
     __syncthreads();
 
-    // Load raw v → buf2 for DB
+    // Load raw v → buf2 for DB (and later reuse for beta*V in Step 3)
     for (int idx = tid; idx < Lp * Vdim; idx += nthr) {
         const int pos = idx / Vdim, vv = idx % Vdim;
         buf2[idx] = (pos < L) ?
@@ -3819,12 +3855,12 @@ __global__ void gdr_bwd_phase3_wmma(
     // ================================================================
     // Step 3: dM = DU @ (bv)^T + DW @ bkg^T
     // ================================================================
-    // beta*V → buf2[Lp×V]
+    // beta*V → buf2[Lp×V] (reuse raw-v values already in buf2)
     for (int idx = tid; idx < Lp * Vdim; idx += nthr) {
-        const int pos = idx / Vdim, vv = idx % Vdim;
+        const int pos = idx / Vdim;
         float val = 0.0f;
         if (pos < L) {
-            float vraw = to_float(v_global[(((long)b * Tlen + cs + pos) * H + h) * Vdim + vv]);
+            float vraw = to_float(buf2[idx]);
             val = bf16_trunc<TQ>(vraw * smem_beta[pos]);
         }
         buf2[idx] = from_float<TQ>(val);
@@ -3910,7 +3946,10 @@ __global__ void gdr_bwd_phase3_wmma(
         scratch2[idx] = 0.0f;  // ddot_sym accumulator
     __syncthreads();
 
-    // Process lower triangle: compute DB, DG and form ddot_sym
+    // Process lower triangle:
+    //   - form ddot_sym for DK matmul in scratch2
+    //   - stash DB pair contributions in scratch1 lower triangle
+    //   - stash DG pair contributions in tmp_area lower triangle
     for (int idx = tid; idx < L * L; idx += nthr) {
         const int i = idx / L, j = idx % L;
         if (j >= i) continue;
@@ -3920,17 +3959,33 @@ __global__ void gdr_bwd_phase3_wmma(
         const float dot_k = tmp_area[i * Lp + j];  // precomputed kkt
         const float val = dot_k * exp_ij;
 
-        atomicAdd(&DB[i], a_grad * val);
+        const float db_pair = a_grad * val;
         const float dval = a_grad * smem_beta[i];
         const float ddot = dval * exp_ij;
-        const float dexp = dval * dot_k;
+        const float dg_pair = dval * dot_k * exp_ij;
 
-        atomicAdd(&DG[i],  dexp * exp_ij);
-        atomicAdd(&DG[j], -dexp * exp_ij);
+        scratch1[i * Lp + j] = db_pair;
+        tmp_area[i * Lp + j] = dg_pair;
 
         // Store symmetric ddot for DK matmul
         scratch2[i * Lp + j] = ddot;
         scratch2[j * Lp + i] = ddot;
+    }
+    __syncthreads();
+
+    // Reduce pairwise contributions into DB and DG without atomics.
+    for (int i = tid; i < L; i += nthr) {
+        float db_acc = 0.0f;
+        float dg_acc = 0.0f;
+        for (int j = 0; j < i; ++j) {
+            db_acc += scratch1[i * Lp + j];
+            dg_acc += tmp_area[i * Lp + j];
+        }
+        for (int j = i + 1; j < L; ++j) {
+            dg_acc -= tmp_area[j * Lp + i];
+        }
+        DB[i] += db_acc;
+        DG[i] += dg_acc;
     }
     __syncthreads();
 
