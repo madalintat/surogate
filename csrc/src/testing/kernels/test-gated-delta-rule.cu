@@ -196,18 +196,27 @@ json benchmark_case(const BenchConfig& cfg, int warmup_iters, int bench_iters) {
     const std::size_t n_checkpoints =
         static_cast<std::size_t>(B) * H * static_cast<std::size_t>(num_chunks + 1) * K * V;
     const int Lp = 64;
-    const std::size_t chunk_ws_stride =
-        static_cast<std::size_t>(Lp) * Lp * 2 +     // M + A
-        static_cast<std::size_t>(Lp) * K +           // W
-        static_cast<std::size_t>(Lp) * V +           // VNEW
-        static_cast<std::size_t>(Lp) * V +           // DU
-        static_cast<std::size_t>(Lp) * K +           // DW
-        static_cast<std::size_t>(Lp) * K +           // DQ
-        static_cast<std::size_t>(Lp) * K +           // DK
-        static_cast<std::size_t>(Lp) * 2 +           // DG + DB
-        static_cast<std::size_t>(K) * V +            // DHT1
-        static_cast<std::size_t>(K) * K +            // C (correction matrix)
-        1;                                            // EG (exp(g_last))
+    constexpr std::size_t kWsAlignFloats = 128 / sizeof(float);
+    const std::size_t c_storage_floats =
+        (static_cast<std::size_t>(K) * K * sizeof(nv_bfloat16) + sizeof(float) - 1) / sizeof(float);
+    auto align_up = [](std::size_t x, std::size_t align) {
+        return ((x + align - 1) / align) * align;
+    };
+    std::size_t chunk_ws_stride = 0;
+    chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + static_cast<std::size_t>(Lp) * Lp; // M
+    chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + static_cast<std::size_t>(Lp) * Lp; // A
+    chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + static_cast<std::size_t>(Lp) * K;  // W
+    chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + static_cast<std::size_t>(Lp) * V;  // VNEW
+    chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + static_cast<std::size_t>(Lp) * V;  // DU
+    chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + static_cast<std::size_t>(Lp) * K;  // DW
+    chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + static_cast<std::size_t>(Lp) * K;  // DQ
+    chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + static_cast<std::size_t>(Lp) * K;  // DK
+    chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + static_cast<std::size_t>(Lp);      // DG
+    chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + static_cast<std::size_t>(Lp);      // DB
+    chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + static_cast<std::size_t>(K) * V;   // DHT1
+    chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + c_storage_floats;                  // C packed as bf16
+    chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + 1;                                  // EG
+    chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats);                                       // total stride
     const std::size_t dh_storage_per_chunk = static_cast<std::size_t>(K) * V;
     const std::size_t workspace_size =
         static_cast<std::size_t>(num_chunks) * chunk_ws_stride
@@ -405,18 +414,27 @@ TEST_CASE("gated delta rule deterministic surogate value dump", "[kernels][gated
     thrust::device_vector<nv_bfloat16> d_dout = to_device(to_bf16(d_out_f));
     thrust::device_vector<float> d_dfinal = to_device(d_final_state_f);
     const int Lp = 64;
-    const std::size_t chunk_ws_stride =
-        static_cast<std::size_t>(Lp) * Lp * 2 +     // M + A
-        static_cast<std::size_t>(Lp) * K +           // W
-        static_cast<std::size_t>(Lp) * V +           // VNEW
-        static_cast<std::size_t>(Lp) * V +           // DU
-        static_cast<std::size_t>(Lp) * K +           // DW
-        static_cast<std::size_t>(Lp) * K +           // DQ
-        static_cast<std::size_t>(Lp) * K +           // DK
-        static_cast<std::size_t>(Lp) * 2 +           // DG + DB
-        static_cast<std::size_t>(K) * V +            // DHT1
-        static_cast<std::size_t>(K) * K +            // C (correction matrix)
-        1;                                            // EG (exp(g_last))
+    constexpr std::size_t kWsAlignFloats = 128 / sizeof(float);
+    const std::size_t c_storage_floats =
+        (static_cast<std::size_t>(K) * K * sizeof(nv_bfloat16) + sizeof(float) - 1) / sizeof(float);
+    auto align_up = [](std::size_t x, std::size_t align) {
+        return ((x + align - 1) / align) * align;
+    };
+    std::size_t chunk_ws_stride = 0;
+    chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + static_cast<std::size_t>(Lp) * Lp; // M
+    chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + static_cast<std::size_t>(Lp) * Lp; // A
+    chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + static_cast<std::size_t>(Lp) * K;  // W
+    chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + static_cast<std::size_t>(Lp) * V;  // VNEW
+    chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + static_cast<std::size_t>(Lp) * V;  // DU
+    chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + static_cast<std::size_t>(Lp) * K;  // DW
+    chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + static_cast<std::size_t>(Lp) * K;  // DQ
+    chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + static_cast<std::size_t>(Lp) * K;  // DK
+    chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + static_cast<std::size_t>(Lp);      // DG
+    chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + static_cast<std::size_t>(Lp);      // DB
+    chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + static_cast<std::size_t>(K) * V;   // DHT1
+    chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + c_storage_floats;                  // C packed as bf16
+    chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + 1;                                  // EG
+    chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats);                                       // total stride
     const std::size_t dh_storage_per_chunk = static_cast<std::size_t>(K) * V;
     const std::size_t workspace_size =
         static_cast<std::size_t>(num_chunks) * chunk_ws_stride

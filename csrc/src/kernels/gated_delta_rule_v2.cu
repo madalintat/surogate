@@ -238,6 +238,8 @@ __global__ void gdr_chunk_fwd_wmma(
     float* smem_beta = smem_gcum + Lp;
     float* smem_invq = smem_beta + Lp;
     float* smem_invk = smem_invq + Lp;
+    float* smem_eg   = smem_invk + Lp;
+    float* smem_e_last = smem_eg + Lp;
 
     const int num_chunks = (Tlen + chunk_size - 1) / chunk_size;
 
@@ -502,6 +504,8 @@ __global__ void gdr_fwd_precompute_wmma(
     float* smem_beta = smem_gcum + Lp;
     float* smem_invq = smem_beta + Lp;
     float* smem_invk = smem_invq + Lp;
+    float* smem_eg   = smem_invk + Lp;
+    float* smem_e_last = smem_eg + Lp;
 
     // Zero-fill
     for (int idx = tid; idx < Lp * Kdim; idx += nthr) {
@@ -514,7 +518,10 @@ __global__ void gdr_fwd_precompute_wmma(
         buf3[idx] = from_float<TQ>(0.0f);
     for (int idx = tid; idx < Lp * Lp; idx += nthr)
         buf1[idx] = from_float<TQ>(0.0f);
-    if (tid < Lp) { smem_gcum[tid] = 0.0f; smem_beta[tid] = 0.0f; }
+    if (tid < Lp) {
+        smem_gcum[tid] = 0.0f;
+        smem_beta[tid] = 0.0f;
+    }
     __syncthreads();
 
     // Load k, q, v
@@ -1616,6 +1623,8 @@ __global__ void gdr_chunk_bwd_wmma(
     float* smem_beta = smem_gcum + Lp;
     float* smem_invq = smem_beta + Lp;
     float* smem_invk = smem_invq + Lp;
+    float* smem_eg   = smem_invk + Lp;
+    float* smem_e_last = smem_eg + Lp;
 
     // Global workspace per (b,h)
     float* ws = workspace + bh * workspace_stride;
@@ -2019,16 +2028,18 @@ __global__ void gdr_chunk_bwd_wmma(
             ws_gs[idx] = scratch1[idx];
         __syncthreads();
 
-        // DG from S gradient: DG[i] += grad_S[i,j]*S[i,j], DG[j] -= same
+        // DG from S gradient without atomics:
+        // DG[i] += sum_{j<=i}(grad_S[i,j] * S[i,j]) - sum_{r>i}(grad_S[r,i] * S[r,i])
         for (int i = tid; i < L; i += nthr) {
-            float dg_i = 0.0f;
+            float dg_pos = 0.0f;
+            float dg_neg = 0.0f;
             for (int j = 0; j <= i; ++j) {
-                float gs = ws_gs[i * Lp + j];
-                float sv = ws_tmp[i * Lp + j];
-                dg_i += gs * sv;
-                atomicAdd(&DG[j], -gs * sv);
+                dg_pos += ws_gs[i * Lp + j] * ws_tmp[i * Lp + j];
             }
-            DG[i] += dg_i;
+            for (int r = i + 1; r < L; ++r) {
+                dg_neg += ws_gs[r * Lp + i] * ws_tmp[r * Lp + i];
+            }
+            DG[i] += dg_pos - dg_neg;
         }
         __syncthreads();
 
@@ -2994,28 +3005,36 @@ struct ChunkWorkspaceLayout {
     int DG_off;      // [Lp]
     int DB_off;      // [Lp]
     int DHT1_off;    // [K×V]
-    int C_off;       // [K×K] — correction matrix for Phase 2 ds recurrence
+    int C_off;       // [K×K] packed as TQ — correction matrix for Phase 2 ds recurrence
     int EG_off;      // [1]   — exp(g_last) per chunk
     int total;       // total floats per chunk
 };
 
+__host__ __device__ __forceinline__ int align_up_int(int x, int align) {
+    return ((x + align - 1) / align) * align;
+}
+
+template<typename TQ>
 __host__ __device__ ChunkWorkspaceLayout make_chunk_ws(int Lp, int Kdim, int Vdim) {
+    constexpr int kWsAlignFloats = 128 / sizeof(float);
     ChunkWorkspaceLayout l;
     int off = 0;
-    l.M_off    = off; off += Lp * Lp;
-    l.A_off    = off; off += Lp * Lp;
-    l.W_off    = off; off += Lp * Kdim;
-    l.VNEW_off = off; off += Lp * Vdim;
-    l.DU_off   = off; off += Lp * Vdim;
-    l.DW_off   = off; off += Lp * Kdim;
-    l.DQ_off   = off; off += Lp * Kdim;
-    l.DK_off   = off; off += Lp * Kdim;
-    l.DG_off   = off; off += Lp;
-    l.DB_off   = off; off += Lp;
-    l.DHT1_off = off; off += Kdim * Vdim;
-    l.C_off    = off; off += Kdim * Kdim;
-    l.EG_off   = off; off += 1;
-    l.total    = off;
+    const int c_storage_floats =
+        static_cast<int>((static_cast<long>(Kdim) * Kdim * sizeof(TQ) + sizeof(float) - 1) / sizeof(float));
+    l.M_off    = align_up_int(off, kWsAlignFloats); off = l.M_off + Lp * Lp;
+    l.A_off    = align_up_int(off, kWsAlignFloats); off = l.A_off + Lp * Lp;
+    l.W_off    = align_up_int(off, kWsAlignFloats); off = l.W_off + Lp * Kdim;
+    l.VNEW_off = align_up_int(off, kWsAlignFloats); off = l.VNEW_off + Lp * Vdim;
+    l.DU_off   = align_up_int(off, kWsAlignFloats); off = l.DU_off + Lp * Vdim;
+    l.DW_off   = align_up_int(off, kWsAlignFloats); off = l.DW_off + Lp * Kdim;
+    l.DQ_off   = align_up_int(off, kWsAlignFloats); off = l.DQ_off + Lp * Kdim;
+    l.DK_off   = align_up_int(off, kWsAlignFloats); off = l.DK_off + Lp * Kdim;
+    l.DG_off   = align_up_int(off, kWsAlignFloats); off = l.DG_off + Lp;
+    l.DB_off   = align_up_int(off, kWsAlignFloats); off = l.DB_off + Lp;
+    l.DHT1_off = align_up_int(off, kWsAlignFloats); off = l.DHT1_off + Kdim * Vdim;
+    l.C_off    = align_up_int(off, kWsAlignFloats); off = l.C_off + c_storage_floats;
+    l.EG_off   = align_up_int(off, kWsAlignFloats); off = l.EG_off + 1;
+    l.total    = align_up_int(off, kWsAlignFloats);
     return l;
 }
 
@@ -3054,7 +3073,7 @@ __global__ void gdr_bwd_phase1_wmma(
 
     // Per-chunk workspace
     float* cws = chunk_workspace + (long)block_id * chunk_ws_stride;
-    ChunkWorkspaceLayout cwl = make_chunk_ws(Lp, Kdim, Vdim);
+    ChunkWorkspaceLayout cwl = make_chunk_ws<TQ>(Lp, Kdim, Vdim);
     float* M    = cws + cwl.M_off;
     float* A    = cws + cwl.A_off;
     float* W    = cws + cwl.W_off;
@@ -3080,6 +3099,8 @@ __global__ void gdr_bwd_phase1_wmma(
     float* smem_beta = smem_gcum + Lp;
     float* smem_invq = smem_beta + Lp;
     float* smem_invk = smem_invq + Lp;
+    float* smem_eg   = smem_invk + Lp;
+    float* smem_e_last = smem_eg + Lp;
 
     // Zero-fill shared buffers
     for (int idx = tid; idx < Lp * Kdim; idx += nthr) {
@@ -3092,7 +3113,12 @@ __global__ void gdr_bwd_phase1_wmma(
         buf3[idx] = from_float<TQ>(0.0f);
     for (int idx = tid; idx < Lp * Lp; idx += nthr)
         buf1[idx] = from_float<TQ>(0.0f);
-    if (tid < Lp) { smem_gcum[tid] = 0.0f; smem_beta[tid] = 0.0f; }
+    if (tid < Lp) {
+        smem_gcum[tid] = 0.0f;
+        smem_beta[tid] = 0.0f;
+        smem_eg[tid] = 0.0f;
+        smem_e_last[tid] = 0.0f;
+    }
     __syncthreads();
 
     // Load k, q, v
@@ -3114,6 +3140,18 @@ __global__ void gdr_bwd_phase1_wmma(
             smem_gcum[i] = acc;
             smem_beta[i] = to_float(beta_global[gh]);
         }
+    }
+    __syncthreads();
+
+    for (int pos = tid; pos < L; pos += nthr) {
+        smem_eg[pos] = expf(smem_gcum[pos]);
+    }
+    __syncthreads();
+    const float g_last_val = (L > 0) ? smem_gcum[L - 1] : 0.0f;
+    const float eg_last_val = (L > 0) ? smem_eg[L - 1] : 0.0f;
+    const float inv_eg_last_val = (eg_last_val != 0.0f) ? (1.0f / eg_last_val) : 0.0f;
+    for (int pos = tid; pos < L; pos += nthr) {
+        smem_e_last[pos] = expf(g_last_val - smem_gcum[pos]);
     }
     __syncthreads();
 
@@ -3152,7 +3190,7 @@ __global__ void gdr_bwd_phase1_wmma(
     for (int idx = tid; idx < Lp * Lp; idx += nthr) {
         const int i = idx / Lp, j = idx % Lp;
         if (i < L && j <= i)
-            scratch1[idx] *= smem_beta[i] * expf(smem_gcum[i] - smem_gcum[j]);
+            scratch1[idx] *= smem_beta[i] * (smem_eg[i] * smem_e_last[j] * inv_eg_last_val);
         else
             scratch1[idx] = 0.0f;
     }
@@ -3205,7 +3243,7 @@ __global__ void gdr_bwd_phase1_wmma(
     // bkg = beta*k*exp(g) → buf3
     for (int idx = tid; idx < Lp * Kdim; idx += nthr) {
         const int i = idx / Kdim;
-        float val = (i < L) ? to_float(smem_k[idx]) * smem_beta[i] * expf(smem_gcum[i]) : 0.0f;
+        float val = (i < L) ? to_float(smem_k[idx]) * smem_beta[i] * smem_eg[i] : 0.0f;
         buf3[idx] = from_float<TQ>(bf16_trunc<TQ>(val));
     }
     __syncthreads();
@@ -3232,11 +3270,10 @@ __global__ void gdr_bwd_phase1_wmma(
     __syncthreads();
 
     // vnew_pre = u - wh, then vnew = vnew_pre * exp(g_last - g_cum[i])
-    const float g_last_val = (L > 0) ? smem_gcum[L - 1] : 0.0f;
     for (int idx = tid; idx < Lp * Vdim; idx += nthr) {
         const int i = idx / Vdim;
         float vnew_pre = bf16_trunc<TQ>(to_float(buf2[idx]) - scratch1[idx]);
-        float e_i = (i < L) ? expf(g_last_val - smem_gcum[i]) : 0.0f;
+        float e_i = (i < L) ? smem_e_last[i] : 0.0f;
         float vnew = bf16_trunc<TQ>(vnew_pre * e_i);
         buf2[idx] = from_float<TQ>(vnew);
         VNEW[idx] = vnew;
@@ -3276,14 +3313,14 @@ __global__ void gdr_bwd_phase1_wmma(
     __syncthreads();
     for (int idx = tid; idx < L * Kdim; idx += nthr) {
         const int i = idx / Kdim;
-        DQ[idx] += scale * expf(smem_gcum[i]) * scratch1[i * Kdim + idx % Kdim];
+        DQ[idx] += scale * smem_eg[i] * scratch1[i * Kdim + idx % Kdim];
     }
     __syncthreads();
 
     // DHT1 = (scale*exp(g)*q)^T @ d_out → [K×V]
     for (int idx = tid; idx < Lp * Kdim; idx += nthr) {
         const int i = idx / Kdim;
-        float val = (i < L) ? to_float(smem_q[idx]) * scale * expf(smem_gcum[i]) : 0.0f;
+        float val = (i < L) ? to_float(smem_q[idx]) * scale * smem_eg[i] : 0.0f;
         buf3[idx] = from_float<TQ>(bf16_trunc<TQ>(val));
     }
     __syncthreads();
@@ -3300,7 +3337,7 @@ __global__ void gdr_bwd_phase1_wmma(
         float dot_val = 0.0f;
         for (int vv = 0; vv < Vdim; ++vv)
             dot_val += scratch1[i * Vdim + vv] * to_float(buf2[i * Vdim + vv]);
-        DG[i] += scale * expf(smem_gcum[i]) * dot_val;
+        DG[i] += scale * smem_eg[i] * dot_val;
     }
     __syncthreads();
 
@@ -3312,8 +3349,10 @@ __global__ void gdr_bwd_phase1_wmma(
     __syncthreads();
     for (int idx = tid; idx < Lp * Lp; idx += nthr) {
         const int i = idx / Lp, j = idx % Lp;
-        if (i < L && j <= i)
-            scratch1[idx] = bf16_trunc<TQ>(expf(smem_gcum[i] - smem_gcum[j]) * scratch1[idx]);
+        if (i < L && j <= i) {
+            const float exp_ij = smem_eg[i] * smem_e_last[j] * inv_eg_last_val;
+            scratch1[idx] = bf16_trunc<TQ>(exp_ij * scratch1[idx]);
+        }
         else
             scratch1[idx] = 0.0f;
     }
@@ -3325,7 +3364,7 @@ __global__ void gdr_bwd_phase1_wmma(
     __syncthreads();
     for (int idx = tid; idx < Lp * Vdim; idx += nthr) {
         const int j = idx / Vdim;
-        float e_j = (j < L) ? expf(g_last_val - smem_gcum[j]) : 1.0f;
+        float e_j = (j < L) ? smem_e_last[j] : 1.0f;
         float vnp = (j < L) ? VNEW[j * Vdim + idx % Vdim] / e_j : 0.0f;
         buf1[idx] = from_float<TQ>(bf16_trunc<TQ>(vnp));
     }
@@ -3348,16 +3387,18 @@ __global__ void gdr_bwd_phase1_wmma(
     wmma_nt<TQ>(buf2, Vdim, buf1, Vdim, scratch1, Lp, Lp, Lp, Vdim);
     __syncthreads();
 
-    // DG from S gradient
+    // DG from S gradient without atomics:
+    // DG[i] += sum_{j<=i}(grad_S[i,j] * S[i,j]) - sum_{r>i}(grad_S[r,i] * S[r,i])
     for (int i = tid; i < L; i += nthr) {
-        float dg_i = 0.0f;
+        float dg_pos = 0.0f;
+        float dg_neg = 0.0f;
         for (int j = 0; j <= i; ++j) {
-            float gs = scratch1[i * Lp + j];
-            float sv = scratch2[i * Lp + j];
-            dg_i += gs * sv;
-            atomicAdd(&DG[j], -gs * sv);
+            dg_pos += scratch1[i * Lp + j] * scratch2[i * Lp + j];
         }
-        DG[i] += dg_i;
+        for (int r = i + 1; r < L; ++r) {
+            dg_neg += scratch1[r * Lp + i] * scratch2[r * Lp + i];
+        }
+        DG[i] += dg_pos - dg_neg;
     }
     __syncthreads();
 
@@ -3367,7 +3408,7 @@ __global__ void gdr_bwd_phase1_wmma(
         const int i = idx / Lp, j = idx % Lp;
         float val = 0.0f;
         if (i < L && j <= i)
-            val = scratch1[idx] * expf(smem_gcum[i] - smem_gcum[j]);
+            val = scratch1[idx] * (smem_eg[i] * smem_e_last[j] * inv_eg_last_val);
         buf1[idx] = from_float<TQ>(bf16_trunc<TQ>(val));
     }
     __syncthreads();
@@ -3392,7 +3433,7 @@ __global__ void gdr_bwd_phase1_wmma(
         const int i = idx / Lp, j = idx % Lp;
         float val = 0.0f;
         if (i < L && j <= i && j < L)
-            val = scratch2[idx] / expf(g_last_val - smem_gcum[j]);
+            val = scratch2[idx] / smem_e_last[j];
         buf1[idx] = from_float<TQ>(bf16_trunc<TQ>(val));
     }
     __syncthreads();
@@ -3406,19 +3447,19 @@ __global__ void gdr_bwd_phase1_wmma(
     // Precompute correction matrix C and correction_local for Phase 2
     // This allows Phase 2 to use a single matmul: ds = ds*eg + DHT1_corrected - C@ds
     // ================================================================
-    float* C_mat = cws + cwl.C_off;
-    const float g_last_val_p1 = (L > 0) ? smem_gcum[L - 1] : 0.0f;
+    TQ* C_mat = reinterpret_cast<TQ*>(cws + cwl.C_off);
+    const float g_last_val_p1 = g_last_val;
 
     // Store eg_last for Phase 2
     if (tid == 0) {
         float* eg_ptr = cws + cwl.EG_off;
-        *eg_ptr = expf(g_last_val_p1);
+        *eg_ptr = eg_last_val;
     }
 
     // W_gated → buf3[Lp×K]: W[i,k] * exp(g_last - g[i])
     for (int idx = tid; idx < Lp * Kdim; idx += nthr) {
         const int i = idx / Kdim;
-        float val = (i < L) ? W[idx] * expf(g_last_val_p1 - smem_gcum[i]) : 0.0f;
+        float val = (i < L) ? W[idx] * smem_e_last[i] : 0.0f;
         buf3[idx] = from_float<TQ>(bf16_trunc<TQ>(val));
     }
     __syncthreads();
@@ -3428,15 +3469,15 @@ __global__ void gdr_bwd_phase1_wmma(
     wmma_tn<TQ>(buf3, Kdim, smem_k, Kdim, scratch1, Kdim, Kdim, Kdim, Lp);
     __syncthreads();
 
-    // Store C in workspace
+    // Store C in workspace as packed TQ once; Phase 2 reuses directly.
     for (int idx = tid; idx < Kdim * Kdim; idx += nthr)
-        C_mat[idx] = scratch1[idx];
+        C_mat[idx] = from_float<TQ>(bf16_trunc<TQ>(scratch1[idx]));
     __syncthreads();
 
     // d_pre_local = DU * exp(g_last - g[i]) → buf2[Lp×V]
     for (int idx = tid; idx < Lp * Vdim; idx += nthr) {
         const int i = idx / Vdim;
-        float val = (i < L) ? DU[idx] * expf(g_last_val_p1 - smem_gcum[i]) : 0.0f;
+        float val = (i < L) ? DU[idx] * smem_e_last[i] : 0.0f;
         buf2[idx] = from_float<TQ>(bf16_trunc<TQ>(val));
     }
     __syncthreads();
@@ -3487,7 +3528,7 @@ __global__ void gdr_bwd_phase2_wmma(
     const long kv = (long)Kdim * Vdim;
     const long kk = (long)Kdim * Kdim;
     const int Lp = kMaxC;
-    ChunkWorkspaceLayout cwl = make_chunk_ws(Lp, Kdim, Vdim);
+    ChunkWorkspaceLayout cwl = make_chunk_ws<TQ>(Lp, Kdim, Vdim);
 
     float* ds = d_initial_state + (long)bh * kv;
 
@@ -3513,12 +3554,12 @@ __global__ void gdr_bwd_phase2_wmma(
         const int chunk_block_id = bh * num_chunks + chunk;
         float* cws = chunk_workspace + (long)chunk_block_id * chunk_ws_stride;
         float* DHT1 = cws + cwl.DHT1_off;   // already corrected by Phase 1
-        float* C_mat = cws + cwl.C_off;
+        const TQ* C_mat = reinterpret_cast<const TQ*>(cws + cwl.C_off);
         float  eg_last = *(cws + cwl.EG_off);
 
-        // Load C → buf1 bf16 [K×K]
+        // Load packed C directly into buf1 [K×K]
         for (long idx = tid; idx < kk; idx += nthr)
-            buf1[idx] = from_float<TQ>(bf16_trunc<TQ>(C_mat[idx]));
+            buf1[idx] = C_mat[idx];
         // Load ds → buf2 bf16 [K×V]
         for (long idx = tid; idx < kv; idx += nthr)
             buf2[idx] = from_float<TQ>(bf16_trunc<TQ>(ds[idx]));
@@ -3574,7 +3615,7 @@ __global__ void gdr_bwd_phase3_wmma(
     const int cs = chunk * chunk_size;
     const int L = min(chunk_size, Tlen - cs);
 
-    ChunkWorkspaceLayout cwl = make_chunk_ws(Lp, Kdim, Vdim);
+    ChunkWorkspaceLayout cwl = make_chunk_ws<TQ>(Lp, Kdim, Vdim);
     float* cws = chunk_workspace + (long)block_id * chunk_ws_stride;
     float* M_ws  = cws + cwl.M_off;
     float* VNEW  = cws + cwl.VNEW_off;
@@ -3602,13 +3643,20 @@ __global__ void gdr_bwd_phase3_wmma(
     float* smem_beta = smem_gcum + Lp;
     float* smem_invq = smem_beta + Lp;
     float* smem_invk = smem_invq + Lp;
+    float* smem_eg   = smem_invk + Lp;
+    float* smem_e_last = smem_eg + Lp;
 
     // Load k, q, scalars
     for (int idx = tid; idx < Lp * Kdim; idx += nthr) {
         smem_k[idx] = from_float<TQ>(0.0f);
         smem_q[idx] = from_float<TQ>(0.0f);
     }
-    if (tid < Lp) { smem_gcum[tid] = 0.0f; smem_beta[tid] = 0.0f; }
+    if (tid < Lp) {
+        smem_gcum[tid] = 0.0f;
+        smem_beta[tid] = 0.0f;
+        smem_eg[tid] = 0.0f;
+        smem_e_last[tid] = 0.0f;
+    }
     __syncthreads();
 
     for (int idx = tid; idx < L * Kdim; idx += nthr) {
@@ -3625,6 +3673,18 @@ __global__ void gdr_bwd_phase3_wmma(
             smem_gcum[i] = acc;
             smem_beta[i] = to_float(beta_global[gh]);
         }
+    }
+    __syncthreads();
+
+    for (int pos = tid; pos < L; pos += nthr) {
+        smem_eg[pos] = expf(smem_gcum[pos]);
+    }
+    __syncthreads();
+    const float g_last_p3 = (L > 0) ? smem_gcum[L - 1] : 0.0f;
+    const float eg_last_p3 = (L > 0) ? smem_eg[L - 1] : 0.0f;
+    const float inv_eg_last_p3 = (eg_last_p3 != 0.0f) ? (1.0f / eg_last_p3) : 0.0f;
+    for (int pos = tid; pos < L; pos += nthr) {
+        smem_e_last[pos] = expf(g_last_p3 - smem_gcum[pos]);
     }
     __syncthreads();
 
@@ -3662,9 +3722,6 @@ __global__ void gdr_bwd_phase3_wmma(
     // Temp storage in DHT1 area (K*V = Lp*Lp for K=V=64)
     float* tmp_area = cws + cwl.DHT1_off;
 
-    const float g_last_p3 = (L > 0) ? smem_gcum[L - 1] : 0.0f;
-    const float eg_last_p3 = expf(g_last_p3);
-
     // ================================================================
     // Step 0-pre: k@ds → add to DU, apply gating, DG contributions
     // (moved from Phase 2 to enable single-matmul Phase 2)
@@ -3684,7 +3741,7 @@ __global__ void gdr_bwd_phase3_wmma(
     // DU += k@ds, then apply gating: DU → d_pre
     for (int idx = tid; idx < L * Vdim; idx += nthr) {
         const int i = idx / Vdim;
-        const float e_i = expf(g_last_p3 - smem_gcum[i]);
+        const float e_i = smem_e_last[i];
         const float kds_val = scratch1[idx];
         const float d_vnew = DU[idx] + kds_val;
         const float d_pre = d_vnew * e_i;
@@ -3838,7 +3895,7 @@ __global__ void gdr_bwd_phase3_wmma(
     __syncthreads();
 
     for (int j = tid; j < L; j += nthr) {
-        const float egj = expf(smem_gcum[j]);
+        const float egj = smem_eg[j];
         float db_acc = 0.0f, dg_acc = 0.0f;
         for (int kk = 0; kk < Kdim; ++kk) {
             float mt_dw = scratch1[j * Kdim + kk];
@@ -3884,7 +3941,7 @@ __global__ void gdr_bwd_phase3_wmma(
     // bkg → buf2[Lp×K]
     for (int idx = tid; idx < Lp * Kdim; idx += nthr) {
         const int pos = idx / Kdim;
-        float val = (pos < L) ? to_float(smem_k[idx]) * smem_beta[pos] * expf(smem_gcum[pos]) : 0.0f;
+        float val = (pos < L) ? to_float(smem_k[idx]) * smem_beta[pos] * smem_eg[pos] : 0.0f;
         buf2[idx] = from_float<TQ>(bf16_trunc<TQ>(val));
     }
     __syncthreads();
@@ -3954,7 +4011,7 @@ __global__ void gdr_bwd_phase3_wmma(
         const int i = idx / L, j = idx % L;
         if (j >= i) continue;
 
-        const float exp_ij = expf(smem_gcum[i] - smem_gcum[j]);
+        const float exp_ij = smem_eg[i] * smem_e_last[j] * inv_eg_last_p3;
         const float a_grad = scratch1[i * Lp + j];
         const float dot_k = tmp_area[i * Lp + j];  // precomputed kkt
         const float val = dot_k * exp_ij;
@@ -4066,7 +4123,7 @@ void launch_bwd_v2_multikernel(
     const int Lp = kMaxC;
     const int threads = 128;
 
-    ChunkWorkspaceLayout cwl = make_chunk_ws(Lp, Kdim, Vdim);
+    ChunkWorkspaceLayout cwl = make_chunk_ws<TQ>(Lp, Kdim, Vdim);
     const int chunk_ws_stride = cwl.total;
 
     // Workspace layout: [chunk_workspace | dh_storage]
@@ -4082,7 +4139,7 @@ void launch_bwd_v2_multikernel(
         + static_cast<std::size_t>(Lp) * Lp * sizeof(TQ)         // buf1
         + static_cast<std::size_t>(Lp) * Vdim * sizeof(TQ)       // buf2
         + static_cast<std::size_t>(Lp) * Kdim * sizeof(TQ)       // buf3
-        + static_cast<std::size_t>(Lp) * 4 * sizeof(float);      // scalars
+        + static_cast<std::size_t>(Lp) * 6 * sizeof(float);      // gcum, beta, invq, invk, eg, e_last
 
     // Phase 2: ultra-lightweight, just scratch1[K×V] + buf1[K×K bf16] + buf2[K×V bf16]
     const std::size_t phase2_smem =

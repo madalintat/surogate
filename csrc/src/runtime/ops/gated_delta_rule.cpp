@@ -275,18 +275,25 @@ void CompiledExecutor::dispatch_chunk_gated_delta_rule_backward(const CompiledOp
     }
 
     const int Lp = 64;
-    const long chunk_ws_stride =
-        static_cast<long>(Lp) * Lp * 2 +          // M + A
-        static_cast<long>(Lp) * Kdim +             // W
-        static_cast<long>(Lp) * Vdim +             // VNEW
-        static_cast<long>(Lp) * Vdim +             // DU
-        static_cast<long>(Lp) * Kdim +             // DW
-        static_cast<long>(Lp) * Kdim +             // DQ
-        static_cast<long>(Lp) * Kdim +             // DK
-        static_cast<long>(Lp) * 2 +                // DG + DB
-        static_cast<long>(Kdim) * Vdim +           // DHT1
-        static_cast<long>(Kdim) * Kdim +           // C (correction matrix)
-        1;                                          // EG (exp(g_last))
+    constexpr long kWsAlignFloats = 128 / sizeof(float);
+    auto align_up = [](long x, long align) { return ((x + align - 1) / align) * align; };
+    const long c_storage_floats =
+        (static_cast<long>(Kdim) * Kdim * get_dtype_size(q.DType) + sizeof(float) - 1) / sizeof(float);
+    long chunk_ws_stride = 0;
+    chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + static_cast<long>(Lp) * Lp;   // M
+    chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + static_cast<long>(Lp) * Lp;   // A
+    chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + static_cast<long>(Lp) * Kdim; // W
+    chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + static_cast<long>(Lp) * Vdim; // VNEW
+    chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + static_cast<long>(Lp) * Vdim; // DU
+    chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + static_cast<long>(Lp) * Kdim; // DW
+    chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + static_cast<long>(Lp) * Kdim; // DQ
+    chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + static_cast<long>(Lp) * Kdim; // DK
+    chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + static_cast<long>(Lp);        // DG
+    chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + static_cast<long>(Lp);        // DB
+    chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + static_cast<long>(Kdim) * Vdim; // DHT1
+    chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + c_storage_floats;              // C packed as q dtype
+    chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + 1;                             // EG
+    chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats);                                 // total stride
     const long dh_storage_per_chunk = static_cast<long>(Kdim) * Vdim;
     const long workspace_size = static_cast<long>(num_chunks) * chunk_ws_stride
         + static_cast<long>(num_chunks) * dh_storage_per_chunk;
