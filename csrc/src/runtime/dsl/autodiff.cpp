@@ -253,11 +253,6 @@ Graph derive_backward_graph(const Graph& forward, const DeriveBackwardOptions& o
         // Get backward rule
         const BackwardRule* rule = registry.get_rule(op_type);
         if (!rule) {
-            if (op_type == "fused_recurrent_gated_delta_rule") {
-                throw std::runtime_error(
-                    "Autodiff: operation '" + op_type +
-                    "' is currently forward-only (decode path only)");
-            }
             throw std::runtime_error(
                 "Autodiff: no backward rule registered for operation '" + op_type + "'");
         }

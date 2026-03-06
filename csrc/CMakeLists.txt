@@ -377,6 +377,7 @@ target_sources(surogate-common PRIVATE
     src/kernels/ep_dispatch.cu
     src/kernels/mamba_kernels.cu
     src/kernels/gated_delta_rule.cu
+    src/kernels/gated_delta_rule_v2.cu
     src/kernels/rope.cu
     src/kernels/mrope.cu
     src/kernels/mask_scatter.cu

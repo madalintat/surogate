@@ -6,7 +6,7 @@ from .mlp import SwiGLUMLP, GatedMLP
 from .attention import GQAAttention, Qwen3Attention, GptOssAttention
 from .mamba import Mamba2Mixer, SimpleMLP
 from .moe import MoEExpertsGated, MoEExpertsSimple, MoESharedExpert, GptOssMoE
-from .gated_delta_rule import ChunkGatedDeltaRule, FusedRecurrentGatedDeltaRule
+from .gated_delta_rule import ChunkGatedDeltaRule
 
 __all__ = [
     "Linear",
@@ -22,7 +22,6 @@ __all__ = [
     "SimpleMLP",
     # Qwen3.5 linear attention
     "ChunkGatedDeltaRule",
-    "FusedRecurrentGatedDeltaRule",
     # MoE
     "MoEExpertsGated",
     "MoEExpertsSimple",

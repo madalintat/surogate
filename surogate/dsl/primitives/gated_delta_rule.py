@@ -48,23 +48,3 @@ def chunk_gated_delta_rule_backward(
 ]:
     """Backward pass for chunk gated delta rule."""
     ...
-
-
-@primitive(impl="kernels.fused_recurrent_gated_delta_rule")
-def fused_recurrent_gated_delta_rule(
-    query: Tensor["B", "T", "H", "K"],
-    key: Tensor["B", "T", "H", "K"],
-    value: Tensor["B", "T", "H", "V"],
-    g: Tensor["B", "T", "H"],
-    beta: Tensor["B", "T", "H"],
-    initial_state: Tensor["B", "H", "K", "V"] | None = None,
-    *,
-    scale: float = 0.0,
-    output_final_state: bool = False,
-    use_qk_l2norm_in_kernel: bool = False,
-) -> tuple[Tensor["B", "T", "H", "V"], Tensor["B", "H", "K", "V"] | None]:
-    """Recurrent gated delta rule forward pass.
-
-    Mirrors FLA/HF `fused_recurrent_gated_delta_rule` API.
-    """
-    ...

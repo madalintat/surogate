@@ -2185,7 +2185,7 @@ void register_builtin_shape_signatures() {
 
     // ------------------------------------------------------------------------
     // Qwen3.5 gated delta rule forward ops
-    // chunk_gated_delta_rule / fused_recurrent_gated_delta_rule
+    // chunk_gated_delta_rule
     // ------------------------------------------------------------------------
     {
         OpShapeSignature sig;
@@ -2259,88 +2259,6 @@ void register_builtin_shape_signatures() {
                     final_state[2] != q[3] || final_state[3] != v[3]) {
                     return std::make_optional(
                         ShapeValidationError{"chunk_gated_delta_rule: final_state must be [B,H,K,V]"});
-                }
-            }
-
-            return std::optional<ShapeValidationError>();
-        };
-        reg.register_signature(sig);
-    }
-
-    {
-        OpShapeSignature sig;
-        sig.op_name = "fused_recurrent_gated_delta_rule";
-        sig.min_inputs = 5;
-        sig.max_inputs = 6;
-        sig.min_outputs = 1;
-        sig.max_outputs = 2;
-        sig.validator = [](const auto& inputs, const auto& outputs,
-                          const AttrMap&, const ShapeEnv&) {
-            if (inputs.size() < 5 || outputs.empty()) {
-                return std::make_optional(
-                    ShapeValidationError{"fused_recurrent_gated_delta_rule: requires 5-6 inputs and 1-2 outputs"});
-            }
-
-            const auto& q = inputs[0];
-            const auto& k = inputs[1];
-            const auto& v = inputs[2];
-            const auto& g = inputs[3];
-            const auto& beta = inputs[4];
-
-            if (auto err = validators::check_rank(q, 4, "q", "fused_recurrent_gated_delta_rule")) return err;
-            if (auto err = validators::check_rank(k, 4, "k", "fused_recurrent_gated_delta_rule")) return err;
-            if (auto err = validators::check_rank(v, 4, "v", "fused_recurrent_gated_delta_rule")) return err;
-            if (auto err = validators::check_rank(g, 3, "g", "fused_recurrent_gated_delta_rule")) return err;
-            if (auto err = validators::check_rank(beta, 3, "beta", "fused_recurrent_gated_delta_rule")) return err;
-
-            if (q[0] != k[0] || q[1] != k[1] || q[2] != k[2] || q[3] != k[3]) {
-                return std::make_optional(
-                    ShapeValidationError{"fused_recurrent_gated_delta_rule: q and k must have the same shape"});
-            }
-            if (q[0] != v[0] || q[1] != v[1] || q[2] != v[2]) {
-                return std::make_optional(
-                    ShapeValidationError{"fused_recurrent_gated_delta_rule: q/k and v must share B/T/H"});
-            }
-            if (g[0] != q[0] || g[1] != q[1] || g[2] != q[2]) {
-                return std::make_optional(
-                    ShapeValidationError{"fused_recurrent_gated_delta_rule: g must be [B,T,H]"});
-            }
-            if (beta[0] != q[0] || beta[1] != q[1] || beta[2] != q[2]) {
-                return std::make_optional(
-                    ShapeValidationError{"fused_recurrent_gated_delta_rule: beta must be [B,T,H]"});
-            }
-
-            if (inputs.size() > 5 && !inputs[5].empty()) {
-                const auto& initial_state = inputs[5];
-                if (auto err = validators::check_rank(
-                    initial_state, 4, "initial_state", "fused_recurrent_gated_delta_rule")) {
-                    return err;
-                }
-                if (initial_state[0] != q[0] || initial_state[1] != q[2] ||
-                    initial_state[2] != q[3] || initial_state[3] != v[3]) {
-                    return std::make_optional(
-                        ShapeValidationError{"fused_recurrent_gated_delta_rule: initial_state must be [B,H,K,V]"});
-                }
-            }
-
-            if (!outputs[0].empty()) {
-                const auto& out = outputs[0];
-                if (auto err = validators::check_rank(out, 4, "out", "fused_recurrent_gated_delta_rule")) return err;
-                if (out[0] != q[0] || out[1] != q[1] || out[2] != q[2] || out[3] != v[3]) {
-                    return std::make_optional(
-                        ShapeValidationError{"fused_recurrent_gated_delta_rule: out must be [B,T,H,V]"});
-                }
-            }
-            if (outputs.size() > 1 && !outputs[1].empty()) {
-                const auto& final_state = outputs[1];
-                if (auto err = validators::check_rank(
-                    final_state, 4, "final_state", "fused_recurrent_gated_delta_rule")) {
-                    return err;
-                }
-                if (final_state[0] != q[0] || final_state[1] != q[2] ||
-                    final_state[2] != q[3] || final_state[3] != v[3]) {
-                    return std::make_optional(
-                        ShapeValidationError{"fused_recurrent_gated_delta_rule: final_state must be [B,H,K,V]"});
                 }
             }
 

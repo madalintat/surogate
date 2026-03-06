@@ -27,8 +27,7 @@ bool tensor_shape_matches(const Tensor& t, long n0, long n1, long n2, long n3) {
 }  // namespace
 
 void CompiledExecutor::dispatch_gated_delta_rule_common(const CompiledOp& op,
-                                                        const char* op_name,
-                                                        bool use_chunk_path) {
+                                                        const char* op_name) {
     if (op.inputs.size() < 5) {
         throw std::runtime_error(std::string(op_name) + ": expected at least 5 inputs");
     }
@@ -108,37 +107,36 @@ void CompiledExecutor::dispatch_gated_delta_rule_common(const CompiledOp& op,
         scale = 1.0f / std::sqrt(static_cast<float>(Kdim));
     }
 
-    if (use_chunk_path) {
-        int chunk_size = op.attrs.chunk_size > 0 ? op.attrs.chunk_size : 64;
-        Tensor state_scratch = mRunState.temp_alloc(ETensorDType::FP32, {B, H, Kdim, Vdim});
-        mTemps.push_back(state_scratch);
-        gated_delta_rule_chunk_forward(
-            *out_ptr,
-            *final_state_ptr,
-            state_scratch,
-            q,
-            k,
-            v,
-            g,
-            beta,
-            initial_state,
-            scale,
-            chunk_size,
-            op.attrs.use_qk_l2norm_in_kernel,
-            mRunState.MainStream);
-    } else {
-        gated_delta_rule_recurrent_forward(
-            *out_ptr,
-            *final_state_ptr,
-            q,
-            k,
-            v,
-            g,
-            beta,
-            initial_state,
-            scale,
-            op.attrs.use_qk_l2norm_in_kernel,
-            mRunState.MainStream);
+    int chunk_size = op.attrs.chunk_size > 0 ? op.attrs.chunk_size : 64;
+    const int num_chunks = static_cast<int>((T + chunk_size - 1) / chunk_size);
+
+    Tensor state_scratch = mRunState.temp_alloc(ETensorDType::FP32, {B, H, Kdim, Vdim});
+    mTemps.push_back(state_scratch);
+
+    // Allocate checkpoints to save during forward (avoids recomputation in backward)
+    Tensor fwd_checkpoints = mRunState.temp_alloc(
+        ETensorDType::FP32, {B, H, static_cast<long>(num_chunks + 1), Kdim, Vdim});
+    mTemps.push_back(fwd_checkpoints);
+
+    gated_delta_rule_chunk_forward_v2(
+        *out_ptr,
+        *final_state_ptr,
+        state_scratch,
+        q,
+        k,
+        v,
+        g,
+        beta,
+        initial_state,
+        scale,
+        chunk_size,
+        op.attrs.use_qk_l2norm_in_kernel,
+        &fwd_checkpoints,
+        mRunState.MainStream);
+
+    // Save checkpoints for backward (avoid re-running checkpoint kernel)
+    if (mSaved) {
+        (*mSaved)["gdr_checkpoints"] = fwd_checkpoints;
     }
 
     if (!op.outputs.empty() && !op.outputs[0].name.empty()) {
@@ -150,11 +148,7 @@ void CompiledExecutor::dispatch_gated_delta_rule_common(const CompiledOp& op,
 }
 
 void CompiledExecutor::dispatch_chunk_gated_delta_rule(const CompiledOp& op) {
-    dispatch_gated_delta_rule_common(op, "chunk_gated_delta_rule", true);
-}
-
-void CompiledExecutor::dispatch_fused_recurrent_gated_delta_rule(const CompiledOp& op) {
-    dispatch_gated_delta_rule_common(op, "fused_recurrent_gated_delta_rule", false);
+    dispatch_gated_delta_rule_common(op, "chunk_gated_delta_rule");
 }
 
 void CompiledExecutor::dispatch_chunk_gated_delta_rule_backward(const CompiledOp& op) {
@@ -264,14 +258,39 @@ void CompiledExecutor::dispatch_chunk_gated_delta_rule_backward(const CompiledOp
     int chunk_size = op.attrs.chunk_size > 0 ? op.attrs.chunk_size : 64;
     const int num_chunks = static_cast<int>((T + chunk_size - 1) / chunk_size);
 
-    Tensor checkpoints = mRunState.temp_alloc(
-        ETensorDType::FP32, {B, H, static_cast<long>(num_chunks + 1), Kdim, Vdim});
-    const long workspace_size =
-        static_cast<long>(4 * chunk_size) * Kdim +
-        static_cast<long>(2 * chunk_size) * Vdim +
-        static_cast<long>(2 * chunk_size);
+    // Check for saved checkpoints from forward pass
+    bool skip_checkpoint = false;
+    Tensor checkpoints;
+    if (mSaved) {
+        auto it = mSaved->find("gdr_checkpoints");
+        if (it != mSaved->end()) {
+            checkpoints = it->second;
+            skip_checkpoint = true;
+        }
+    }
+    if (!skip_checkpoint) {
+        checkpoints = mRunState.temp_alloc(
+            ETensorDType::FP32, {B, H, static_cast<long>(num_chunks + 1), Kdim, Vdim});
+        mTemps.push_back(checkpoints);
+    }
+
+    const int Lp = 64;
+    const long chunk_ws_stride =
+        static_cast<long>(Lp) * Lp * 2 +          // M + A
+        static_cast<long>(Lp) * Kdim +             // W
+        static_cast<long>(Lp) * Vdim +             // VNEW
+        static_cast<long>(Lp) * Vdim +             // DU
+        static_cast<long>(Lp) * Kdim +             // DW
+        static_cast<long>(Lp) * Kdim +             // DQ
+        static_cast<long>(Lp) * Kdim +             // DK
+        static_cast<long>(Lp) * 2 +                // DG + DB
+        static_cast<long>(Kdim) * Vdim +           // DHT1
+        static_cast<long>(Kdim) * Kdim +           // C (correction matrix)
+        1;                                          // EG (exp(g_last))
+    const long dh_storage_per_chunk = static_cast<long>(Kdim) * Vdim;
+    const long workspace_size = static_cast<long>(num_chunks) * chunk_ws_stride
+        + static_cast<long>(num_chunks) * dh_storage_per_chunk;
     Tensor state_scratch = mRunState.temp_alloc(ETensorDType::FP32, {B, H, workspace_size});
-    mTemps.push_back(checkpoints);
     mTemps.push_back(state_scratch);
 
     float scale = op.attrs.delta_rule_scale;
@@ -279,7 +298,7 @@ void CompiledExecutor::dispatch_chunk_gated_delta_rule_backward(const CompiledOp
         scale = 1.0f / std::sqrt(static_cast<float>(Kdim));
     }
 
-    gated_delta_rule_chunk_backward(
+    gated_delta_rule_chunk_backward_v2(
         *d_q,
         *d_k,
         *d_v,
@@ -299,6 +318,7 @@ void CompiledExecutor::dispatch_chunk_gated_delta_rule_backward(const CompiledOp
         op.attrs.use_qk_l2norm_in_kernel,
         checkpoints,
         state_scratch,
+        skip_checkpoint,
         mRunState.MainStream);
 
     if (op.outputs.size() > 0 && !op.outputs[0].name.empty()) store_tensor(op.outputs[0], *d_q);

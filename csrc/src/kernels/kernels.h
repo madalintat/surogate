@@ -2273,22 +2273,6 @@ void mamba_selective_scan_backward(Tensor& du, Tensor& ddelta, Tensor& dA, Tenso
                                    int Bsz, int T, int Ddim, int dstate,
                                    int groups, int n_chunks, cudaStream_t stream);
 
-// Qwen3.5 gated delta rule recurrent forward (shared fallback for chunk + fused_recurrent).
-// Shapes:
-//   q/k [B, T, H, K], v/out [B, T, H, V], g/beta [B, T, H], state [B, H, K, V] (FP32).
-void gated_delta_rule_recurrent_forward(
-    Tensor& out,
-    Tensor& final_state,
-    const Tensor& q,
-    const Tensor& k,
-    const Tensor& v,
-    const Tensor& g,
-    const Tensor& beta,
-    const Tensor* initial_state,
-    float scale,
-    bool use_qk_l2norm_in_kernel,
-    cudaStream_t stream);
-
 // Qwen3.5 gated delta rule chunk forward.
 // Matches FLA chunk_gated_delta_rule semantics (chunk-local cumsum + WY solve stack).
 void gated_delta_rule_chunk_forward(
@@ -2304,29 +2288,6 @@ void gated_delta_rule_chunk_forward(
     float scale,
     int chunk_size,
     bool use_qk_l2norm_in_kernel,
-    cudaStream_t stream);
-
-// Backward for chunk_gated_delta_rule using recurrent checkpointed recomputation.
-void gated_delta_rule_recurrent_backward(
-    Tensor& d_q,
-    Tensor& d_k,
-    Tensor& d_v,
-    Tensor& d_g,
-    Tensor& d_beta,
-    Tensor& d_initial_state,
-    const Tensor& d_out,
-    const Tensor* d_final_state,
-    const Tensor& q,
-    const Tensor& k,
-    const Tensor& v,
-    const Tensor& g,
-    const Tensor& beta,
-    const Tensor* initial_state,
-    float scale,
-    bool use_qk_l2norm_in_kernel,
-    int chunk_size,
-    Tensor& checkpoints,
-    Tensor& state_scratch,
     cudaStream_t stream);
 
 // Backward for chunk_gated_delta_rule using chunk-equivalent recomputation.
@@ -2353,6 +2314,46 @@ void gated_delta_rule_chunk_backward(
     bool use_qk_l2norm_in_kernel,
     Tensor& checkpoints,
     Tensor& workspace,
+    cudaStream_t stream);
+
+// Parallelized v2 chunk kernels for gated delta rule (128 threads, fully parallel).
+void gated_delta_rule_chunk_forward_v2(
+    Tensor& out,
+    Tensor& final_state,
+    Tensor& state_scratch,
+    const Tensor& q,
+    const Tensor& k,
+    const Tensor& v,
+    const Tensor& g,
+    const Tensor& beta,
+    const Tensor* initial_state,
+    float scale,
+    int chunk_size,
+    bool use_qk_l2norm_in_kernel,
+    Tensor* fwd_checkpoints,
+    cudaStream_t stream);
+
+void gated_delta_rule_chunk_backward_v2(
+    Tensor& d_q,
+    Tensor& d_k,
+    Tensor& d_v,
+    Tensor& d_g,
+    Tensor& d_beta,
+    Tensor& d_initial_state,
+    const Tensor& d_out,
+    const Tensor* d_final_state,
+    const Tensor& q,
+    const Tensor& k,
+    const Tensor& v,
+    const Tensor& g,
+    const Tensor& beta,
+    const Tensor* initial_state,
+    float scale,
+    int chunk_size,
+    bool use_qk_l2norm_in_kernel,
+    Tensor& checkpoints,
+    Tensor& workspace,
+    bool skip_checkpoint,
     cudaStream_t stream);
 
 // Simple element-wise multiply for gated operations (e.g., gated RMSNorm)

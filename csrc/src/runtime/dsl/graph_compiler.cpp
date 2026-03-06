@@ -266,7 +266,6 @@ CompiledOpType op_type_from_string(const std::string& op_type) {
         {"mamba_out_proj", CompiledOpType::MambaOutProj},
         // Qwen3.5 gated delta rule forward operations
         {"chunk_gated_delta_rule", CompiledOpType::ChunkGatedDeltaRule},
-        {"fused_recurrent_gated_delta_rule", CompiledOpType::FusedRecurrentGatedDeltaRule},
         // Qwen3.5 gated delta rule backward operations
         {"chunk_gated_delta_rule_backward", CompiledOpType::ChunkGatedDeltaRuleBackward},
         // Mamba/SSM backward operations
@@ -903,7 +902,6 @@ CompiledAttrs GraphCompiler::resolve_attrs(const Operation& op, CompiledOpType t
 
     // Qwen3.5 gated delta rule attributes
     if (type == CompiledOpType::ChunkGatedDeltaRule ||
-        type == CompiledOpType::FusedRecurrentGatedDeltaRule ||
         type == CompiledOpType::ChunkGatedDeltaRuleBackward) {
         if (auto* attr = find_attr(op.attrs, "chunk_size")) {
             if (auto v = attr_int(*attr)) {
@@ -1509,8 +1507,7 @@ void GraphCompiler::infer_output_shapes(
             break;
         }
 
-        case CompiledOpType::ChunkGatedDeltaRule:
-        case CompiledOpType::FusedRecurrentGatedDeltaRule: {
+        case CompiledOpType::ChunkGatedDeltaRule: {
             // Inputs:
             //   q [B, T, H, K], k [B, T, H, K], v [B, T, H, V], g [B, T, H], beta [B, T, H]
             //   initial_state [B, H, K, V] (optional)
@@ -2585,8 +2582,7 @@ CompiledGraph GraphCompiler::compile(const Graph& graph, long B, long T) {
                             ref.shape = compiled.inputs[0].shape;
                         }
                     }
-                } else if (compiled.type == CompiledOpType::ChunkGatedDeltaRule ||
-                           compiled.type == CompiledOpType::FusedRecurrentGatedDeltaRule) {
+                } else if (compiled.type == CompiledOpType::ChunkGatedDeltaRule) {
                     // output[0] = out [B, T, H, V] (match value dtype)
                     // output[1] = final_state [B, H, K, V] (kept in FP32 for cache stability)
                     if (i == 0) {

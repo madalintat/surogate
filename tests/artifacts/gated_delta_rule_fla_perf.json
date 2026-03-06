@@ -1,0 +1,35 @@
+{
+  "cases": [
+    {
+      "B": 1,
+      "H": 8,
+      "K": 64,
+      "T": 256,
+      "V": 64,
+      "backward_ms": 0.41473917961120604,
+      "chunk_size": 64,
+      "dtype": "torch.bfloat16",
+      "forward_ms": 0.42470240592956543,
+      "total_ms": 0.7391056060791016,
+      "use_qk_l2norm_in_kernel": true
+    },
+    {
+      "B": 1,
+      "H": 8,
+      "K": 64,
+      "T": 512,
+      "V": 64,
+      "backward_ms": 0.4359568119049072,
+      "chunk_size": 64,
+      "dtype": "torch.bfloat16",
+      "forward_ms": 0.4922368049621582,
+      "total_ms": 0.7470143795013428,
+      "use_qk_l2norm_in_kernel": true
+    }
+  ],
+  "meta": {
+    "bench_iters": 20,
+    "device": "NVIDIA GeForce RTX 5090",
+    "warmup_iters": 5
+  }
+}

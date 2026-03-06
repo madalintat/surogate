@@ -29,7 +29,6 @@ from .mamba import (
 )
 from .gated_delta_rule import (
     chunk_gated_delta_rule,
-    fused_recurrent_gated_delta_rule,
 )
 from .ep import (
     ep_dispatch,
@@ -93,7 +92,6 @@ __all__ = [
     "mamba_combine_scan",
     # Qwen3.5 gated delta rule
     "chunk_gated_delta_rule",
-    "fused_recurrent_gated_delta_rule",
     # Expert Parallelism
     "ep_dispatch",
     "ep_combine",

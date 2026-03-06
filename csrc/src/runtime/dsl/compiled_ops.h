@@ -276,9 +276,8 @@ private:
     void dispatch_mamba_gated_rmsnorm(const CompiledOp& op);
     void dispatch_mamba_out_proj(const CompiledOp& op, const modules::ForwardHook* hook);
     // Qwen3.5 gated delta rule forward dispatch
-    void dispatch_gated_delta_rule_common(const CompiledOp& op, const char* op_name, bool use_chunk_path);
+    void dispatch_gated_delta_rule_common(const CompiledOp& op, const char* op_name);
     void dispatch_chunk_gated_delta_rule(const CompiledOp& op);
-    void dispatch_fused_recurrent_gated_delta_rule(const CompiledOp& op);
     void dispatch_chunk_gated_delta_rule_backward(const CompiledOp& op);
 
     // Mamba/SSM backward dispatch

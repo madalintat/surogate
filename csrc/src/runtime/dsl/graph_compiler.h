@@ -129,7 +129,6 @@ enum class CompiledOpType : std::uint8_t {
     MambaOutProj,
     // Qwen3.5 gated delta rule forward operations
     ChunkGatedDeltaRule,
-    FusedRecurrentGatedDeltaRule,
     // Qwen3.5 gated delta rule backward operations
     ChunkGatedDeltaRuleBackward,
     // Mamba/SSM backward operations

@@ -308,7 +308,6 @@ const char* op_type_to_string(CompiledOpType type) {
         case CompiledOpType::MambaGatedRMSNorm: return "mamba_gated_rmsnorm";
         case CompiledOpType::MambaOutProj: return "mamba_out_proj";
         case CompiledOpType::ChunkGatedDeltaRule: return "chunk_gated_delta_rule";
-        case CompiledOpType::FusedRecurrentGatedDeltaRule: return "fused_recurrent_gated_delta_rule";
         case CompiledOpType::ChunkGatedDeltaRuleBackward: return "chunk_gated_delta_rule_backward";
         // Mamba/SSM backward
         case CompiledOpType::MambaSplitProjBackward: return "mamba_split_proj_backward";
@@ -2158,9 +2157,6 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
                 case CompiledOpType::ChunkGatedDeltaRule:
                     dispatch_chunk_gated_delta_rule(op);
                     break;
-                case CompiledOpType::FusedRecurrentGatedDeltaRule:
-                    dispatch_fused_recurrent_gated_delta_rule(op);
-                    break;
                 default:
                     throw std::runtime_error("CompiledExecutor: unsupported forward op type");
             }
@@ -2895,7 +2891,6 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
                 case CompiledOpType::MambaGatedRMSNorm:
                 case CompiledOpType::MambaOutProj:
                 case CompiledOpType::ChunkGatedDeltaRule:
-                case CompiledOpType::FusedRecurrentGatedDeltaRule:
                     // These forward Mamba/GDN ops may appear in backward graph due to autodiff
                     throw std::runtime_error(
                         "CompiledExecutor: Mamba/GatedDelta forward op in backward graph not yet supported");
