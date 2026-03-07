@@ -16,6 +16,7 @@ from surogate.train.loss_guard import LossGuard
 from surogate.train.moe_monitor import MoEMonitor
 from surogate.train.lr_schedule import LRSchedule
 from surogate.train.training_advisor import TrainingAdvisor
+from surogate.train.qwen35_guard import apply_qwen35_sample_packing_guard
 from surogate.train.metrics import MoEMetrics, StepMetrics
 from surogate.train.phase_detector import PhaseDetector
 from surogate.train.plateau_detector import PlateauDetector
@@ -41,6 +42,18 @@ class SurogateTrainerWrapper():
         self.config = config
         self._block_types = None
         self._train_vision = bool(config.train_vision and config.model_template.is_multimodal)
+
+        # Keep guard here too (covers direct trainer construction paths).
+        apply_qwen35_sample_packing_guard(config, logger)
+
+        # Multimodal on-the-fly training intentionally runs in eager mode.
+        # Ensure runtime CUDA graph capture is disabled before constructing
+        # the native trainer to avoid capture-only save-buffer requirements.
+        if self._train_vision and getattr(config, "use_cuda_graphs", False):
+            logger.info("Disabling CUDA graphs for multimodal on-the-fly training.")
+            config.use_cuda_graphs = False
+            if hasattr(config, "runtime_config") and config.runtime_config is not None:
+                config.runtime_config.use_cuda_graphs = False
 
         model_weights_path = get_model_weights_path(config.model_dir)
 
@@ -607,6 +620,13 @@ class SurogateTrainerWrapper():
 
     def run_training_loop(self, train_logger: _surogate.TrainingRunLogger):
         use_full_step_graphs = True
+        template_type = str(getattr(self.config.model_info, "template_type", "") or "")
+        if self.config.use_cuda_graphs and template_type.startswith("Qwen3_5"):
+            logger.info(
+                "Qwen3.5: keeping use_cuda_graphs enabled while disabling outer full-step graph capture; "
+                "using micro-step execution path."
+            )
+            use_full_step_graphs = False
         if use_full_step_graphs and self.config.optimizer not in ("adamw_8bit", "normuon"):
             raise RuntimeError("DSL training requires optimizer 'adamw_8bit' or 'normuon' for full-step execution.")
         if use_full_step_graphs and not self.config.use_cuda_graphs:

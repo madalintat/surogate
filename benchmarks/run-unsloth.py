@@ -1,73 +1,83 @@
-from unsloth import FastLanguageModel
+from unsloth import FastVisionModel
 
 from datasets import load_dataset
 from trl import SFTTrainer, SFTConfig
+from unsloth.trainer import UnslothVisionDataCollator
 
-model, tokenizer = FastLanguageModel.from_pretrained(
-    model_name="Qwen/Qwen3-0.6B",
-    max_seq_length=2048,  # Context length - can be longer, but uses more memory
-    load_in_4bit=False,  # 4bit uses much less memory
-    load_in_fp8=False,  # A bit more accurate, uses 2x memory
-    full_finetuning=False,  # We have full finetuning now!
-    float8_kv_cache=False,
-    fast_inference=False,
+model, tokenizer = FastVisionModel.from_pretrained(
+    "unsloth/Qwen3.5-0.8B",
+    load_in_4bit = False, # Use 4bit to reduce memory use. False for 16bit LoRA.
+    use_gradient_checkpointing = "unsloth", # True or "unsloth" for long context
     use_exact_model_name=True
-    # token = "hf_...",      # use one if using gated models
 )
 
-model = FastLanguageModel.get_peft_model(
+model = FastVisionModel.get_peft_model(
     model,
-    r=16,  # Choose any number > 0! Suggested 8, 16, 32, 64, 128
-    target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
-                    "gate_proj", "up_proj", "down_proj", ],
-    lora_alpha=32,  # Best to choose alpha = rank or rank*2
-    lora_dropout=0,  # Supports any, but = 0 is optimized
-    bias="none",  # Supports any, but = "none" is optimized
-    random_state=3407,
-    use_rslora=False,  # We support rank stabilized LoRA
-    loftq_config=None,  # And LoftQ
+    finetune_vision_layers     = True, # False if not finetuning vision layers
+    finetune_language_layers   = True, # False if not finetuning language layers
+    finetune_attention_modules = True, # False if not finetuning attention layers
+    finetune_mlp_modules       = True, # False if not finetuning MLP layers
+
+    r = 16,           # The larger, the higher the accuracy, but might overfit
+    lora_alpha = 32,  # Recommended alpha == r at least
+    lora_dropout = 0,
+    bias = "none",
+    random_state = 3407,
+    use_rslora = False,  # We support rank stabilized LoRA
+    loftq_config = None, # And LoftQ
+    # target_modules = "all-linear", # Optional now! Can specify a list if needed
 )
 
-dataset = load_dataset("OpenLLM-Ro/ro_gsm8k", split="train")
+instruction = "Write the LaTeX representation for this image."
+
+def convert_to_conversation(sample):
+    conversation = [
+        { "role": "user",
+          "content" : [
+            {"type" : "text",  "text"  : instruction},
+            {"type" : "image", "image" : sample["image"]} ]
+        },
+        { "role" : "assistant",
+          "content" : [
+            {"type" : "text",  "text"  : sample["text"]} ]
+        },
+    ]
+    return { "messages" : conversation }
+pass
 
 
-def format_prompts(examples):
-    texts = []
-    for question, answer in zip(examples["question"], examples["answer"]):
-        messages = [
-            {"role": "user", "content": question},
-            {"role": "assistant", "content": answer},
-        ]
-        text = tokenizer.apply_chat_template(messages, tokenize=False)
-        texts.append(text)
-        
-    return {"text": texts}
+dataset = load_dataset("unsloth/LaTeX_OCR", split = "train")
+converted_dataset = [convert_to_conversation(sample) for sample in dataset]
 
-
-dataset = dataset.map(format_prompts, batched=True)
+FastVisionModel.for_training(model) # Enable for training!
 
 trainer = SFTTrainer(
-    model=model,
-    tokenizer=tokenizer,
-    train_dataset=dataset,
-    eval_dataset=None,  # Can set up evaluation!
-    args=SFTConfig(
-        dataset_text_field="text",
-        per_device_train_batch_size=2,
-        gradient_accumulation_steps=4,  # Use GA to mimic batch size!
-        warmup_steps=20,
-        num_train_epochs = 2, # Set this for 1 full training run.
-        # max_steps=30,
-        learning_rate=2e-4,  # Reduce to 2e-5 for long training runs
-        logging_steps=1,
-        optim="adamw_8bit",
-        weight_decay=0.001,
-        lr_scheduler_type="linear",
-        seed=3407,
-        report_to="none",  # Use TrackIO/WandB etc
-        packing=True,
-        max_length=2048
+    model = model,
+    tokenizer = tokenizer,
+    data_collator = UnslothVisionDataCollator(model, tokenizer), # Must use!
+    train_dataset = converted_dataset,
+    args = SFTConfig(
+        per_device_train_batch_size = 2,
+        gradient_accumulation_steps = 4,
+        warmup_steps = 5,
+        max_steps = 30,
+        # num_train_epochs = 1, # Set this instead of max_steps for full training runs
+        learning_rate = 2e-4,
+        logging_steps = 1,
+        optim = "adamw_8bit",
+        weight_decay = 0.001,
+        lr_scheduler_type = "linear",
+        seed = 3407,
+        output_dir = "outputs",
+        report_to = "none",     # For Weights and Biases
+
+        # You MUST put the below items for vision finetuning:
+        remove_unused_columns = False,
+        dataset_text_field = "",
+        dataset_kwargs = {"skip_prepare_dataset": True},
+        max_length = 2048,
     ),
 )
+
 trainer_stats = trainer.train()
 model.save_pretrained("./output_unsloth_bf16")

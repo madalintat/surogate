@@ -184,7 +184,11 @@ public:
     void save_tensors(const std::vector<std::string>& save_list, bool force_persist = false);
     // Preallocate persistent buffers for saved tensors before CUDA graph capture.
     // This avoids cudaMalloc during capture when recompute requires persistent saves.
-    void prepare_saved_buffers_for_capture(const std::vector<std::string>& save_list);
+    void prepare_saved_buffers_for_capture(
+        const std::vector<std::string>& save_list,
+        const CompiledGraph* capture_graph = nullptr);
+    // Preallocate GDR backward workspaces/checkpoints before CUDA graph capture.
+    void prepare_gdr_buffers_for_capture(const CompiledGraph& capture_graph);
 
 private:
     // Save MoE layer tensors to persistent storage at layer boundaries
@@ -193,9 +197,13 @@ private:
     // Direct dispatch functions (no string comparison)
     void dispatch_embedding(const CompiledOp& op);
     void dispatch_zeros(const CompiledOp& op);
+    void dispatch_ones(const CompiledOp& op);
     void dispatch_fused_residual_rmsnorm(const CompiledOp& op);
     void dispatch_layernorm(const CompiledOp& op);
     void dispatch_view(const CompiledOp& op);
+    void dispatch_transpose(const CompiledOp& op);
+    void dispatch_split(const CompiledOp& op);
+    void dispatch_concat(const CompiledOp& op);
     void dispatch_add(const CompiledOp& op);
     void dispatch_matmul(const CompiledOp& op, const modules::ForwardHook* hook);
     void dispatch_bias_add(const CompiledOp& op);
@@ -375,12 +383,17 @@ private:
     // Indexed by TensorRef::tensor_id assigned during graph compilation.
     // Eliminates string hashing/comparison in the hot resolve_tensor path.
     std::vector<Tensor> mTensors;
+    // Name-indexed tensor overrides for cases where multiple tensor names share one tensor_id/slot.
+    std::unordered_map<std::string, Tensor> mNamedTensors;
     std::vector<bool> mSaveMask;               // Per-tensor-id: true if in save list (for prune)
     const CompiledGraph* mCurrentGraph = nullptr;
 
     // Bind a named tensor into the flat vector using the current graph's name-to-id map.
     // No-op if the name is not in the graph (e.g., optional visual embeds when disabled).
     void bind_tensor(const std::string& name, const Tensor& t) {
+        if (!name.empty()) {
+            mNamedTensors[name] = t;
+        }
         if (mCurrentGraph) {
             int id = mCurrentGraph->find_tensor_id(name);
             if (id >= 0 && id < static_cast<int>(mTensors.size())) {
@@ -392,6 +405,9 @@ private:
     // Store a tensor by its pre-resolved TensorRef into the flat vector.
     // Use this in dispatch functions instead of direct mTensors assignment.
     void store_tensor(const TensorRef& ref, const Tensor& t) {
+        if (!ref.name.empty()) {
+            mNamedTensors[ref.name] = t;
+        }
         if (ref.tensor_id >= 0 && static_cast<std::size_t>(ref.tensor_id) < mTensors.size()) {
             mTensors[ref.tensor_id] = t;
         }

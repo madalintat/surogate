@@ -375,6 +375,202 @@ void register_builtin_shape_signatures() {
     }
 
     // ------------------------------------------------------------------------
+    // Transpose
+    // ------------------------------------------------------------------------
+    {
+        OpShapeSignature sig;
+        sig.op_name = "transpose";
+        sig.min_inputs = 1;
+        sig.max_inputs = 1;
+        sig.min_outputs = 1;
+        sig.max_outputs = 1;
+        sig.validator = [](const auto& inputs, const auto& outputs,
+                          const AttrMap& attrs, const ShapeEnv&) {
+            if (inputs.empty() || outputs.empty()) {
+                ShapeValidationError err;
+                err.message = "transpose requires 1 input and 1 output";
+                return std::make_optional(err);
+            }
+            if (inputs[0].empty() || outputs[0].empty()) {
+                return std::optional<ShapeValidationError>();
+            }
+
+            const int rank = static_cast<int>(inputs[0].size());
+            long dim0 = 0;
+            long dim1 = 1;
+            if (const AttrValue* a = find_attr(attrs, "dim0")) {
+                if (auto v = attr_int(*a)) dim0 = *v;
+            }
+            if (const AttrValue* a = find_attr(attrs, "dim1")) {
+                if (auto v = attr_int(*a)) dim1 = *v;
+            }
+            if (dim0 < 0) dim0 += rank;
+            if (dim1 < 0) dim1 += rank;
+            if (dim0 < 0 || dim0 >= rank || dim1 < 0 || dim1 >= rank || dim0 == dim1) {
+                ShapeValidationError err;
+                err.message = "transpose: invalid dim0/dim1 for input rank";
+                return std::make_optional(err);
+            }
+
+            auto expected = inputs[0];
+            std::swap(expected[dim0], expected[dim1]);
+            if (outputs[0].size() != expected.size()) {
+                ShapeValidationError err;
+                err.message = "transpose: output rank mismatch";
+                return std::make_optional(err);
+            }
+            for (std::size_t i = 0; i < expected.size(); ++i) {
+                if (outputs[0][i] != expected[i]) {
+                    ShapeValidationError err;
+                    err.message = "transpose: output shape mismatch";
+                    return std::make_optional(err);
+                }
+            }
+            return std::optional<ShapeValidationError>();
+        };
+        reg.register_signature(sig);
+    }
+
+    // ------------------------------------------------------------------------
+    // Concat
+    // ------------------------------------------------------------------------
+    {
+        OpShapeSignature sig;
+        sig.op_name = "concat";
+        sig.min_inputs = 1;
+        sig.max_inputs = -1;
+        sig.min_outputs = 1;
+        sig.max_outputs = 1;
+        sig.validator = [](const auto& inputs, const auto& outputs,
+                          const AttrMap& attrs, const ShapeEnv&) {
+            if (inputs.empty() || outputs.empty()) {
+                ShapeValidationError err;
+                err.message = "concat requires at least 1 input and 1 output";
+                return std::make_optional(err);
+            }
+            if (inputs[0].empty() || outputs[0].empty()) {
+                return std::optional<ShapeValidationError>();
+            }
+
+            const int rank = static_cast<int>(inputs[0].size());
+            long dim = 0;
+            if (const AttrValue* dim_attr = find_attr(attrs, "dim")) {
+                if (auto v = attr_int(*dim_attr)) {
+                    dim = *v;
+                }
+            }
+            if (dim < 0) dim += rank;
+            if (dim < 0 || dim >= rank) {
+                ShapeValidationError err;
+                err.message = "concat: dim out of range for input rank";
+                return std::make_optional(err);
+            }
+
+            auto expected = inputs[0];
+            long cat = 0;
+            for (const auto& in_shape : inputs) {
+                if (in_shape.size() != static_cast<std::size_t>(rank)) {
+                    ShapeValidationError err;
+                    err.message = "concat: all inputs must have the same rank";
+                    return std::make_optional(err);
+                }
+                for (int d = 0; d < rank; ++d) {
+                    if (d == dim) continue;
+                    if (in_shape[d] != expected[d]) {
+                        ShapeValidationError err;
+                        err.message = "concat: non-concat dimensions must match";
+                        return std::make_optional(err);
+                    }
+                }
+                cat += in_shape[dim];
+            }
+            expected[dim] = cat;
+
+            if (outputs[0].size() != expected.size()) {
+                ShapeValidationError err;
+                err.message = "concat: output rank mismatch";
+                return std::make_optional(err);
+            }
+            for (std::size_t i = 0; i < expected.size(); ++i) {
+                if (outputs[0][i] != expected[i]) {
+                    ShapeValidationError err;
+                    err.message = "concat: output shape mismatch";
+                    return std::make_optional(err);
+                }
+            }
+            return std::optional<ShapeValidationError>();
+        };
+        reg.register_signature(sig);
+    }
+
+    // ------------------------------------------------------------------------
+    // Split
+    // ------------------------------------------------------------------------
+    {
+        OpShapeSignature sig;
+        sig.op_name = "split";
+        sig.min_inputs = 1;
+        sig.max_inputs = 1;
+        sig.min_outputs = 1;
+        sig.max_outputs = -1;
+        sig.validator = [](const auto& inputs, const auto& outputs,
+                          const AttrMap& attrs, const ShapeEnv&) {
+            if (inputs.empty() || outputs.empty()) {
+                ShapeValidationError err;
+                err.message = "split requires 1 input and at least 1 output";
+                return std::make_optional(err);
+            }
+            if (inputs[0].empty()) {
+                return std::optional<ShapeValidationError>();
+            }
+
+            const auto& in_shape = inputs[0];
+            const int rank = static_cast<int>(in_shape.size());
+            long dim = 0;
+            if (const AttrValue* dim_attr = find_attr(attrs, "dim")) {
+                if (auto v = attr_int(*dim_attr)) {
+                    dim = *v;
+                }
+            }
+            if (dim < 0) dim += rank;
+            if (dim < 0 || dim >= rank) {
+                ShapeValidationError err;
+                err.message = "split: dim out of range for input rank";
+                return std::make_optional(err);
+            }
+
+            long total = 0;
+            for (const auto& out_shape : outputs) {
+                if (out_shape.empty()) {
+                    return std::optional<ShapeValidationError>();
+                }
+                if (out_shape.size() != static_cast<std::size_t>(rank)) {
+                    ShapeValidationError err;
+                    err.message = "split: all outputs must have same rank as input";
+                    return std::make_optional(err);
+                }
+                for (int d = 0; d < rank; ++d) {
+                    if (d == dim) continue;
+                    if (out_shape[d] != in_shape[d]) {
+                        ShapeValidationError err;
+                        err.message = "split: non-split dimensions must match input";
+                        return std::make_optional(err);
+                    }
+                }
+                total += out_shape[dim];
+            }
+
+            if (total != in_shape[dim]) {
+                ShapeValidationError err;
+                err.message = "split: output split sizes do not sum to input size along dim";
+                return std::make_optional(err);
+            }
+            return std::optional<ShapeValidationError>();
+        };
+        reg.register_signature(sig);
+    }
+
+    // ------------------------------------------------------------------------
     // Add (elementwise)
     // ------------------------------------------------------------------------
     {
@@ -784,6 +980,38 @@ void register_builtin_shape_signatures() {
 
                 std::ostringstream hint;
                 hint << "The 'zeros' operation requires an explicit output shape. ";
+                hint << "This shape should be defined in the IR tensor definition or operation attributes. ";
+                hint << "Check that the output tensor is properly declared in the DSL graph with a concrete shape.";
+                err.hint = hint.str();
+
+                return std::make_optional(err);
+            }
+            return std::optional<ShapeValidationError>();
+        };
+        reg.register_signature(sig);
+    }
+
+    // ------------------------------------------------------------------------
+    // Ones
+    // ------------------------------------------------------------------------
+    {
+        OpShapeSignature sig;
+        sig.op_name = "ones";
+        sig.min_inputs = 0;
+        sig.max_inputs = 0;
+        sig.min_outputs = 1;
+        sig.max_outputs = 1;
+        sig.validator = [](const std::vector<std::vector<long>>& inputs,
+                          const std::vector<std::vector<long>>& outputs,
+                          const AttrMap& attrs,
+                          const ShapeEnv& env) -> std::optional<ShapeValidationError> {
+            // No inputs, output shape determined by allocation
+            if (outputs.empty() || outputs[0].empty()) {
+                ShapeValidationError err;
+                err.message = "ones: output shape not specified or could not be resolved";
+
+                std::ostringstream hint;
+                hint << "The 'ones' operation requires an explicit output shape. ";
                 hint << "This shape should be defined in the IR tensor definition or operation attributes. ";
                 hint << "Check that the output tensor is properly declared in the DSL graph with a concrete shape.";
                 err.hint = hint.str();

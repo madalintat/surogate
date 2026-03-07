@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -226,9 +227,13 @@ const char* op_type_to_string(CompiledOpType type) {
     switch (type) {
         case CompiledOpType::Embedding: return "embedding";
         case CompiledOpType::Zeros: return "zeros";
+        case CompiledOpType::Ones: return "ones";
         case CompiledOpType::FusedResidualRMSNorm: return "fused_residual_rmsnorm";
         case CompiledOpType::LayerNorm: return "layernorm";
         case CompiledOpType::View: return "view";
+        case CompiledOpType::Transpose: return "transpose";
+        case CompiledOpType::Split: return "split";
+        case CompiledOpType::Concat: return "concat";
         case CompiledOpType::Add: return "add";
         case CompiledOpType::Matmul: return "matmul";
         case CompiledOpType::MatmulBias: return "matmul_bias";
@@ -617,13 +622,15 @@ void CompiledExecutor::save_moe_layer_tensors(int layer_idx) {
     }
 }
 
-void CompiledExecutor::prepare_saved_buffers_for_capture(const std::vector<std::string>& save_list) {
+void CompiledExecutor::prepare_saved_buffers_for_capture(
+    const std::vector<std::string>& save_list,
+    const CompiledGraph* capture_graph) {
     // Only needed when recompute is enabled or MoE tensors require persistence.
     if (!mSaved) {
         return;
     }
 
-    const bool recompute_enabled = mOptions.recompute_enabled();
+    const bool recompute_enabled = mRecomputeEnabled;
 
     auto prefer_live_tensor = [&](const std::string& tensor_name) -> bool {
         if (!recompute_enabled || !mSlotRegistry) {
@@ -645,9 +652,15 @@ void CompiledExecutor::prepare_saved_buffers_for_capture(const std::vector<std::
         int layer_idx = -1;
         std::string field;
         if (parse_block_param(name, layer_idx, field)) {
-            return mSlotRegistry->is_shared(strip_ssa_suffix(field));
+            if (auto entry = mSlotRegistry->lookup(strip_ssa_suffix(field))) {
+                return entry->memory_hint == ActivationMemoryHint::Shared;
+            }
+            return std::nullopt;
         }
-        return mSlotRegistry->is_shared(strip_ssa_suffix(name));
+        if (auto entry = mSlotRegistry->lookup(strip_ssa_suffix(name))) {
+            return entry->memory_hint == ActivationMemoryHint::Shared;
+        }
+        return std::nullopt;
     };
 
     auto is_mapped_slot = [&](const std::string& name) -> std::optional<bool> {
@@ -682,21 +695,42 @@ void CompiledExecutor::prepare_saved_buffers_for_capture(const std::vector<std::
         if (shared.has_value()) {
             return shared.value();
         }
-        // Unknown tensors (not in slot registry) are treated as needing persistence.
-        return true;
+        // Unknown tensors default to non-persistent to avoid over-allocating
+        // during graph-capture preallocation.
+        return false;
     };
 
+    const bool debug_save_buffers = (std::getenv("SUROGATE_DEBUG_SAVE_BUFFERS") != nullptr);
     auto ensure_buffer = [&](const std::string& name, size_t bytes) {
         if (bytes == 0) {
             return;
         }
         auto buf_it = mMoeSavedBuffers.find(name);
         if (buf_it == mMoeSavedBuffers.end() || mMoeSavedSizes[name] < bytes) {
+            if (debug_save_buffers) {
+                std::cerr << "[SAVE-BUF] alloc name=" << name
+                          << " bytes=" << bytes
+                          << " old_bytes=" << (buf_it == mMoeSavedBuffers.end() ? 0 : mMoeSavedSizes[name])
+                          << std::endl;
+            }
             if (buf_it != mMoeSavedBuffers.end() && buf_it->second != nullptr) {
                 CUDA_CHECK(cudaFree(buf_it->second));
             }
             void* new_buffer = nullptr;
-            CUDA_CHECK(cudaMalloc(&new_buffer, bytes));
+            cudaError_t alloc_err = cudaMalloc(&new_buffer, bytes);
+            if (alloc_err != cudaSuccess) {
+                std::size_t free_bytes = 0;
+                std::size_t total_bytes = 0;
+                (void)cudaMemGetInfo(&free_bytes, &total_bytes);
+                std::ostringstream oss;
+                oss << "CompiledExecutor::prepare_saved_buffers_for_capture: cudaMalloc failed for saved tensor '"
+                    << name << "' (" << bytes << " bytes, "
+                    << static_cast<double>(bytes) / (1024.0 * 1024.0) << " MiB)"
+                    << ", free=" << static_cast<double>(free_bytes) / (1024.0 * 1024.0) << " MiB"
+                    << ", total=" << static_cast<double>(total_bytes) / (1024.0 * 1024.0) << " MiB"
+                    << ", error=" << cudaGetErrorString(alloc_err);
+                throw std::runtime_error(oss.str());
+            }
             mMoeSavedBuffers[name] = new_buffer;
             mMoeSavedSizes[name] = bytes;
         }
@@ -844,10 +878,7 @@ void CompiledExecutor::prepare_saved_buffers_for_capture(const std::vector<std::
         } else if (base_field == "lse") {
             shape = {B, Hq, T};
         } else {
-            // Fallback: use conservative upper bound for any unrecognized block tensor.
-            // This ensures persist_saved_layer_tensors won't cudaMalloc during capture.
-            const long max_dim = std::max({C, QKV, MUp, D});
-            shape = {B, T, max_dim};
+            return false;
         }
 
         ETensorDType dtype = ETensorDType::BF16;
@@ -863,6 +894,54 @@ void CompiledExecutor::prepare_saved_buffers_for_capture(const std::vector<std::
         return out_bytes > 0;
     };
 
+    auto infer_graph_ref_bytes = [&](const std::string& name, std::size_t& out_bytes) -> bool {
+        const CompiledGraph* graph = capture_graph ? capture_graph : mCurrentGraph;
+        if (!graph) {
+            return false;
+        }
+        auto ref_bytes = [&](const TensorRef& ref, std::size_t& bytes_out) -> bool {
+            if (ref.name != name || ref.shape.empty()) {
+                return false;
+            }
+            const std::size_t nelem = shape_nelem(ref.shape);
+            if (nelem == 0) {
+                return false;
+            }
+            bytes_out = nelem * static_cast<std::size_t>(get_dtype_size(ref.dtype));
+            return bytes_out > 0;
+        };
+        // Prefer producer shape (outputs), then fallback to consumer refs (inputs).
+        for (const auto& op : graph->ops) {
+            for (const auto& ref : op.outputs) {
+                if (ref_bytes(ref, out_bytes)) {
+                    return true;
+                }
+            }
+        }
+        for (const auto& op : graph->ops) {
+            for (const auto& ref : op.inputs) {
+                if (ref_bytes(ref, out_bytes)) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    };
+
+    auto is_lora_hook_activation = [&](const std::string& tensor_name) -> bool {
+        if (!mLoRAConfig) {
+            return false;
+        }
+        int layer_idx = -1;
+        std::string field;
+        if (!parse_block_param(tensor_name, layer_idx, field)) {
+            return false;
+        }
+        const std::string base = strip_ssa_suffix(field);
+        return (base == "swiglu" || base == "swiglu_flat" ||
+                base == "att" || base == "att_flat");
+    };
+
     for (const auto& name : save_list) {
         if (mWeights.has(name)) {
             continue;
@@ -870,7 +949,8 @@ void CompiledExecutor::prepare_saved_buffers_for_capture(const std::vector<std::
 
         const bool force_persist_name =
             (name == "xF_flat" || name == "xF" || name == "ln_final" ||
-             name == "ln_final_rstd" || name == "residual_final" || name == "final_residual");
+             name == "ln_final_rstd" || name == "residual_final" || name == "final_residual" ||
+             is_lora_hook_activation(name));
         const bool is_moe_tensor = (name.find("moe_") != std::string::npos ||
                                     name.find("scatter_indices") != std::string::npos ||
                                     name.find("routing_weights") != std::string::npos ||
@@ -884,35 +964,29 @@ void CompiledExecutor::prepare_saved_buffers_for_capture(const std::vector<std::
         const bool need_persist = should_persist(name, prefer_live, force_persist || force_persist_name);
 
         // Block-level tensors may be stack-backed and persisted by
-        // persist_saved_layer_tensors() during execute_forward.  Pre-allocate
-        // buffers for those too, since cudaMalloc is not allowed during CUDA
-        // graph capture.  However, skip tensors that will be recomputed in
-        // backward — they only need metadata-only saves, not persistent buffers.
+        // persist_saved_layer_tensors() during execute_forward. Pre-allocate
+        // buffers for those only when they can actually require persistence.
         int layer_idx = -1;
         std::string field;
         const bool is_block_tensor = parse_block_param(name, layer_idx, field);
-        if (!need_persist && !(is_block_tensor && !prefer_live)) {
+        if (!need_persist && (!is_block_tensor || prefer_live)) {
             continue;
         }
 
-        // For tensors that need_persist from save_tensors, always pre-allocate.
-        // For block tensors that don't need_persist but might be stack-backed:
-        // only pre-allocate if the resolved source has null Data (indicating it
-        // will be stack-allocated at runtime). Per-layer allocator buffers
-        // (non-null Data) don't need persistent copies since they survive the
-        // entire training step.
         auto src_opt = resolve_source(name);
-        if (!need_persist && src_opt.has_value() && src_opt->Data) {
-            // Per-layer allocator buffer — persist_saved_layer_tensors will
-            // skip it (Stack.owns returns false), so no pre-allocation needed.
-            continue;
-        }
+        // For capture safety, preallocate block save tensors even when they
+        // appear non-stack-backed at prep time. Runtime dispatch may route
+        // them through stack-backed storage depending on recompute/layout.
         if (src_opt.has_value() && src_opt->Data) {
             ensure_buffer(name, src_opt->bytes());
             continue;
         }
         std::size_t inferred_bytes = 0;
         if (infer_block_bytes(name, inferred_bytes)) {
+            ensure_buffer(name, inferred_bytes);
+            continue;
+        }
+        if (infer_graph_ref_bytes(name, inferred_bytes)) {
             ensure_buffer(name, inferred_bytes);
             continue;
         }
@@ -941,6 +1015,190 @@ void CompiledExecutor::prepare_saved_buffers_for_capture(const std::vector<std::
             }
         }
     }
+
+    // Some ops persist internal saved tensors with op-scoped names that are not
+    // in forward.save (e.g., mamba_gated_rmsnorm saves "<op_id>.rstd"/".normed").
+    // Pre-allocate those buffers before capture to avoid cudaMalloc in dispatch.
+    const CompiledGraph* graph = capture_graph ? capture_graph : mCurrentGraph;
+    if (graph) {
+        for (const auto& op : graph->ops) {
+            if (op.type != CompiledOpType::MambaGatedRMSNorm || op.op_id.empty()) {
+                continue;
+            }
+            if (op.inputs.empty() || op.inputs[0].shape.empty()) {
+                continue;
+            }
+            const auto& x_ref = op.inputs[0];
+            const auto x_elems = shape_nelem(x_ref.shape);
+            if (x_elems == 0) {
+                continue;
+            }
+
+            const std::size_t normed_bytes =
+                x_elems * static_cast<std::size_t>(get_dtype_size(x_ref.dtype));
+            ensure_buffer(op.op_id + ".normed", normed_bytes);
+
+            const int groups = op.attrs.n_groups > 0 ? op.attrs.n_groups : 1;
+            long rows = x_ref.shape[0];
+            if (x_ref.shape.size() >= 3) {
+                rows *= x_ref.shape[1];
+            }
+            if (rows > 0 && groups > 0) {
+                const std::size_t rstd_bytes =
+                    static_cast<std::size_t>(rows) *
+                    static_cast<std::size_t>(groups) * sizeof(float);
+                ensure_buffer(op.op_id + ".rstd", rstd_bytes);
+            }
+        }
+    }
+}
+
+void CompiledExecutor::prepare_gdr_buffers_for_capture(const CompiledGraph& capture_graph) {
+    long max_checkpoints_elems = 0;
+    long max_workspace_elems = 0;
+    long max_fwd_workspace_elems = 0;
+    std::vector<long> fwd_checkpoint_requirements;
+
+    constexpr long kWsAlignFloats = 128 / sizeof(float);
+    constexpr int kLp = 64;
+    auto align_up = [](long x, long align) { return ((x + align - 1) / align) * align; };
+
+    for (const auto& op : capture_graph.ops) {
+        if (op.type == CompiledOpType::ChunkGatedDeltaRule) {
+            // Forward op layout:
+            // [q, k, v, g, beta, initial_state(optional)]
+            if (op.inputs.size() < 5) {
+                continue;
+            }
+            const auto& q_shape = op.inputs[0].shape;
+            const auto& v_shape = op.inputs[2].shape;
+            if (q_shape.size() != 4 || v_shape.size() != 4) {
+                continue;
+            }
+            const long B = q_shape[0];
+            const long T = q_shape[1];
+            const long H = q_shape[2];
+            const long Kdim = q_shape[3];
+            const long Vdim = v_shape[3];
+            if (B <= 0 || T <= 0 || H <= 0 || Kdim <= 0 || Vdim <= 0) {
+                continue;
+            }
+            const int chunk_size = op.attrs.chunk_size > 0 ? op.attrs.chunk_size : 64;
+            const int num_chunks = static_cast<int>((T + chunk_size - 1) / chunk_size);
+            const long checkpoints_elems =
+                B * H * static_cast<long>(num_chunks + 1) * Kdim * Vdim;
+            fwd_checkpoint_requirements.push_back(checkpoints_elems);
+            long fwd_ws_stride = 0;
+            fwd_ws_stride = align_up(fwd_ws_stride, kWsAlignFloats) + static_cast<long>(kLp) * Vdim;  // u
+            fwd_ws_stride = align_up(fwd_ws_stride, kWsAlignFloats) + static_cast<long>(kLp) * Kdim;  // w
+            fwd_ws_stride = align_up(fwd_ws_stride, kWsAlignFloats) + static_cast<long>(kLp) * Kdim;  // k
+            fwd_ws_stride = align_up(fwd_ws_stride, kWsAlignFloats) + static_cast<long>(kLp) * Vdim;  // vnew_pre
+            fwd_ws_stride = align_up(fwd_ws_stride, kWsAlignFloats) + static_cast<long>(kLp);         // gcum
+            fwd_ws_stride = align_up(fwd_ws_stride, kWsAlignFloats);
+            const long workspace_elems = B * H * static_cast<long>(num_chunks) * fwd_ws_stride;
+            max_fwd_workspace_elems = std::max(max_fwd_workspace_elems, workspace_elems);
+            continue;
+        }
+
+        if (op.type == CompiledOpType::ChunkGatedDeltaRuleBackward) {
+            // Backward op layout:
+            // [d_out, d_final_state(optional), q, k, v, g, beta, initial_state(optional)]
+            if (op.inputs.size() < 7) {
+                continue;
+            }
+            const std::size_t q_idx = 2;
+            const std::size_t v_idx = 4;
+            if (op.inputs.size() <= v_idx) {
+                continue;
+            }
+            const auto& q_shape = op.inputs[q_idx].shape;
+            const auto& v_shape = op.inputs[v_idx].shape;
+            if (q_shape.size() != 4 || v_shape.size() != 4) {
+                continue;
+            }
+
+            const long B = q_shape[0];
+            const long T = q_shape[1];
+            const long H = q_shape[2];
+            const long Kdim = q_shape[3];
+            const long Vdim = v_shape[3];
+            if (B <= 0 || T <= 0 || H <= 0 || Kdim <= 0 || Vdim <= 0) {
+                continue;
+            }
+
+            const int chunk_size = op.attrs.chunk_size > 0 ? op.attrs.chunk_size : 64;
+            const int num_chunks = static_cast<int>((T + chunk_size - 1) / chunk_size);
+            const long checkpoints_elems =
+                B * H * static_cast<long>(num_chunks + 1) * Kdim * Vdim;
+            max_checkpoints_elems = std::max(max_checkpoints_elems, checkpoints_elems);
+
+            const long c_storage_floats = Kdim * Kdim;
+            long chunk_ws_stride = 0;
+            chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + static_cast<long>(kLp) * kLp;    // M
+            chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + static_cast<long>(kLp) * kLp;    // A
+            chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + static_cast<long>(kLp) * Kdim;  // W
+            chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + static_cast<long>(kLp) * Vdim;  // VNEW
+            chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + static_cast<long>(kLp) * Vdim;  // DU
+            chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + static_cast<long>(kLp) * Kdim;  // DW
+            chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + static_cast<long>(kLp) * Kdim;  // DQ
+            chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + static_cast<long>(kLp) * Kdim;  // DK
+            chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + static_cast<long>(kLp);         // DG
+            chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + static_cast<long>(kLp);         // DB
+            chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + Kdim * Vdim;                    // DHT1
+            chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + c_storage_floats;               // C fp32
+            chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats) + 1;                              // EG
+            chunk_ws_stride = align_up(chunk_ws_stride, kWsAlignFloats);                                  // total stride
+            const long dh_storage_per_chunk = Kdim * Vdim;
+            const long multikernel_ws_size =
+                static_cast<long>(num_chunks) * chunk_ws_stride +
+                static_cast<long>(num_chunks) * dh_storage_per_chunk;
+            const long scalar_ws_stride =
+                static_cast<long>(chunk_size) * (4 * Kdim + 2 * Vdim + 2) +
+                static_cast<long>(2 * kLp * kLp);
+            const long workspace_size = std::max(multikernel_ws_size, scalar_ws_stride);
+            const long workspace_elems = B * H * workspace_size;
+            max_workspace_elems = std::max(max_workspace_elems, workspace_elems);
+        }
+    }
+
+    auto& scratch = mRunState.scratch();
+    if (!fwd_checkpoint_requirements.empty()) {
+        if (scratch.gdr_fwd_checkpoints.size() < fwd_checkpoint_requirements.size()) {
+            scratch.gdr_fwd_checkpoints.resize(fwd_checkpoint_requirements.size());
+        }
+        for (std::size_t i = 0; i < fwd_checkpoint_requirements.size(); ++i) {
+            const long required = fwd_checkpoint_requirements[i];
+            Tensor& slot = scratch.gdr_fwd_checkpoints[i];
+            if (!slot.Data ||
+                slot.DType != ETensorDType::FP32 ||
+                slot.nelem() < required) {
+                const std::string name = "gdr_fwd_checkpoints_" + std::to_string(i);
+                slot = mRunState.Allocator->allocate(
+                    ETensorDType::FP32, name.c_str(), EAllocationType::ON_DEVICE, {required});
+            }
+        }
+    }
+    if (max_fwd_workspace_elems > 0 &&
+        (!scratch.gdr_fwd_workspace.Data ||
+         scratch.gdr_fwd_workspace.DType != ETensorDType::FP32 ||
+         scratch.gdr_fwd_workspace.nelem() < max_fwd_workspace_elems)) {
+        scratch.gdr_fwd_workspace = mRunState.Allocator->allocate(
+            ETensorDType::FP32, "gdr_fwd_workspace", EAllocationType::ON_DEVICE, {max_fwd_workspace_elems});
+    }
+    if (max_checkpoints_elems > 0 &&
+        (!scratch.gdr_bwd_checkpoints.Data ||
+         scratch.gdr_bwd_checkpoints.DType != ETensorDType::FP32 ||
+         scratch.gdr_bwd_checkpoints.nelem() < max_checkpoints_elems)) {
+        scratch.gdr_bwd_checkpoints = mRunState.Allocator->allocate(
+            ETensorDType::FP32, "gdr_bwd_checkpoints", EAllocationType::ON_DEVICE, {max_checkpoints_elems});
+    }
+    if (max_workspace_elems > 0 &&
+        (!scratch.gdr_bwd_workspace.Data ||
+         scratch.gdr_bwd_workspace.DType != ETensorDType::FP32 ||
+         scratch.gdr_bwd_workspace.nelem() < max_workspace_elems)) {
+        scratch.gdr_bwd_workspace = mRunState.Allocator->allocate(
+            ETensorDType::FP32, "gdr_bwd_workspace", EAllocationType::ON_DEVICE, {max_workspace_elems});
+    }
 }
 
 void CompiledExecutor::save_tensors(const std::vector<std::string>& save_list, bool force_persist) {
@@ -954,10 +1212,9 @@ void CompiledExecutor::save_tensors(const std::vector<std::string>& save_list, b
          capture_status != cudaStreamCaptureStatusNone);
     const bool capturing = mCapturing || in_capture;
 
-    // Recompute is only active when enabled in runtime options.
-    // Do NOT use mRecomputeFn here: it's always set when the graph is compiled,
-    // even for no-recompute runs, and would cause metadata-only saves.
-    const bool recompute_enabled = mOptions.recompute_enabled();
+    // Recompute is only active when explicitly enabled for this execution.
+    // This gate is set by GraphExecutor after validating runtime options + plan.
+    const bool recompute_enabled = mRecomputeEnabled;
 
     auto prefer_live_tensor = [&](const std::string& tensor_name) -> bool {
         if (force_persist) {
@@ -988,9 +1245,15 @@ void CompiledExecutor::save_tensors(const std::vector<std::string>& save_list, b
         int layer_idx = -1;
         std::string field;
         if (parse_block_param(name, layer_idx, field)) {
-            return mSlotRegistry->is_shared(strip_ssa_suffix(field));
+            if (auto entry = mSlotRegistry->lookup(strip_ssa_suffix(field))) {
+                return entry->memory_hint == ActivationMemoryHint::Shared;
+            }
+            return std::nullopt;
         }
-        return mSlotRegistry->is_shared(strip_ssa_suffix(name));
+        if (auto entry = mSlotRegistry->lookup(strip_ssa_suffix(name))) {
+            return entry->memory_hint == ActivationMemoryHint::Shared;
+        }
+        return std::nullopt;
     };
 
     auto is_mapped_slot = [&](const std::string& name) -> std::optional<bool> {
@@ -1026,7 +1289,8 @@ void CompiledExecutor::save_tensors(const std::vector<std::string>& save_list, b
         if (shared.has_value()) {
             return shared.value();
         }
-        return true;
+        // Unknown tensors default to non-persistent unless explicitly forced.
+        return false;
     };
 
     auto save_tensor_with_policy = [&](const std::string& name, const Tensor& src,
@@ -1043,14 +1307,22 @@ void CompiledExecutor::save_tensors(const std::vector<std::string>& save_list, b
             return;
         }
 
-        const bool need_persist = should_persist(name, prefer_live, force_persist_name) && src.Data != nullptr;
+        const bool src_stack_backed = src.Data && mRunState.Stack.owns(src.Data);
+        const bool need_persist =
+            (should_persist(name, prefer_live, force_persist_name) || src_stack_backed) &&
+            src.Data != nullptr;
         if (need_persist && src.Data != nullptr) {
             const size_t bytes = src.bytes();
             auto buf_it = mMoeSavedBuffers.find(name);
             if (buf_it == mMoeSavedBuffers.end() || mMoeSavedSizes[name] < bytes) {
                 if (capturing) {
-                    throw std::runtime_error("CompiledExecutor: missing preallocated save buffer for '" + name +
-                                             "' during CUDA graph capture");
+                    // During CUDA graph capture we cannot allocate new buffers.
+                    // Fall back to metadata-only save so backward can resolve
+                    // from live/recomputed tensors instead of aborting capture.
+                    Tensor meta = src;
+                    meta.Data = nullptr;
+                    (*mSaved)[name] = meta;
+                    return;
                 }
                 if (buf_it != mMoeSavedBuffers.end() && buf_it->second != nullptr) {
                     CUDA_CHECK(cudaFree(buf_it->second));
@@ -1078,10 +1350,25 @@ void CompiledExecutor::save_tensors(const std::vector<std::string>& save_list, b
         (*mSaved)[name] = src;
     };
 
+    auto is_lora_hook_activation = [&](const std::string& tensor_name) -> bool {
+        if (!mLoRAConfig) {
+            return false;
+        }
+        int layer_idx = -1;
+        std::string field;
+        if (!parse_block_param(tensor_name, layer_idx, field)) {
+            return false;
+        }
+        const std::string base = strip_ssa_suffix(field);
+        return (base == "swiglu" || base == "swiglu_flat" ||
+                base == "att" || base == "att_flat");
+    };
+
     for (const auto& name : save_list) {
         const bool force_persist_name =
             (name == "xF_flat" || name == "xF" || name == "ln_final" ||
-             name == "ln_final_rstd" || name == "residual_final" || name == "final_residual");
+             name == "ln_final_rstd" || name == "residual_final" || name == "final_residual" ||
+             is_lora_hook_activation(name));
         // Skip tensors already saved directly by dispatch (e.g. mamba_gated_rmsnorm saves rstd/normed),
         // unless we are forcing a persistent copy to replace metadata-only entries.
         auto saved_it = mSaved->find(name);
@@ -1345,6 +1632,14 @@ Tensor& CompiledExecutor::resolve_tensor(const TensorRef& ref) {
         }
     };
 
+    if (!ref.name.empty()) {
+        auto name_it = mNamedTensors.find(ref.name);
+        if (name_it != mNamedTensors.end() && name_it->second.Data) {
+            log_tensor(name_it->second, "named");
+            return name_it->second;
+        }
+    }
+
     // Only check gradient resolution for tensors flagged as gradients at compile time.
     // This avoids calling base_param_from_grad() (string substr + find) for the ~80%
     // of tensors that are activations/weights, not gradients.
@@ -1353,7 +1648,11 @@ Tensor& CompiledExecutor::resolve_tensor(const TensorRef& ref) {
             bool accum = false;
             if (Tensor* grad = mGrads.get_param_grad(*base, accum)) {
                 if (grad->Data) {
-                    Tensor resolved = ref.shape.empty() ? *grad : view_tensor(*grad, ref.shape);
+                    Tensor resolved = *grad;
+                    if (!ref.shape.empty() &&
+                        shape_nelem(ref.shape) == static_cast<std::size_t>(grad->nelem())) {
+                        resolved = view_tensor(*grad, ref.shape);
+                    }
                     if (tid >= 0) {
                         mTensors[static_cast<std::size_t>(tid)] = resolved;
                         return mTensors[static_cast<std::size_t>(tid)];
@@ -1506,12 +1805,16 @@ Tensor& CompiledExecutor::resolve_tensor(const TensorRef& ref) {
                     if (it->second.Data != nullptr) {
                         return it->second;
                     }
-                    // Metadata-only: try to resolve from live buffer via flat vector
-                    if (tid >= 0 && mTensors[static_cast<std::size_t>(tid)].Data) {
-                        return mTensors[static_cast<std::size_t>(tid)];
-                    }
+                    // Metadata-only: resolve from current live tensors first.
                     if (Tensor* live = try_resolve_saved_live(ref.name, it->second)) {
                         return *live;
+                    }
+                    // As a last resort, reuse cached tensor-id only if it points to
+                    // persistent (non-stack) memory; stack pointers can become stale
+                    // across layer checkpoint restores under recompute/capture.
+                    if (tid >= 0 && mTensors[static_cast<std::size_t>(tid)].Data &&
+                        !mRunState.Stack.owns(mTensors[static_cast<std::size_t>(tid)].Data)) {
+                        return mTensors[static_cast<std::size_t>(tid)];
                     }
                     return it->second;
                 }
@@ -1521,6 +1824,44 @@ Tensor& CompiledExecutor::resolve_tensor(const TensorRef& ref) {
             // Already checked mTensors[tid] above; if we get here, tensor was not found
             if (tid >= 0 && mTensors[static_cast<std::size_t>(tid)].Data) {
                 return mTensors[static_cast<std::size_t>(tid)];
+            }
+            // Materialize effective tensors on demand (e.g. *_weight_eff = *_weight + 1).
+            if (!ref.name.empty() && ref.name.size() > 4 &&
+                ref.name.compare(ref.name.size() - 4, 4, "_eff") == 0) {
+                const std::string base_name = ref.name.substr(0, ref.name.size() - 4);
+                Tensor* base_ptr = nullptr;
+                if (mWeights.has(base_name)) {
+                    base_ptr = &mWeights.get(base_name);
+                } else if (mSaved) {
+                    auto it = mSaved->find(base_name);
+                    if (it != mSaved->end() && it->second.Data) {
+                        base_ptr = &it->second;
+                    }
+                }
+                if (!base_ptr && mCurrentGraph) {
+                    const int base_tid = mCurrentGraph->find_tensor_id(base_name);
+                    if (base_tid >= 0 && static_cast<std::size_t>(base_tid) < mTensors.size() &&
+                        mTensors[static_cast<std::size_t>(base_tid)].Data) {
+                        base_ptr = &mTensors[static_cast<std::size_t>(base_tid)];
+                    }
+                }
+                if (base_ptr && base_ptr->Data) {
+                    std::vector<long> shape(base_ptr->Sizes.begin(),
+                                            base_ptr->Sizes.begin() + base_ptr->Rank);
+                    Tensor ones = mRunState.temp_alloc(base_ptr->DType, shape);
+                    Tensor eff = mRunState.temp_alloc(base_ptr->DType, shape);
+                    mTemps.push_back(ones);
+                    mTemps.push_back(eff);
+                    fill_constant(ones, 1.0f, static_cast<std::size_t>(ones.nelem()), mRunState.MainStream);
+                    vector_add_sr(eff, *base_ptr, ones, 1.0f,
+                                  static_cast<long>(base_ptr->nelem()), 0, mRunState.MainStream);
+                    if (tid >= 0 && static_cast<std::size_t>(tid) < mTensors.size()) {
+                        mTensors[static_cast<std::size_t>(tid)] = eff;
+                        return mTensors[static_cast<std::size_t>(tid)];
+                    }
+                    throw std::runtime_error(
+                        "CompiledExecutor: mapped effective tensor requires valid tensor_id: " + ref.name);
+                }
             }
             throw std::runtime_error("CompiledExecutor: tensor not found: " + ref.name);
         }
@@ -1567,7 +1908,11 @@ Tensor& CompiledExecutor::ensure_output_tensor(const TensorRef& ref) {
             bool accum = false;
             if (Tensor* grad = mGrads.get_param_grad(*base, accum)) {
                 if (grad->Data) {
-                    Tensor resolved = ref.shape.empty() ? *grad : view_tensor(*grad, ref.shape);
+                    Tensor resolved = *grad;
+                    if (!ref.shape.empty() &&
+                        shape_nelem(ref.shape) == static_cast<std::size_t>(grad->nelem())) {
+                        resolved = view_tensor(*grad, ref.shape);
+                    }
                     if (tid >= 0) {
                         mTensors[static_cast<std::size_t>(tid)] = resolved;
                         return mTensors[static_cast<std::size_t>(tid)];
@@ -1719,6 +2064,8 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
     mComm = &comm;
     mCurrentGraph = &graph;
     mTemps.clear();
+    mRunState.scratch().gdr_fwd_write_count = 0;
+    mRunState.scratch().gdr_fwd_read_count = 0;
     mMoEHostOffsetsCache.clear();
     // cudaFree and cudaMemPoolTrimTo are prohibited during CUDA stream capture —
     // they invalidate the capture. Skip all cleanup when capturing; it will run
@@ -1759,6 +2106,7 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
     }
     // Initialize flat tensor vector indexed by compile-time tensor IDs
     mTensors.assign(static_cast<std::size_t>(graph.num_tensors), Tensor{});
+    mNamedTensors.clear();
     mCurrentLayer = -1;
 
     // Match GraphExecutor behavior: initialize loss/counter buffers for full forward runs.
@@ -1824,7 +2172,7 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
          fwd_capture_status != cudaStreamCaptureStatusNone);
 
     // Check if a tensor will be recomputed in backward (same logic as save_tensors).
-    const bool recompute_enabled_flag = mOptions.recompute_enabled();
+    const bool recompute_enabled_flag = mRecomputeEnabled;
     auto will_recompute_tensor = [&](const std::string& tensor_name) -> bool {
         if (!recompute_enabled_flag || !mSlotRegistry) {
             return false;
@@ -2004,6 +2352,53 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
     // Main dispatch loop - no string comparisons, direct function pointer dispatch
     const char* op_trace_env = std::getenv("SUROGATE_OP_TRACE");
     const bool op_trace = op_trace_env && std::string(op_trace_env) != "0";
+    const int debug_nonfinite_mode = env_int("SUROGATE_DEBUG_CHECK_NONFINITE", 0);
+    const bool debug_nonfinite_forward = (debug_nonfinite_mode & 0x1) != 0;
+    auto check_nonfinite_refs = [&](const CompiledOp& op, const std::vector<TensorRef>& refs) {
+        if (!debug_nonfinite_forward) {
+            return;
+        }
+        for (const auto& ref : refs) {
+            if (ref.name.empty()) {
+                continue;
+            }
+            const Tensor* t = try_get_tensor(ref.name);
+            if (!t || !t->Data) {
+                continue;
+            }
+            if (t->DType != ETensorDType::BF16 && t->DType != ETensorDType::FP32) {
+                continue;
+            }
+
+            Tensor non_finite_count = mRunState.temp_alloc(ETensorDType::INT32, {1});
+            CUDA_CHECK(cudaMemsetAsync(non_finite_count.Data, 0, sizeof(int), mRunState.MainStream));
+            count_non_finite(non_finite_count, *t, mRunState.MainStream);
+            int host_count = 0;
+            CUDA_CHECK(cudaMemcpyAsync(&host_count,
+                                       non_finite_count.get<int>(),
+                                       sizeof(int),
+                                       cudaMemcpyDeviceToHost,
+                                       mRunState.MainStream));
+            CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
+            mRunState.temp_free(non_finite_count);
+
+            if (host_count > 0) {
+                std::ostringstream oss;
+                oss << "Non-finite detected in forward output tensor '" << ref.name
+                    << "' at op id=" << op.op_id
+                    << " type=" << op_type_to_string(op.type)
+                    << " count=" << host_count
+                    << " dtype=" << static_cast<int>(t->DType)
+                    << " shape=[";
+                for (int d = 0; d < t->Rank; ++d) {
+                    if (d > 0) oss << ",";
+                    oss << t->Sizes[d];
+                }
+                oss << "]";
+                throw std::runtime_error(oss.str());
+            }
+        }
+    };
     for (std::size_t idx = 0; idx < graph.ops.size(); ++idx) {
         if (!full && !graph.required_mask.empty() && !graph.required_mask[idx]) {
             continue;
@@ -2036,6 +2431,9 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
                 case CompiledOpType::Zeros:
                     dispatch_zeros(op);
                     break;
+                case CompiledOpType::Ones:
+                    dispatch_ones(op);
+                    break;
                 case CompiledOpType::FusedResidualRMSNorm:
                     dispatch_fused_residual_rmsnorm(op);
                     break;
@@ -2044,6 +2442,15 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
                     break;
                 case CompiledOpType::View:
                     dispatch_view(op);
+                    break;
+                case CompiledOpType::Transpose:
+                    dispatch_transpose(op);
+                    break;
+                case CompiledOpType::Split:
+                    dispatch_split(op);
+                    break;
+                case CompiledOpType::Concat:
+                    dispatch_concat(op);
                     break;
                 case CompiledOpType::Add:
                     dispatch_add(op);
@@ -2170,6 +2577,7 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
                 default:
                     throw std::runtime_error("CompiledExecutor: unsupported forward op type");
             }
+            check_nonfinite_refs(op, op.outputs);
             // After each op, check for sticky CUDA errors (debug mode)
             if (op_trace) {
                 auto post_err = cudaGetLastError();
@@ -2224,6 +2632,51 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
     }
     mTemps.clear();
 
+    // Dump requested non-block tensors (e.g. xF/residual_final) after forward.
+    // Per-layer block dumps are handled in the layer_end callback above.
+    if (mDebugDumpFn) {
+        static const char* dump_tensors_env = std::getenv("SUROGATE_DEBUG_DUMP_TENSORS");
+        if (dump_tensors_env && *dump_tensors_env) {
+            std::vector<std::string> names;
+            {
+                std::string token;
+                std::stringstream ss(dump_tensors_env);
+                while (std::getline(ss, token, ',')) {
+                    // trim ASCII whitespace
+                    std::size_t b = 0;
+                    while (b < token.size() &&
+                           std::isspace(static_cast<unsigned char>(token[b]))) {
+                        ++b;
+                    }
+                    std::size_t e = token.size();
+                    while (e > b &&
+                           std::isspace(static_cast<unsigned char>(token[e - 1]))) {
+                        --e;
+                    }
+                    if (e > b) {
+                        names.emplace_back(token.substr(b, e - b));
+                    }
+                }
+            }
+            std::vector<std::string> global_names;
+            global_names.reserve(names.size());
+            for (const auto& name : names) {
+                if (name.rfind("blocks[", 0) != 0) {
+                    global_names.push_back(name);
+                }
+            }
+            if (!global_names.empty()) {
+                cudaStreamCaptureStatus dump_capture_status = cudaStreamCaptureStatusNone;
+                const bool dump_capturing =
+                    (cudaStreamIsCapturing(mRunState.MainStream, &dump_capture_status) == cudaSuccess &&
+                     dump_capture_status != cudaStreamCaptureStatusNone);
+                if (!dump_capturing) {
+                    mDebugDumpFn(global_names, -1);
+                }
+            }
+        }
+    }
+
     if (mWeightManager && (mWeightManager->is_streaming_enabled() || mWeightManager->is_offload_enabled())) {
         mWeightManager->release_embeddings(mRunState.MainStream);
         mWeightManager->release_final_norm(mRunState.MainStream);
@@ -2240,6 +2693,7 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
     mCurrentGraph = &graph;
     mRunState.reset_simplified_gradients();
     mTemps.clear();
+    mRunState.scratch().gdr_fwd_read_count = 0;
     // For EP models, keep forward-cached host offsets (populated by ep_dispatch).
     // During gradient checkpointing recompute, ep_dispatch is skipped (it's a
     // communication op), so the GPU persistent buffers may be stale. The forward
@@ -2248,6 +2702,7 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
         mMoEHostOffsetsCache.clear();
     }
     mTensors.assign(static_cast<std::size_t>(graph.num_tensors), Tensor{});
+    mNamedTensors.clear();
     mAccumulateTensors.clear();
     mCurrentLayer = -1;
     mLastRecomputeLayer = -1;
@@ -2662,6 +3117,68 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
     const int num_layers = static_cast<int>(mConfig.NumLayers);
     const char* op_trace_env = std::getenv("SUROGATE_OP_TRACE");
     const bool op_trace = op_trace_env && std::string(op_trace_env) != "0";
+    const char* op_profile_env = std::getenv("SUROGATE_OP_PROFILE");
+    const bool op_profile = op_profile_env && std::string(op_profile_env) != "0";
+    const int debug_nonfinite_mode = env_int("SUROGATE_DEBUG_CHECK_NONFINITE", 0);
+    const bool debug_nonfinite_backward = (debug_nonfinite_mode & 0x2) != 0;
+    auto check_nonfinite_refs = [&](const CompiledOp& op, const std::vector<TensorRef>& refs) {
+        if (!debug_nonfinite_backward) {
+            return;
+        }
+        for (const auto& ref : refs) {
+            if (ref.name.empty()) {
+                continue;
+            }
+            const Tensor* t = try_get_tensor(ref.name);
+            if (!t || !t->Data) {
+                continue;
+            }
+            if (t->DType != ETensorDType::BF16 && t->DType != ETensorDType::FP32) {
+                continue;
+            }
+
+            Tensor non_finite_count = mRunState.temp_alloc(ETensorDType::INT32, {1});
+            CUDA_CHECK(cudaMemsetAsync(non_finite_count.Data, 0, sizeof(int), mRunState.MainStream));
+            count_non_finite(non_finite_count, *t, mRunState.MainStream);
+            int host_count = 0;
+            CUDA_CHECK(cudaMemcpyAsync(&host_count,
+                                       non_finite_count.get<int>(),
+                                       sizeof(int),
+                                       cudaMemcpyDeviceToHost,
+                                       mRunState.MainStream));
+            CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
+            mRunState.temp_free(non_finite_count);
+
+            if (host_count > 0) {
+                std::ostringstream oss;
+                oss << "Non-finite detected in backward output tensor '" << ref.name
+                    << "' at op id=" << op.op_id
+                    << " type=" << op_type_to_string(op.type)
+                    << " count=" << host_count
+                    << " dtype=" << static_cast<int>(t->DType)
+                    << " shape=[";
+                for (int d = 0; d < t->Rank; ++d) {
+                    if (d > 0) oss << ",";
+                    oss << t->Sizes[d];
+                }
+                oss << "]";
+                throw std::runtime_error(oss.str());
+            }
+        }
+    };
+    std::unordered_map<std::string, double> op_profile_total_ms;
+    std::unordered_map<std::string, std::size_t> op_profile_counts;
+    cudaEvent_t op_profile_start = nullptr;
+    cudaEvent_t op_profile_end = nullptr;
+    if (op_profile) {
+        CUDA_CHECK(cudaEventCreateWithFlags(&op_profile_start, cudaEventDefault));
+        CUDA_CHECK(cudaEventCreateWithFlags(&op_profile_end, cudaEventDefault));
+    }
+    cudaStreamCaptureStatus bwd_capture_status = cudaStreamCaptureStatusNone;
+    const bool bwd_stream_capturing =
+        mCapturing ||
+        (cudaStreamIsCapturing(mRunState.MainStream, &bwd_capture_status) == cudaSuccess &&
+         bwd_capture_status != cudaStreamCaptureStatusNone);
 
     std::vector<std::size_t> layer_start_indices(num_layers, SIZE_MAX);
     std::vector<bool> layer_seen_any(num_layers, false);
@@ -2676,6 +3193,9 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
         const int op_layer_any = op_layer_idx_any(op);
         if (skip_logits_grad && is_logits_grad_op(op)) {
             continue;
+        }
+        if (op_profile) {
+            CUDA_CHECK(cudaEventRecord(op_profile_start, mRunState.MainStream));
         }
 
         if (op.layer_start >= 0) {
@@ -2805,6 +3325,16 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
                 case CompiledOpType::View:
                     dispatch_view_backward(op);
                     break;
+                case CompiledOpType::Transpose:
+                    dispatch_transpose(op);
+                    break;
+                // Split/concat may appear in backward graphs via autodiff rules.
+                case CompiledOpType::Split:
+                    dispatch_split(op);
+                    break;
+                case CompiledOpType::Concat:
+                    dispatch_concat(op);
+                    break;
                 // "add" ops in the backward graph are gradient-accumulation nodes,
                 // so we must execute them as forward add (sum inputs), not add-backward.
                 case CompiledOpType::Add:
@@ -2812,6 +3342,10 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
                     break;
                 // Zeros in backward is a no-op
                 case CompiledOpType::Zeros:
+                    dispatch_zeros_backward(op);
+                    break;
+                // Ones in backward is a no-op
+                case CompiledOpType::Ones:
                     dispatch_zeros_backward(op);
                     break;
 
@@ -2920,6 +3454,7 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
                     throw std::runtime_error(oss.str());
                 }
             }
+            check_nonfinite_refs(op, op.outputs);
 
             // Per-op CUDA error check in trace mode: detects illegal memory accesses from launched kernels
             if (op_trace) {
@@ -2933,46 +3468,59 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
                 }
             }
 
+            if (op_profile) {
+                CUDA_CHECK(cudaEventRecord(op_profile_end, mRunState.MainStream));
+                CUDA_CHECK(cudaEventSynchronize(op_profile_end));
+                float elapsed_ms = 0.0f;
+                CUDA_CHECK(cudaEventElapsedTime(&elapsed_ms, op_profile_start, op_profile_end));
+                const std::string op_name = op_type_to_string(op.type);
+                op_profile_total_ms[op_name] += static_cast<double>(elapsed_ms);
+                op_profile_counts[op_name] += 1;
+            }
+
             // Memory management - prune tensors after last use, then restore stack at layer boundaries.
             // If live cross-layer tensors exist on the stack, persist them to allocated memory first.
             prune_by_last_use(idx);
-            if (op.layer_end >= 0 &&
-                op.layer_end != last_layer_restored) {
-                // Persist any cross-layer tensors that still live on the stack.
-                // These tensors (e.g., d_blocks[N].router_logits for MoE aux loss) have
-                // last_use beyond the current layer, so they must survive stack restore.
-                for (const auto& [name, use_idx] : last_use) {
-                    if (use_idx <= idx) continue;
-                    int tid = graph.find_tensor_id(name);
-                    if (tid < 0 || static_cast<std::size_t>(tid) >= mTensors.size()) continue;
-                    auto& tensor = mTensors[static_cast<std::size_t>(tid)];
-                    if (tensor.Data && mRunState.Stack.owns(tensor.Data)) {
-                        // Copy to persistent GPU memory
-                        const std::size_t nbytes = tensor.bytes();
-                        std::byte* persistent = nullptr;
-                        CUDA_CHECK(cudaMalloc(&persistent, nbytes));
-                        CUDA_CHECK(cudaMemcpyAsync(persistent, tensor.Data, nbytes,
-                                                    cudaMemcpyDeviceToDevice, mRunState.MainStream));
-                        tensor.Data = persistent;
-                        // Track for cleanup at end of backward
-                        mPersistedBackwardTensors.push_back(persistent);
+            if (op.layer_end >= 0 && op.layer_end != last_layer_restored) {
+                if (!bwd_stream_capturing) {
+                    // Persist any cross-layer tensors that still live on the stack.
+                    // These tensors (e.g., d_blocks[N].router_logits for MoE aux loss) have
+                    // last_use beyond the current layer, so they must survive stack restore.
+                    for (const auto& [name, use_idx] : last_use) {
+                        if (use_idx <= idx) continue;
+                        int tid = graph.find_tensor_id(name);
+                        if (tid < 0 || static_cast<std::size_t>(tid) >= mTensors.size()) continue;
+                        auto& tensor = mTensors[static_cast<std::size_t>(tid)];
+                        if (tensor.Data && mRunState.Stack.owns(tensor.Data)) {
+                            // Copy to persistent GPU memory
+                            const std::size_t nbytes = tensor.bytes();
+                            std::byte* persistent = nullptr;
+                            CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&persistent), nbytes));
+                            CUDA_CHECK(cudaMemcpyAsync(persistent, tensor.Data, nbytes,
+                                                       cudaMemcpyDeviceToDevice, mRunState.MainStream));
+                            tensor.Data = persistent;
+                            // Track for cleanup at end of backward
+                            mPersistedBackwardTensors.push_back(persistent);
+                        }
+                    }
+
+                    // Release this layer's offloaded weights (if applicable)
+                    handle_layer_end(op.layer_end);
+
+                    // Trigger async gradient reduction for this layer on side_stream.
+                    // This overlaps communication with the next layer's backward compute on MainStream.
+                    if (mComm && mComm->world_size() > 1) {
+                        // Record event on MainStream to ensure layer gradients are ready
+                        CUDA_CHECK(cudaEventRecord(mRunState.side_stream_event(), mRunState.MainStream));
+                        // Wait for gradients on side_stream before starting reduction
+                        CUDA_CHECK(cudaStreamWaitEvent(mRunState.side_stream(), mRunState.side_stream_event(), 0));
+                        // Start async reduction on side_stream (overlaps with next layer backward on MainStream)
+                        mGrads.notify_block(op.layer_end, mRunState.side_stream(), *mComm);
                     }
                 }
 
-                // Release this layer's offloaded weights (if applicable)
-                handle_layer_end(op.layer_end);
-
-                // Trigger async gradient reduction for this layer on side_stream.
-                // This overlaps communication with the next layer's backward compute on MainStream.
-                if (mComm && mComm->world_size() > 1) {
-                    // Record event on MainStream to ensure layer gradients are ready
-                    CUDA_CHECK(cudaEventRecord(mRunState.side_stream_event(), mRunState.MainStream));
-                    // Wait for gradients on side_stream before starting reduction
-                    CUDA_CHECK(cudaStreamWaitEvent(mRunState.side_stream(), mRunState.side_stream_event(), 0));
-                    // Start async reduction on side_stream (overlaps with next layer backward on MainStream)
-                    mGrads.notify_block(op.layer_end, mRunState.side_stream(), *mComm);
-                }
-                // Restore stack and clear temps
+                // During CUDA graph capture, we must still restore stack at each layer boundary
+                // to bound peak memory; only capture-unsafe work above is skipped.
                 mRunState.Stack.restore(initial_checkpoint);
                 mTemps.clear();
                 prune_stack_tensors(op.layer_end);
@@ -3031,6 +3579,25 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
             throw std::runtime_error(oss.str());
         }
 
+    }
+
+    if (op_profile && !op_profile_total_ms.empty()) {
+        std::vector<std::pair<std::string, double>> totals(op_profile_total_ms.begin(), op_profile_total_ms.end());
+        std::sort(totals.begin(), totals.end(),
+                  [](const auto& a, const auto& b) { return a.second > b.second; });
+        std::cerr << "[OP PROFILE][backward] totals:\n";
+        for (const auto& [name, total_ms] : totals) {
+            const std::size_t count = op_profile_counts[name];
+            const double avg_ms = count > 0 ? (total_ms / static_cast<double>(count)) : 0.0;
+            std::cerr << "  " << name
+                      << " total=" << total_ms << "ms"
+                      << " count=" << count
+                      << " avg=" << avg_ms << "ms\n";
+        }
+    }
+    if (op_profile) {
+        if (op_profile_start) cudaEventDestroy(op_profile_start);
+        if (op_profile_end) cudaEventDestroy(op_profile_end);
     }
 
     // Final cleanup - pass -1 to allow full pruning (backward complete)

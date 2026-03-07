@@ -570,9 +570,14 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
 
         self.ensure_directories()
 
-        # Default vision training to enabled for multimodal models.
-        if self.train_vision is None and getattr(self.model_template, 'is_multimodal', False):
-            self.train_vision = True
+        # Vision training is opt-in. Even for multimodal templates, default to text
+        # training unless explicitly requested by the user.
+        if self.train_vision is None:
+            if getattr(self.model_template, 'is_multimodal', False):
+                logger.info(
+                    "train_vision is not set; defaulting to False for multimodal models. "
+                    "Set train_vision=true to enable on-the-fly vision training.")
+            self.train_vision = False
         if self.train_vision and not getattr(self.model_template, 'is_multimodal', False):
             logger.warning("train_vision=True but model is not multimodal; disabling vision training.")
             self.train_vision = False

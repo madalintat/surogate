@@ -879,10 +879,10 @@ __device__ __forceinline__ float softplus_stable(float x) {
     return log1pf(expf(x));
 }
 
-template<typename TData, typename TParam>
+template<typename TOut, typename TIn, typename TParam>
 __global__ void qwen3_5_decay_forward_kernel(
-    TData* out,
-    const TData* a,
+    TOut* out,
+    const TIn* a,
     const TParam* a_log,
     const TParam* dt_bias,
     long total,
@@ -897,16 +897,16 @@ __global__ void qwen3_5_decay_forward_kernel(
     const float x = af + dt;
     const float sp = softplus_stable(x);
     const float g = -expf(A) * sp;
-    out[idx] = from_float<TData>(g);
+    out[idx] = from_float<TOut>(g);
 }
 
-template<typename TData, typename TParam>
+template<typename TIn, typename TGrad, typename TParam>
 __global__ void qwen3_5_decay_backward_kernel(
-    TData* d_a,
+    TIn* d_a,
     float* d_a_log,
     float* d_dt_bias,
-    const TData* d_out,
-    const TData* a,
+    const TGrad* d_out,
+    const TIn* a,
     const TParam* a_log,
     const TParam* dt_bias,
     long total,
@@ -926,7 +926,7 @@ __global__ void qwen3_5_decay_backward_kernel(
     const float sp = softplus_stable(x);
 
     const float dga = -expA * sig;  // dg/da and dg/ddt_bias
-    d_a[idx] = from_float<TData>(dout * dga);
+    d_a[idx] = from_float<TIn>(dout * dga);
     atomicAdd(&d_a_log[h], dout * (-expA * sp));  // dg/dA_log
     atomicAdd(&d_dt_bias[h], dout * dga);
 }
@@ -990,10 +990,10 @@ __global__ void repeat_interleave_heads_backward_kernel(
     d_inp[idx] = from_float<T>(acc);
 }
 
-template<typename TData, typename TParam>
+template<typename TOut, typename TIn, typename TParam>
 void launch_qwen3_5_decay_forward(
-    TData* out,
-    const TData* a,
+    TOut* out,
+    const TIn* a,
     const TParam* a_log,
     const TParam* dt_bias,
     long total,
@@ -1005,13 +1005,13 @@ void launch_qwen3_5_decay_forward(
         out, a, a_log, dt_bias, total, H);
 }
 
-template<typename TData, typename TParam>
+template<typename TIn, typename TGrad, typename TParam>
 void launch_qwen3_5_decay_backward(
-    TData* d_a,
+    TIn* d_a,
     float* d_a_log,
     float* d_dt_bias,
-    const TData* d_out,
-    const TData* a,
+    const TGrad* d_out,
+    const TIn* a,
     const TParam* a_log,
     const TParam* dt_bias,
     long total,
@@ -1061,34 +1061,73 @@ void qwen3_5_decay_forward(
     }
 
     if (a.DType == ETensorDType::BF16) {
-        if (A_log.DType == ETensorDType::BF16 && dt_bias.DType == ETensorDType::BF16) {
-            launch_qwen3_5_decay_forward(
-                out.get<nv_bfloat16>(), a.get<nv_bfloat16>(),
-                A_log.get<nv_bfloat16>(), dt_bias.get<nv_bfloat16>(),
-                total, H, stream);
-        } else if (A_log.DType == ETensorDType::FP32 && dt_bias.DType == ETensorDType::FP32) {
-            launch_qwen3_5_decay_forward(
-                out.get<nv_bfloat16>(), a.get<nv_bfloat16>(),
-                A_log.get<float>(), dt_bias.get<float>(),
-                total, H, stream);
+        if (out.DType == ETensorDType::FP32) {
+            if (A_log.DType == ETensorDType::BF16 && dt_bias.DType == ETensorDType::BF16) {
+                launch_qwen3_5_decay_forward(
+                    out.get<float>(), a.get<nv_bfloat16>(),
+                    A_log.get<nv_bfloat16>(), dt_bias.get<nv_bfloat16>(),
+                    total, H, stream);
+            } else if (A_log.DType == ETensorDType::FP32 && dt_bias.DType == ETensorDType::FP32) {
+                launch_qwen3_5_decay_forward(
+                    out.get<float>(), a.get<nv_bfloat16>(),
+                    A_log.get<float>(), dt_bias.get<float>(),
+                    total, H, stream);
+            } else {
+                throw std::logic_error("qwen3_5_decay_forward: unsupported A_log/dt_bias dtype combo");
+            }
+        } else if (out.DType == ETensorDType::BF16) {
+            if (A_log.DType == ETensorDType::BF16 && dt_bias.DType == ETensorDType::BF16) {
+                launch_qwen3_5_decay_forward(
+                    out.get<nv_bfloat16>(), a.get<nv_bfloat16>(),
+                    A_log.get<nv_bfloat16>(), dt_bias.get<nv_bfloat16>(),
+                    total, H, stream);
+            } else if (A_log.DType == ETensorDType::FP32 && dt_bias.DType == ETensorDType::FP32) {
+                launch_qwen3_5_decay_forward(
+                    out.get<nv_bfloat16>(), a.get<nv_bfloat16>(),
+                    A_log.get<float>(), dt_bias.get<float>(),
+                    total, H, stream);
+            } else {
+                throw std::logic_error("qwen3_5_decay_forward: unsupported A_log/dt_bias dtype combo");
+            }
         } else {
-            throw std::logic_error("qwen3_5_decay_forward: unsupported A_log/dt_bias dtype combo");
+            throw std::logic_error("qwen3_5_decay_forward: unsupported output dtype for BF16 input");
         }
     } else if (a.DType == ETensorDType::FP16) {
-        if (A_log.DType == ETensorDType::FP16 && dt_bias.DType == ETensorDType::FP16) {
-            launch_qwen3_5_decay_forward(
-                out.get<half>(), a.get<half>(),
-                A_log.get<half>(), dt_bias.get<half>(),
-                total, H, stream);
-        } else if (A_log.DType == ETensorDType::FP32 && dt_bias.DType == ETensorDType::FP32) {
-            launch_qwen3_5_decay_forward(
-                out.get<half>(), a.get<half>(),
-                A_log.get<float>(), dt_bias.get<float>(),
-                total, H, stream);
+        if (out.DType == ETensorDType::FP32) {
+            if (A_log.DType == ETensorDType::FP16 && dt_bias.DType == ETensorDType::FP16) {
+                launch_qwen3_5_decay_forward(
+                    out.get<float>(), a.get<half>(),
+                    A_log.get<half>(), dt_bias.get<half>(),
+                    total, H, stream);
+            } else if (A_log.DType == ETensorDType::FP32 && dt_bias.DType == ETensorDType::FP32) {
+                launch_qwen3_5_decay_forward(
+                    out.get<float>(), a.get<half>(),
+                    A_log.get<float>(), dt_bias.get<float>(),
+                    total, H, stream);
+            } else {
+                throw std::logic_error("qwen3_5_decay_forward: unsupported A_log/dt_bias dtype combo");
+            }
+        } else if (out.DType == ETensorDType::FP16) {
+            if (A_log.DType == ETensorDType::FP16 && dt_bias.DType == ETensorDType::FP16) {
+                launch_qwen3_5_decay_forward(
+                    out.get<half>(), a.get<half>(),
+                    A_log.get<half>(), dt_bias.get<half>(),
+                    total, H, stream);
+            } else if (A_log.DType == ETensorDType::FP32 && dt_bias.DType == ETensorDType::FP32) {
+                launch_qwen3_5_decay_forward(
+                    out.get<half>(), a.get<half>(),
+                    A_log.get<float>(), dt_bias.get<float>(),
+                    total, H, stream);
+            } else {
+                throw std::logic_error("qwen3_5_decay_forward: unsupported A_log/dt_bias dtype combo");
+            }
         } else {
-            throw std::logic_error("qwen3_5_decay_forward: unsupported A_log/dt_bias dtype combo");
+            throw std::logic_error("qwen3_5_decay_forward: unsupported output dtype for FP16 input");
         }
     } else if (a.DType == ETensorDType::FP32) {
+        if (out.DType != ETensorDType::FP32) {
+            throw std::logic_error("qwen3_5_decay_forward: FP32 input requires FP32 output");
+        }
         if (A_log.DType == ETensorDType::FP32 && dt_bias.DType == ETensorDType::FP32) {
             launch_qwen3_5_decay_forward(
                 out.get<float>(), a.get<float>(),
@@ -1125,6 +1164,9 @@ void qwen3_5_decay_backward(
     if (d_out.Rank != 3 || a.Rank != 3 || A_log.Rank != 1 || dt_bias.Rank != 1) {
         throw std::logic_error("qwen3_5_decay_backward: invalid ranks");
     }
+    if (d_a.DType != a.DType) {
+        throw std::logic_error("qwen3_5_decay_backward: d_a dtype must match a dtype");
+    }
     if (d_A_log.DType != ETensorDType::FP32 || d_dt_bias.DType != ETensorDType::FP32) {
         throw std::logic_error("qwen3_5_decay_backward: d_A_log and d_dt_bias must be FP32");
     }
@@ -1134,37 +1176,77 @@ void qwen3_5_decay_backward(
     fill_zero(d_A_log, stream);
     fill_zero(d_dt_bias, stream);
 
-    if (a.DType == ETensorDType::BF16 && d_out.DType == ETensorDType::BF16) {
-        if (A_log.DType == ETensorDType::BF16 && dt_bias.DType == ETensorDType::BF16) {
-            launch_qwen3_5_decay_backward(
-                d_a.get<nv_bfloat16>(), d_A_log.get<float>(), d_dt_bias.get<float>(),
-                d_out.get<nv_bfloat16>(), a.get<nv_bfloat16>(),
-                A_log.get<nv_bfloat16>(), dt_bias.get<nv_bfloat16>(),
-                total, H, stream);
-        } else if (A_log.DType == ETensorDType::FP32 && dt_bias.DType == ETensorDType::FP32) {
-            launch_qwen3_5_decay_backward(
-                d_a.get<nv_bfloat16>(), d_A_log.get<float>(), d_dt_bias.get<float>(),
-                d_out.get<nv_bfloat16>(), a.get<nv_bfloat16>(),
-                A_log.get<float>(), dt_bias.get<float>(),
-                total, H, stream);
+    if (a.DType == ETensorDType::BF16) {
+        if (d_out.DType == ETensorDType::BF16) {
+            if (A_log.DType == ETensorDType::BF16 && dt_bias.DType == ETensorDType::BF16) {
+                launch_qwen3_5_decay_backward(
+                    d_a.get<nv_bfloat16>(), d_A_log.get<float>(), d_dt_bias.get<float>(),
+                    d_out.get<nv_bfloat16>(), a.get<nv_bfloat16>(),
+                    A_log.get<nv_bfloat16>(), dt_bias.get<nv_bfloat16>(),
+                    total, H, stream);
+            } else if (A_log.DType == ETensorDType::FP32 && dt_bias.DType == ETensorDType::FP32) {
+                launch_qwen3_5_decay_backward(
+                    d_a.get<nv_bfloat16>(), d_A_log.get<float>(), d_dt_bias.get<float>(),
+                    d_out.get<nv_bfloat16>(), a.get<nv_bfloat16>(),
+                    A_log.get<float>(), dt_bias.get<float>(),
+                    total, H, stream);
+            } else {
+                throw std::logic_error("qwen3_5_decay_backward: unsupported A_log/dt_bias dtype combo");
+            }
+        } else if (d_out.DType == ETensorDType::FP32) {
+            if (A_log.DType == ETensorDType::BF16 && dt_bias.DType == ETensorDType::BF16) {
+                launch_qwen3_5_decay_backward(
+                    d_a.get<nv_bfloat16>(), d_A_log.get<float>(), d_dt_bias.get<float>(),
+                    d_out.get<float>(), a.get<nv_bfloat16>(),
+                    A_log.get<nv_bfloat16>(), dt_bias.get<nv_bfloat16>(),
+                    total, H, stream);
+            } else if (A_log.DType == ETensorDType::FP32 && dt_bias.DType == ETensorDType::FP32) {
+                launch_qwen3_5_decay_backward(
+                    d_a.get<nv_bfloat16>(), d_A_log.get<float>(), d_dt_bias.get<float>(),
+                    d_out.get<float>(), a.get<nv_bfloat16>(),
+                    A_log.get<float>(), dt_bias.get<float>(),
+                    total, H, stream);
+            } else {
+                throw std::logic_error("qwen3_5_decay_backward: unsupported A_log/dt_bias dtype combo");
+            }
         } else {
-            throw std::logic_error("qwen3_5_decay_backward: unsupported A_log/dt_bias dtype combo");
+            throw std::logic_error("qwen3_5_decay_backward: unsupported d_out dtype for BF16 input");
         }
-    } else if (a.DType == ETensorDType::FP16 && d_out.DType == ETensorDType::FP16) {
-        if (A_log.DType == ETensorDType::FP16 && dt_bias.DType == ETensorDType::FP16) {
-            launch_qwen3_5_decay_backward(
-                d_a.get<half>(), d_A_log.get<float>(), d_dt_bias.get<float>(),
-                d_out.get<half>(), a.get<half>(),
-                A_log.get<half>(), dt_bias.get<half>(),
-                total, H, stream);
-        } else if (A_log.DType == ETensorDType::FP32 && dt_bias.DType == ETensorDType::FP32) {
-            launch_qwen3_5_decay_backward(
-                d_a.get<half>(), d_A_log.get<float>(), d_dt_bias.get<float>(),
-                d_out.get<half>(), a.get<half>(),
-                A_log.get<float>(), dt_bias.get<float>(),
-                total, H, stream);
+    } else if (a.DType == ETensorDType::FP16) {
+        if (d_out.DType == ETensorDType::FP16) {
+            if (A_log.DType == ETensorDType::FP16 && dt_bias.DType == ETensorDType::FP16) {
+                launch_qwen3_5_decay_backward(
+                    d_a.get<half>(), d_A_log.get<float>(), d_dt_bias.get<float>(),
+                    d_out.get<half>(), a.get<half>(),
+                    A_log.get<half>(), dt_bias.get<half>(),
+                    total, H, stream);
+            } else if (A_log.DType == ETensorDType::FP32 && dt_bias.DType == ETensorDType::FP32) {
+                launch_qwen3_5_decay_backward(
+                    d_a.get<half>(), d_A_log.get<float>(), d_dt_bias.get<float>(),
+                    d_out.get<half>(), a.get<half>(),
+                    A_log.get<float>(), dt_bias.get<float>(),
+                    total, H, stream);
+            } else {
+                throw std::logic_error("qwen3_5_decay_backward: unsupported A_log/dt_bias dtype combo");
+            }
+        } else if (d_out.DType == ETensorDType::FP32) {
+            if (A_log.DType == ETensorDType::FP16 && dt_bias.DType == ETensorDType::FP16) {
+                launch_qwen3_5_decay_backward(
+                    d_a.get<half>(), d_A_log.get<float>(), d_dt_bias.get<float>(),
+                    d_out.get<float>(), a.get<half>(),
+                    A_log.get<half>(), dt_bias.get<half>(),
+                    total, H, stream);
+            } else if (A_log.DType == ETensorDType::FP32 && dt_bias.DType == ETensorDType::FP32) {
+                launch_qwen3_5_decay_backward(
+                    d_a.get<half>(), d_A_log.get<float>(), d_dt_bias.get<float>(),
+                    d_out.get<float>(), a.get<half>(),
+                    A_log.get<float>(), dt_bias.get<float>(),
+                    total, H, stream);
+            } else {
+                throw std::logic_error("qwen3_5_decay_backward: unsupported A_log/dt_bias dtype combo");
+            }
         } else {
-            throw std::logic_error("qwen3_5_decay_backward: unsupported A_log/dt_bias dtype combo");
+            throw std::logic_error("qwen3_5_decay_backward: unsupported d_out dtype for FP16 input");
         }
     } else if (a.DType == ETensorDType::FP32 && d_out.DType == ETensorDType::FP32) {
         if (A_log.DType == ETensorDType::FP32 && dt_bias.DType == ETensorDType::FP32) {

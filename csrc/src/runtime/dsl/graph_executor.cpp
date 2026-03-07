@@ -96,6 +96,19 @@ inline bool stream_is_capturing(cudaStream_t stream) {
     return status != cudaStreamCaptureStatusNone;
 }
 
+inline bool graph_has_qwen35_ops(const CompiledGraph* g) {
+    if (!g) {
+        return false;
+    }
+    for (const auto& op : g->ops) {
+        if (op.type == CompiledOpType::Qwen3_5Decay ||
+            op.type == CompiledOpType::ChunkGatedDeltaRule) {
+            return true;
+        }
+    }
+    return false;
+}
+
 inline void sync_event_if_not_capturing(cudaEvent_t event, cudaStream_t stream) {
     if (!stream_is_capturing(stream)) {
         CUDA_CHECK(cudaEventSynchronize(event));
@@ -733,12 +746,26 @@ void GraphExecutor::execute_forward(long B, long T, NCCLCommunicator& comm, bool
     cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
     const bool in_capture = (cudaStreamIsCapturing(rs.MainStream, &capture_status) == cudaSuccess &&
                              capture_status != cudaStreamCaptureStatusNone);
-    const bool use_graphs = mGraphsEnabled && !in_capture;
+    // Qwen3.5 LoRA forward graph capture/replay is currently unstable (illegal address on
+    // launch for captured forward graph on 128x128 GDR path). Force eager forward for this
+    // case while keeping non-Qwen3.5 models and non-LoRA paths graphed.
+    const bool disable_fwd_graphs_for_qwen35_lora =
+        graph_has_qwen35_ops(mCompiledForward.get()) && mLoRAConfig && mLoRAConfig->enabled();
+    if (disable_fwd_graphs_for_qwen35_lora && mGraphsEnabled &&
+        !mLoggedQwen35LoraFwdGraphDisable) {
+        std::cerr << "GraphExecutor: disabling forward CUDA graphs for Qwen3.5 LoRA "
+                     "(capture-unsafe forward path)." << std::endl;
+        mLoggedQwen35LoraFwdGraphDisable = true;
+    }
+    const bool use_graphs = mGraphsEnabled && !in_capture && !disable_fwd_graphs_for_qwen35_lora;
     if (use_graphs && (mGraphB != B || mGraphT != T)) {
         reset_cuda_graphs();
         mGraphB = B;
         mGraphT = T;
     }
+    const bool recompute_active =
+        mOptions.recompute_enabled() && mRecomputePlan && !mRecomputePlan->empty();
+    mCompiledExecutor->set_recompute_enabled(recompute_active);
     const bool capturing = use_graphs && mForwardGraph == nullptr;
     if (!use_graphs || capturing) {
         mSaved.clear();
@@ -748,12 +775,22 @@ void GraphExecutor::execute_forward(long B, long T, NCCLCommunicator& comm, bool
         // Preallocate persistent save buffers before CUDA graph capture to avoid cudaMalloc
         // inside save_tensors (which is not allowed during capture).
         mCompiledExecutor->set_dimensions(B, T);
-        mCompiledExecutor->prepare_saved_buffers_for_capture(mSaveList);
+        mCompiledExecutor->prepare_saved_buffers_for_capture(mSaveList, mCompiledForward.get());
+        // GDR forward uses persistent checkpoint/workspace slots during capture.
+        // Preallocate them here so chunk_gated_delta_rule never attempts allocation in-capture.
+        mCompiledExecutor->prepare_gdr_buffers_for_capture(*mCompiledForward);
 
         // Prime FP8/FP4 weight caches BEFORE capture so matmul dispatch can consume cached weights
         // without allocating during cudaStreamBeginCapture.
         prime_fp8_weight_cache({});
         prime_fp4_weight_cache({});
+    } else if (!use_graphs && !in_capture) {
+        // External/full-step CUDA graph capture paths (outside GraphExecutor) can still
+        // call save_tensors() while the stream is captured. Preallocate persistent save
+        // buffers during regular eager execution so later captured passes don't need
+        // cudaMalloc (which is forbidden during capture).
+        mCompiledExecutor->set_dimensions(B, T);
+        mCompiledExecutor->prepare_saved_buffers_for_capture(mSaveList, mCompiledForward.get());
     } else if (!mWeightCachesPrimed) {
         // Prime FP4 weight caches on first eager execution (e.g., QLoRA where CUDA
         // graphs are disabled). FP4 on-the-fly quantization (two-level block scaling,
@@ -768,6 +805,7 @@ void GraphExecutor::execute_forward(long B, long T, NCCLCommunicator& comm, bool
 
     auto run_ops = [&]() {
         mCompiledExecutor->set_dimensions(B, T);
+        mCompiledExecutor->set_recompute_enabled(recompute_active);
         mCompiledExecutor->set_capturing(capturing);
         mCompiledExecutor->execute_forward(*mCompiledForward, comm, full, hook);
         // Save tensors for backward (same list as non-compiled path).
@@ -797,12 +835,28 @@ void GraphExecutor::execute_backward(long B, long T, NCCLCommunicator& comm, int
     cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
     const bool in_capture = (cudaStreamIsCapturing(rs.MainStream, &capture_status) == cudaSuccess &&
                              capture_status != cudaStreamCaptureStatusNone);
-    const bool use_graphs = mBackwardGraphsEnabled && mBackwardGraphCapturable && !in_capture;
+    const bool has_qwen35_ops =
+        graph_has_qwen35_ops(mCompiledForward ? mCompiledForward.get() : mCompiledBackward.get());
+    // Qwen3.5 LoRA backward currently routes through a cuBLAS fallback matmul path
+    // that is not capture-safe. Keep forward CUDA graphs enabled, but force eager
+    // backward execution for this case.
+    const bool disable_bwd_graphs_for_qwen35_lora =
+        has_qwen35_ops && mLoRAConfig && mLoRAConfig->enabled();
+    if (disable_bwd_graphs_for_qwen35_lora && mBackwardGraphsEnabled &&
+        !mLoggedQwen35LoraBwdGraphDisable) {
+        std::cerr << "GraphExecutor: disabling backward CUDA graphs for Qwen3.5 LoRA "
+                     "(capture-unsafe matmul fallback path)." << std::endl;
+        mLoggedQwen35LoraBwdGraphDisable = true;
+    }
+    const bool use_graphs = mBackwardGraphsEnabled && mBackwardGraphCapturable && !in_capture &&
+                            !disable_bwd_graphs_for_qwen35_lora;
     if (use_graphs && (mGraphB != B || mGraphT != T)) {
         reset_cuda_graphs();
         mGraphB = B;
         mGraphT = T;
     }
+    const bool recompute_active =
+        mOptions.recompute_enabled() && mRecomputePlan && !mRecomputePlan->empty();
     const int graph_idx = (micro_step > 0) ? 1 : 0;
     const bool capturing = use_graphs && mBackwardGraph[graph_idx] == nullptr;
     if (capturing) {
@@ -810,11 +864,14 @@ void GraphExecutor::execute_backward(long B, long T, NCCLCommunicator& comm, int
         prime_fp8_weight_cache({});
         prime_fp8_weight_cache_transposed({});
         prime_fp4_weight_cache({});
+        // GDR backward uses large persistent workspaces/checkpoints; preallocate
+        // them before capture so no allocator cudaMalloc occurs inside capture.
+        mCompiledExecutor->prepare_gdr_buffers_for_capture(*mCompiledBackward);
     }
 
     auto run_ops = [&]() {
         mCompiledExecutor->set_dimensions(B, T);
-        mCompiledExecutor->set_recompute_enabled(mOptions.recompute_enabled());
+        mCompiledExecutor->set_recompute_enabled(recompute_active);
         mCompiledExecutor->set_recompute_use_graphs(use_graphs && !capturing);
         mCompiledExecutor->set_capturing(capturing);
         mCompiledExecutor->execute_backward(*mCompiledBackward, comm, grad_accum_steps, micro_step, hook,

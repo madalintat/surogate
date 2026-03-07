@@ -29,6 +29,39 @@
 // ----------------------------------------------------------------------------
 // CUDA kernels
 
+__device__ __forceinline__ float sigmoid_stable(float x) {
+    if (x >= 0.0f) {
+        float z = expf(-x);
+        return 1.0f / (1.0f + z);
+    }
+    float z = expf(x);
+    return z / (1.0f + z);
+}
+
+__device__ __forceinline__ float silu_from_gate(float gate) {
+    if (!isfinite(gate)) {
+        return gate > 0.0f ? gate : 0.0f;
+    }
+    float s = sigmoid_stable(gate);
+    return gate * s;
+}
+
+__device__ __forceinline__ float silu_grad_from_gate(float gate) {
+    if (!isfinite(gate)) {
+        return gate > 0.0f ? 1.0f : 0.0f;
+    }
+    float s = sigmoid_stable(gate);
+    float ds = s * (1.0f - s);
+    return fmaf(gate, ds, s);  // s + gate * ds
+}
+
+__device__ __forceinline__ float safe_mul(float a, float b) {
+    if (a == 0.0f || b == 0.0f) {
+        return 0.0f;
+    }
+    return a * b;
+}
+
 /**
  * @brief Basic CUDA kernel for SwiGLU forward pass.
  *
@@ -73,7 +106,8 @@ __global__ void swiglu_forward_kernel(floatX* out, const floatX* inp, float* abs
         for(int k = 0; k < up_inp.size; ++k) {
             float x1 = (float)up_inp[k];
             float x2 = (float)gate_inp[k];
-            packed_out[k] = (floatX)((x1 * x2) / (1.0f + expf(-x2)));
+            float silu_gate = silu_from_gate(x2);
+            packed_out[k] = (floatX)safe_mul(x1, silu_gate);
             if (abs_max_ptr) {
                 thread_max = fmaxf(thread_max, fabsf(packed_out[k]));
             }
@@ -122,7 +156,7 @@ __global__ void swiglu_forward_quant_kernel(__nv_fp8_e4m3* out, float* scale_ptr
     for(int k = 0; k < up_inp.size; ++k) {
         float x1 = (float)up_inp[k];
         float x2 = (float)gate_inp[k];
-        float result = (x1 * x2) / (1.0f + expf(-x2));
+        float result = safe_mul(x1, silu_from_gate(x2));
         floatX qr = (floatX)result;
         __nv_fp8_e4m3 quant;
         quant.__x = __nv_cvt_float_to_fp8(scale * (float)qr, __nv_saturation_t::__NV_SATFINITE, __nv_fp8_interpretation_t::__NV_E4M3);
@@ -211,7 +245,7 @@ __global__ __launch_bounds__(128) void swiglu_forward_persistent_kernel(floatX* 
         for(int k = 0; k < up_inp.size; ++k) {
             float x1 = (float)up_inp[k];
             float x2 = (float)gate_inp[k];
-            packed_out[k] = (floatX)((x1 * x2) / (1.0f + expf(-x2)));
+            packed_out[k] = (floatX)safe_mul(x1, silu_from_gate(x2));
             if (HasAbsMax) {
                 thread_max = fmaxf(thread_max, fabsf((float)packed_out[k]));
             }
@@ -290,7 +324,7 @@ __global__ void swiglu_forward_quant_persistent_kernel(__nv_fp8_e4m3* out, float
         for(int k = 0; k < up_inp.size; ++k) {
             float x1 = (float)up_inp[k];
             float x2 = (float)gate_inp[k];
-            float result = (x1 * x2) / (1.0f + expf(-x2));
+            float result = safe_mul(x1, silu_from_gate(x2));
             floatX qr = (floatX)result;
             __nv_fp8_e4m3 quant;
             quant.__x = __nv_cvt_float_to_fp8(scale * (float)qr, __nv_saturation_t::__NV_SATFINITE, __nv_fp8_interpretation_t::__NV_E4M3);
@@ -363,9 +397,10 @@ __global__ void swiglu_backward_kernel1(floatX* dinp, const floatX* dout, const 
             float x2 = (float)packed_inp2[k];
             float dout = (float)packed_dout[k];
 
-            float sx2 = 1.0f / (1.0f + expf(-x2)); // sigmoid of x2
-            float dx1 = dout * x2 * sx2;
-            float dx2 = dout * x1 * sx2 * (1.0f + x2 * (1.0f - sx2));
+            const float silu_gate = silu_from_gate(x2);
+            const float silu_grad = silu_grad_from_gate(x2);
+            float dx1 = safe_mul(dout, silu_gate);
+            float dx2 = safe_mul(dout, safe_mul(x1, silu_grad));
 
             dinp1[k] = (floatX)dx1;
             dinp2[k] = (floatX)dx2;

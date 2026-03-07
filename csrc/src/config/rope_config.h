@@ -94,7 +94,11 @@ struct RoPEConfig {
                 // Round down to even number (RoPE works on pairs)
                 return (static_cast<int>(head_dim * partial_factor) / 2) * 2;
             case Mode::MULTIMODAL:
-                // For M-RoPE, all dimensions are rotated but with different position IDs
+                // Qwen3.5-style MRoPE can still be partial rotary. Respect partial_factor
+                // when set (< 1), otherwise rotate the full head dimension.
+                if (partial_factor > 0.0f && partial_factor < 1.0f) {
+                    return (static_cast<int>(head_dim * partial_factor) / 2) * 2;
+                }
                 return head_dim;
             case Mode::NONE:
                 return 0;
@@ -132,7 +136,7 @@ struct RoPEConfig {
     [[nodiscard]] bool validate_mrope_sections(int head_dim) const {
         if (mode != Mode::MULTIMODAL) return true;
         int total = mrope_section[0] + mrope_section[1] + mrope_section[2];
-        return total == head_dim / 2;
+        return total == rotary_dim(head_dim) / 2;
     }
 
     /**

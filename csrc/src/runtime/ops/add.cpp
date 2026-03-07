@@ -42,6 +42,38 @@ void CompiledExecutor::dispatch_add_backward(const CompiledOp& op) {
     // IMPORTANT: We must get the base tensor directly from simplified_grads(), not via
     // resolve_tensor(), because resolve_tensor() may return a cached view from mTensors.
     auto assign_output = [&](const TensorRef& ref) {
+        if (!ref.name.empty()) {
+            if (auto base = base_param_from_grad(ref.name)) {
+                bool accumulate = mAccumulateTensors.count(ref.name) > 0;
+                if (!accumulate) {
+                    accumulate = mAccumulateTensors.count("d_" + *base) > 0;
+                }
+                bool grad_accum = false;
+                if (Tensor* grad = mGrads.get_param_grad(*base, grad_accum)) {
+                    if (grad->Data) {
+                        Tensor target = ref.shape.empty() ? *grad : view_tensor(*grad, ref.shape);
+                        if (target.DType != d_out.DType) {
+                            throw std::runtime_error("dispatch_add_backward: dtype mismatch for " + ref.name);
+                        }
+                        if (target.nelem() != d_out.nelem()) {
+                            throw std::runtime_error("dispatch_add_backward: shape mismatch for " + ref.name);
+                        }
+                        if (target.Data != d_out.Data) {
+                            if (accumulate) {
+                                vector_add_sr(target, target, d_out, 1.0f,
+                                              static_cast<long>(target.nelem()), 0, mRunState.MainStream);
+                            } else {
+                                CUDA_CHECK(cudaMemcpyAsync(target.Data, d_out.Data, target.bytes(),
+                                                           cudaMemcpyDeviceToDevice, mRunState.MainStream));
+                            }
+                        }
+                        store_tensor(ref, target);
+                        return;
+                    }
+                }
+            }
+        }
+
         Tensor* base_grad = nullptr;
         if (ref.layer_idx >= 0) {
             auto& grads = mRunState.simplified_grads(ref.layer_idx);

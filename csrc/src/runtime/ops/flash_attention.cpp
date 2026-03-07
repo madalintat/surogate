@@ -56,13 +56,53 @@ void CompiledExecutor::dispatch_flash_attention(const CompiledOp& op) {
         window_size = mConfig.sliding_window_size;
     }
 
-    if (mCuSeqlensGpu) {
+    const bool cudnn_supported = (window_size <= 0) &&
+                                 (Hs > 0) &&
+                                 (Hs % 8 == 0) &&
+                                 (Hs <= 128) &&
+                                 (mRunState.scratch().cudnn_workspace.Data != nullptr);
+
+    // Use FlashAttention varlen when:
+    // - document masking is enabled, or
+    // - cuDNN full-attention is unavailable (e.g. head_dim > 128).
+    //
+    // For the latter, synthesize dense cu_seqlens for (B, T) packed as B documents.
+    const bool use_varlen = (mCuSeqlensGpu != nullptr) || (window_size <= 0 && !cudnn_supported);
+    const int32_t* cu_seqlens_ptr = mCuSeqlensGpu;
+    int num_docs = mNumDocs;
+    int max_doc_seqlen = mMaxDocSeqlen;
+    int total_doc_tokens = mTotalDocTokens;
+    Tensor generated_cu_seqlens;
+    if (use_varlen && cu_seqlens_ptr == nullptr) {
+        num_docs = static_cast<int>(mB);
+        max_doc_seqlen = static_cast<int>(mT);
+        total_doc_tokens = num_docs * max_doc_seqlen;
+        generated_cu_seqlens = mRunState.temp_alloc(ETensorDType::INT32, {static_cast<long>(num_docs + 1)});
+        mTemps.push_back(generated_cu_seqlens);
+
+        std::vector<int32_t> host_cu_seqlens(static_cast<std::size_t>(num_docs + 1));
+        for (int i = 0; i <= num_docs; ++i) {
+            host_cu_seqlens[static_cast<std::size_t>(i)] = i * max_doc_seqlen;
+        }
+        CUDA_CHECK(cudaMemcpyAsync(
+            generated_cu_seqlens.get<int32_t>(),
+            host_cu_seqlens.data(),
+            host_cu_seqlens.size() * sizeof(int32_t),
+            cudaMemcpyHostToDevice,
+            mRunState.MainStream));
+        cu_seqlens_ptr = generated_cu_seqlens.get<int32_t>();
+    }
+
+    if (use_varlen) {
+        if (out.DType != ETensorDType::BF16 || qkv.DType != ETensorDType::BF16) {
+            throw std::logic_error("flash_attention: varlen path currently requires BF16 tensors");
+        }
         // Document-level masking: Flash Attention varlen path.
         // Write LSE directly into the pre-allocated output tensor (persists to backward).
-        // For B=1 (GRPO packed sequences), (B, Hq, T) and (Hq, total_q) have identical layout.
+        // For B>1, LSE is still consumed only by matching backward kernels and sinks path.
         attention_forward_flash_varlen(
             out.get<nv_bfloat16>(), lse.get<float>(), qkv.get<nv_bfloat16>(),
-            mCuSeqlensGpu, mNumDocs, mMaxDocSeqlen, mTotalDocTokens,
+            cu_seqlens_ptr, num_docs, max_doc_seqlen, total_doc_tokens,
             Hq, Hkv, Hs, mRunState.MainStream);
     } else if (window_size > 0) {
         attention_forward_custom(out, lse, qkv,
@@ -121,7 +161,15 @@ void CompiledExecutor::dispatch_flash_attention_backward(const CompiledOp& op) {
     if (op.inputs.size() > 4 && !op.inputs[4].name.empty()) {
         sinks = &resolve_tensor(op.inputs[4]);
     }
-    Tensor& d_qkv = ensure_output_tensor(op.outputs[0]);
+    Tensor* d_qkv_ptr = &ensure_output_tensor(op.outputs[0]);
+    const long qkv_nelem = static_cast<long>(qkv.nelem());
+    if (d_qkv_ptr->Rank == 0 || d_qkv_ptr->nelem() != qkv_nelem || d_qkv_ptr->DType != d_out.DType) {
+        std::vector<long> shape(qkv.Sizes.begin(), qkv.Sizes.begin() + qkv.Rank);
+        Tensor tmp = mRunState.temp_alloc(d_out.DType, shape);
+        mTemps.push_back(tmp);
+        d_qkv_ptr = &mTemps.back();
+    }
+    Tensor& d_qkv = *d_qkv_ptr;
 
     const int Hq = static_cast<int>(mConfig.NumQueryHeads);
     const int Hkv = static_cast<int>(mConfig.NumKeyValHeads);
@@ -140,10 +188,48 @@ void CompiledExecutor::dispatch_flash_attention_backward(const CompiledOp& op) {
         window_size = mConfig.sliding_window_size;
     }
 
-    if (mCuSeqlensGpu) {
+    const bool cudnn_supported = (window_size <= 0) &&
+                                 (Hs > 0) &&
+                                 (Hs % 8 == 0) &&
+                                 (Hs <= 128) &&
+                                 (mRunState.scratch().cudnn_workspace.Data != nullptr);
+
+    const bool use_varlen = (mCuSeqlensGpu != nullptr) || (window_size <= 0 && !cudnn_supported);
+    const int32_t* cu_seqlens_ptr = mCuSeqlensGpu;
+    int num_docs = mNumDocs;
+    int max_doc_seqlen = mMaxDocSeqlen;
+    int total_doc_tokens = mTotalDocTokens;
+    Tensor generated_cu_seqlens;
+    if (use_varlen && cu_seqlens_ptr == nullptr) {
+        num_docs = static_cast<int>(mB);
+        max_doc_seqlen = static_cast<int>(mT);
+        total_doc_tokens = num_docs * max_doc_seqlen;
+        generated_cu_seqlens = mRunState.temp_alloc(ETensorDType::INT32, {static_cast<long>(num_docs + 1)});
+        mTemps.push_back(generated_cu_seqlens);
+
+        std::vector<int32_t> host_cu_seqlens(static_cast<std::size_t>(num_docs + 1));
+        for (int i = 0; i <= num_docs; ++i) {
+            host_cu_seqlens[static_cast<std::size_t>(i)] = i * max_doc_seqlen;
+        }
+        CUDA_CHECK(cudaMemcpyAsync(
+            generated_cu_seqlens.get<int32_t>(),
+            host_cu_seqlens.data(),
+            host_cu_seqlens.size() * sizeof(int32_t),
+            cudaMemcpyHostToDevice,
+            mRunState.MainStream));
+        cu_seqlens_ptr = generated_cu_seqlens.get<int32_t>();
+    }
+
+    if (use_varlen) {
+        if (out.DType != ETensorDType::BF16 ||
+            d_out.DType != ETensorDType::BF16 ||
+            qkv.DType != ETensorDType::BF16 ||
+            d_qkv.DType != ETensorDType::BF16) {
+            throw std::logic_error("flash_attention_backward: varlen path currently requires BF16 tensors");
+        }
         // Document-level masking: Flash Attention varlen backward
         const int Hs_rounded = Hs <= 128 ? ((Hs + 31) / 32) * 32 : ((Hs + 63) / 64) * 64;
-        const long padded_total = static_cast<long>(mTotalDocTokens) + 128L * static_cast<long>(mNumDocs);
+        const long padded_total = static_cast<long>(total_doc_tokens) + 128L * static_cast<long>(num_docs);
         const long dq_accum_elems = padded_total * static_cast<long>(Hq) * static_cast<long>(Hs_rounded);
         const long dsoftmax_elems = static_cast<long>(Hq) * padded_total;
         Tensor dq_accum = mRunState.temp_alloc(ETensorDType::FP32, {dq_accum_elems});
@@ -158,7 +244,7 @@ void CompiledExecutor::dispatch_flash_attention_backward(const CompiledOp& op) {
         nv_bfloat16* dv_exp_ptr = nullptr;
         Tensor dk_expanded, dv_expanded;
         if (Hq != Hkv) {
-            const long exp_elems = static_cast<long>(mTotalDocTokens) * static_cast<long>(Hq) * static_cast<long>(Hs);
+            const long exp_elems = static_cast<long>(total_doc_tokens) * static_cast<long>(Hq) * static_cast<long>(Hs);
             dk_expanded = mRunState.temp_alloc(ETensorDType::BF16, {exp_elems});
             dv_expanded = mRunState.temp_alloc(ETensorDType::BF16, {exp_elems});
             mTemps.push_back(dk_expanded);
@@ -174,9 +260,9 @@ void CompiledExecutor::dispatch_flash_attention_backward(const CompiledOp& op) {
         attention_backward_flash_varlen(
             d_qkv.get<nv_bfloat16>(), lse.get<float>(),
             out.get<nv_bfloat16>(), d_out.get<nv_bfloat16>(), qkv.get<nv_bfloat16>(),
-            mCuSeqlensGpu, dq_accum.get<float>(), dsoftmax.get<float>(),
+            cu_seqlens_ptr, dq_accum.get<float>(), dsoftmax.get<float>(),
             dk_exp_ptr, dv_exp_ptr,
-            mNumDocs, mMaxDocSeqlen, mTotalDocTokens,
+            num_docs, max_doc_seqlen, total_doc_tokens,
             Hq, Hkv, Hs, /*deterministic=*/false, mRunState.MainStream);
     } else if (window_size > 0) {
         if (out.DType == ETensorDType::FP32) {
@@ -320,6 +406,10 @@ void CompiledExecutor::dispatch_flash_attention_backward(const CompiledOp& op) {
         } else {
             throw std::logic_error("flash_attention_backward: unsupported d_sinks dtype");
         }
+    }
+
+    if (!op.outputs.empty() && !op.outputs[0].name.empty()) {
+        store_tensor(op.outputs[0], d_qkv);
     }
 }
 

@@ -4,20 +4,17 @@ output_dir: ./output
 per_device_train_batch_size: 2
 gradient_accumulation_steps: 4
 
-sample_packing: true
-sequence_len: 2048
-
-max_steps: 50
-eval_steps: 25
+max_steps: 100
+eval_steps: 20
 
 learning_rate: 2e-4
 
 recipe: bf16
+train_vision: true
 
 lora: true
 lora_rank: 16
 lora_alpha: 32
-lora_dropout: 0
 lora_target_modules:
   - q_proj
   - k_proj
@@ -29,5 +26,6 @@ lora_target_modules:
 
 dataloader_num_workers: 4
 datasets:
-  - path: "OpenLLM-Ro/ro_gsm8k"
+  - path: "unsloth/LaTeX_OCR"
+    samples: 5000
     type: auto

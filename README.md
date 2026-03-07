@@ -17,7 +17,8 @@
   </a>
 </p>
 
-<h3>LLM Pre-training, Fine-Tuning and Reinforcement Learning at practical hardware limits<br/> (C++/CUDA core, Python wrapper, BF16, FP8, NF4, NVFP4)</h3>
+<h3>⚡ Full-Stack Development Platform for Building Reliable Agents </h3>
+<h4></h4>
 <div>
 <a href="https://surogate.ai">Home</a> ·
 <a href="https://docs.surogate.ai">Docs</a> ·
@@ -35,23 +36,29 @@
 
 </div>
 
-## What is Surogate?
 
-Surogate is an extremely fast **production-grade LLM training framework** and **LLMOps platform** engineered to operate at practical hardware limits, delivering near–speed-of-light throughput, low-latency execution, and multi-GPU/multi-Node training scaling at scale.
+**Surogate** is a full-stack AgentOps platform designed to develop, deploy, evaluate, and monitor reliable agents.
+
+This repository houses the **Surogate Training Engine**: an **insanely fast, production-grade LLM training framework** engineered to operate at **practical hardware limits**. It serves as the high-performance foundation for our entire ecosystem, powering everything from rapid local experimentation to massive distributed cluster deployments.
 
 By combining a native **C++/CUDA execution engine**, a low-overhead Python frontend, and a highly optimized **multi-threaded scheduler**, Surogate achieves industry-leading Speed-Of-Light (SOL) utilization on NVIDIA GPUs — **outperforming existing training toolkits by a wide margin**. 
 
 See reproducible comparisons in [Benchmarks](https://docs.surogate.ai/reference/benchmarks).
 
+## 🌌 The Surogate Ecosystem
+While this repository provides the core C++/CUDA training framework, Surogate is a complete ecosystem spanning three pillars. You can use the framework standalone, or integrate it with our specialized tools:
 
-[Surogate Studio](https://github.com/invergent-ai/surogate-studio) is the no-code companion of Suroagate for enterprise-grade LLMOps.
+1. ⚙️ **[Surogate Engine (This Repo)](#-the-core-engine-surogate-training-framework)**
+   **The high-performance core**. **Delivers near-speed-of-light throughput, mixed precision (BF16, FP8, NVFP4), RL (GRPO), and multi-GPU scaling.**
+2. 🎨 **[Surogate Studio](https://github.com/invergent-ai/surogate-studio)**
+   The enterprise UI. A unified no-code platform for managing your AI infrastructure, fine-tuning, observability, evaluation, and deployment.
+3. 🤖 **[Surogate Agent](https://github.com/invergent-ai/surogate-agent)**
+   **The conversational agent framework.** Build role-aware AI agents with a unique meta-skill authoring workflow—develop new skills through conversation with no manual file editing required.
 
-![alt text](assets/studio.png)
-
----
-
-## ✨ Highlights
+## ⚡ The Core Engine: Surogate Training Framework
 Surogate is built for developers and enterprises that need fast experimentation scalability and predictable outcomes — whether running on-premise, in private clouds, or inside turnkey systems such as the [DenseMAX Appliance](https://www.invergent.ai/densemax-appliance).
+
+### ✨ Highlights
 
 - **🔧 Pre-training + Fine-tuning**: full fine-tuning, LoRA/QLoRA
 - [**🔧 BF16, FP8 and NVFP4 Reinforcement Learning**](https://docs.surogate.ai/guides/rl-training): advanced GRPO training and evaluation with custom, deterministic environments
@@ -78,9 +85,13 @@ Surogate is built for developers and enterprises that need fast experimentation 
   
 ---
 
-## Quickstart
+## 🚀 Quickstart
+You can interact with the Surogate High-Performance Training Engine at the framework level via the CLI, or spin up the full Studio for a visual AgentOps experience. (See the [Surogate Studio](https://github.com/invergent-ai/surogate-studio) repo for deployment options).
 
-### Option A: Run using Docker (recommended)
+
+### Run the Surogate Training Engine:
+
+#### Option A: Run using Docker (recommended)
 Surogate provides 3 docker images for various CUDA versions. Currently only the `x86-64` architecture is supported.
 
 | CUDA   | Image                                        | Recommended NVIDIA Driver | Minimum NVIDIA Driver |
@@ -93,12 +104,12 @@ Surogate provides 3 docker images for various CUDA versions. Currently only the 
 docker run --gpus=all -v /my/local/config.yaml:/home/surogate/config.yaml -v /my/local/output_dir:<OUTPUT_DIR_FROM_CONFIG_YAML> <IMAGE> sft config.yaml
 ```
 
-### Option B: Install via script
+#### Option B: Install via script
 ```bash
 curl -LsSf https://surogate.ai/install.sh | sh
 ```
 
-### Option C: Build from source (dev / contributors)
+#### Option C: Build from source (dev / contributors)
 You need CUDA 12.8/12.9/13.x installed on your machine and NCCL development libraries libnccl-dev for your CUDA version
 
 ```bash
@@ -169,13 +180,10 @@ surogate sft config.yaml
 
 ---
 
-Harness the full power of **Surogate** with **[Surogate Studio](https://github.com/invergent-ai/surogate-studio)** — a fully visual, easy-to-use platform for fine-tuning, deployment, evaluation, and production LLMOps.
-
----
-
 ## Contributing
 
-PRs and issues are welcome.
+We welcome contributions across the entire ecosystem! If you are submitting a PR to the core framework, please ensure you include a clear description, steps to test locally, and relevant examples.
+
 If you’re adding kernels/recipes or touching build/tooling, please keep changes minimal and include:
 - a short description of the change,
 - how to reproduce/validate locally (`make test` where applicable),

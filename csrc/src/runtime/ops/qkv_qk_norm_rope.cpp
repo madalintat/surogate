@@ -199,7 +199,14 @@ void CompiledExecutor::dispatch_qkv_qk_norm_rope_backward(const CompiledOp& op) 
     Tensor& freqs = resolve_tensor(op.inputs[6]);
     Tensor& pos_ids = resolve_tensor(op.inputs[7]);
 
-    Tensor& d_qkv = ensure_output_tensor(op.outputs[0]);
+    Tensor* d_qkv_ptr = &ensure_output_tensor(op.outputs[0]);
+    if (d_qkv_ptr->Rank == 0 || d_qkv_ptr->nelem() != d_out.nelem()) {
+        std::vector<long> shape(d_out.Sizes.begin(), d_out.Sizes.begin() + d_out.Rank);
+        Tensor tmp = mRunState.temp_alloc(d_out.DType, shape);
+        mTemps.push_back(tmp);
+        d_qkv_ptr = &mTemps.back();
+    }
+    Tensor& d_qkv = *d_qkv_ptr;
 
     int Hq = static_cast<int>(mConfig.NumQueryHeads);
     int Hkv = static_cast<int>(mConfig.NumKeyValHeads);
@@ -249,6 +256,16 @@ void CompiledExecutor::dispatch_qkv_qk_norm_rope_backward(const CompiledOp& op) 
         }
     }
     const int q_rows = Hq * Hs;
+    if (const char* dbg = std::getenv("SUROGATE_DEBUG_QWEN35_BWD");
+        dbg && std::string(dbg) == "1") {
+        fprintf(stderr, "[QWEN35_BWD][qkv_qk_norm_rope_backward] Hq=%d Hkv=%d Hs=%d qkv_channels=%d\n",
+                Hq, Hkv, Hs, qkv_channels);
+        log_tensor_shape("d_out", d_out);
+        log_tensor_shape("qkv", qkv);
+        log_tensor_shape("q_rstd", q_rstd);
+        log_tensor_shape("k_rstd", k_rstd);
+        log_tensor_shape("d_qkv", d_qkv);
+    }
 
     auto view_qkv = [&](Tensor& t) -> Tensor {
         const long needed = static_cast<long>(mB) * static_cast<long>(mT) * qkv_channels;
@@ -346,6 +363,16 @@ void CompiledExecutor::dispatch_qkv_qk_norm_rope_backward(const CompiledOp& op) 
         float* abs_max_ptr = mRunState.simplified_quant_grads().d_qkv.abs_max();
         abs_max(abs_max_ptr, d_qkv_view, static_cast<long>(d_qkv_view.nelem()),
                 mRunState.DeviceProp, mRunState.MainStream);
+    }
+
+    if (!op.outputs.empty() && !op.outputs[0].name.empty()) {
+        store_tensor(op.outputs[0], d_qkv);
+    }
+    if (d_q_norm && op.outputs.size() > 1 && !op.outputs[1].name.empty()) {
+        store_tensor(op.outputs[1], *d_q_norm);
+    }
+    if (d_k_norm && op.outputs.size() > 2 && !op.outputs[2].name.empty()) {
+        store_tensor(op.outputs[2], *d_k_norm);
     }
 }
 

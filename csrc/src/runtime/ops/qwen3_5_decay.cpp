@@ -35,8 +35,8 @@ void CompiledExecutor::dispatch_qwen3_5_decay(const CompiledOp& op) {
     }
 
     Tensor out = ensure_output_tensor(op.outputs[0]);
-    if (out.Rank != 3 || out.Sizes[0] != B || out.Sizes[1] != T || out.Sizes[2] != H || out.DType != a.DType) {
-        out = mRunState.temp_alloc(a.DType, {B, T, H});
+    if (out.Rank != 3 || out.Sizes[0] != B || out.Sizes[1] != T || out.Sizes[2] != H || out.DType != ETensorDType::FP32) {
+        out = mRunState.temp_alloc(ETensorDType::FP32, {B, T, H});
         mTemps.push_back(out);
     }
     qwen3_5_decay_forward(out, a, a_log, dt_bias, mRunState.MainStream);
@@ -67,39 +67,128 @@ void CompiledExecutor::dispatch_qwen3_5_decay_backward(const CompiledOp& op) {
         throw std::runtime_error("qwen3_5_decay_backward: head dimension mismatch");
     }
 
-    auto ensure_or_temp = [&](std::size_t out_idx,
-                              ETensorDType dtype,
-                              const std::vector<long>& shape) -> Tensor {
-        if (op.outputs.size() > out_idx && !op.outputs[out_idx].name.empty()) {
-            Tensor out = ensure_output_tensor(op.outputs[out_idx]);
-            if (out.DType == dtype &&
-                out.Rank == static_cast<int>(shape.size())) {
-                bool match = true;
-                for (int i = 0; i < out.Rank; ++i) {
-                    if (out.Sizes[i] != shape[static_cast<std::size_t>(i)]) {
-                        match = false;
-                        break;
-                    }
-                }
-                if (match) return out;
+    auto shape_matches = [](const Tensor& t, const std::vector<long>& shape) -> bool {
+        if (t.Rank != static_cast<int>(shape.size())) {
+            return false;
+        }
+        for (int i = 0; i < t.Rank; ++i) {
+            if (t.Sizes[i] != shape[static_cast<std::size_t>(i)]) {
+                return false;
             }
         }
+        return true;
+    };
+
+    auto maybe_output = [&](std::size_t out_idx, const std::vector<long>& shape) -> Tensor {
+        if (op.outputs.size() > out_idx && !op.outputs[out_idx].name.empty()) {
+            Tensor out = ensure_output_tensor(op.outputs[out_idx]);
+            if (shape_matches(out, shape)) {
+                return out;
+            }
+        }
+        return Tensor{};
+    };
+
+    auto alloc_temp = [&](ETensorDType dtype, const std::vector<long>& shape) -> Tensor {
         Tensor out = mRunState.temp_alloc(dtype, shape);
         mTemps.push_back(out);
         return out;
     };
 
-    Tensor d_a = ensure_or_temp(0, a.DType, {B, T, H});
-    Tensor d_a_log = ensure_or_temp(1, ETensorDType::FP32, {H});
-    Tensor d_dt_bias = ensure_or_temp(2, ETensorDType::FP32, {H});
+    auto copy_or_accumulate = [&](const TensorRef& out_ref, const Tensor& src, bool allow_accumulate) {
+        if (out_ref.name.empty()) {
+            return;
+        }
+        Tensor dst = ensure_output_tensor(out_ref);
+        const std::vector<long> src_shape(src.Sizes.begin(), src.Sizes.begin() + src.Rank);
+        bool is_param_grad = false;
+        if (auto base = base_param_from_grad(out_ref.name)) {
+            bool acc = false;
+            if (Tensor* g = mGrads.get_param_grad(*base, acc)) {
+                is_param_grad = (g && g->Data);
+            }
+        }
+        if (!shape_matches(dst, src_shape)) {
+            if (is_param_grad) {
+                throw std::runtime_error("qwen3_5_decay_backward: output shape mismatch for " + out_ref.name);
+            }
+            dst = alloc_temp(src.DType, src_shape);
+        }
+
+        bool accumulate = false;
+        if (allow_accumulate) {
+            accumulate = mAccumulateTensors.count(out_ref.name) > 0;
+            if (!accumulate) {
+                if (auto base = base_param_from_grad(out_ref.name)) {
+                    accumulate = mAccumulateTensors.count("d_" + *base) > 0;
+                }
+            }
+        }
+
+        Tensor src_use = src;
+        if (dst.DType != src.DType) {
+            src_use = alloc_temp(dst.DType, {static_cast<long>(src.nelem())});
+            if (dst.DType == ETensorDType::BF16 && src.DType == ETensorDType::FP32) {
+                convert_dtype(src_use.get<nv_bfloat16>(), src.get<float>(), src.nelem(), mRunState.MainStream);
+            } else if (dst.DType == ETensorDType::FP32 && src.DType == ETensorDType::BF16) {
+                convert_dtype(src_use.get<float>(), src.get<nv_bfloat16>(), src.nelem(), mRunState.MainStream);
+            } else {
+                throw std::runtime_error("qwen3_5_decay_backward: unsupported dtype conversion for " + out_ref.name);
+            }
+            src_use = view_tensor(src_use, std::vector<long>(src.Sizes.begin(), src.Sizes.begin() + src.Rank));
+        }
+
+        if (dst.Data != src_use.Data) {
+            if (accumulate) {
+                vector_add_sr(dst, dst, src_use, 1.0f, static_cast<long>(dst.nelem()), 0, mRunState.MainStream);
+            } else {
+                CUDA_CHECK(cudaMemcpyAsync(dst.Data, src_use.Data, dst.bytes(),
+                                           cudaMemcpyDeviceToDevice, mRunState.MainStream));
+            }
+        }
+        store_tensor(out_ref, dst);
+    };
+
+    Tensor d_a_target = maybe_output(0, {B, T, H});
+    Tensor d_a_log_target = maybe_output(1, {H});
+    Tensor d_dt_bias_target = maybe_output(2, {H});
+
+    Tensor d_a = d_a_target.Data && d_a_target.DType == a.DType
+        ? d_a_target
+        : alloc_temp(a.DType, {B, T, H});
+
+    Tensor d_a_log = d_a_log_target.Data && d_a_log_target.DType == ETensorDType::FP32
+        ? d_a_log_target
+        : alloc_temp(ETensorDType::FP32, {H});
+
+    Tensor d_dt_bias = d_dt_bias_target.Data && d_dt_bias_target.DType == ETensorDType::FP32
+        ? d_dt_bias_target
+        : alloc_temp(ETensorDType::FP32, {H});
 
     qwen3_5_decay_backward(d_a, d_a_log, d_dt_bias,
                            d_out, a, a_log, dt_bias, mRunState.MainStream);
 
-    if (op.outputs.size() > 0 && !op.outputs[0].name.empty()) store_tensor(op.outputs[0], d_a);
-    if (op.outputs.size() > 1 && !op.outputs[1].name.empty()) store_tensor(op.outputs[1], d_a_log);
-    if (op.outputs.size() > 2 && !op.outputs[2].name.empty()) store_tensor(op.outputs[2], d_dt_bias);
+    if (op.outputs.size() > 0 && !op.outputs[0].name.empty()) {
+        if (d_a_target.Data && d_a_target.Data == d_a.Data) {
+            store_tensor(op.outputs[0], d_a_target);
+        } else {
+            copy_or_accumulate(op.outputs[0], d_a, /*allow_accumulate=*/false);
+        }
+    }
+    if (op.outputs.size() > 1 && !op.outputs[1].name.empty()) {
+        if (d_a_log_target.Data && d_a_log_target.Data == d_a_log.Data) {
+            store_tensor(op.outputs[1], d_a_log_target);
+        } else {
+            copy_or_accumulate(op.outputs[1], d_a_log, /*allow_accumulate=*/true);
+        }
+    }
+    if (op.outputs.size() > 2 && !op.outputs[2].name.empty()) {
+        if (d_dt_bias_target.Data && d_dt_bias_target.Data == d_dt_bias.Data) {
+            store_tensor(op.outputs[2], d_dt_bias_target);
+        } else {
+            copy_or_accumulate(op.outputs[2], d_dt_bias, /*allow_accumulate=*/true);
+        }
+    }
 }
 
 }  // namespace dsl
-

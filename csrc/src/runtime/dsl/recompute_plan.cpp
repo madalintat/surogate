@@ -1538,6 +1538,13 @@ void execute_mrope(RecomputeContext& ctx,
         throw std::runtime_error("DSL recompute: mrope missing qkv_rope output");
     }
 
+    if (qkv_out->DType != qkv_in->DType ||
+        qkv_out->Rank != qkv_in->Rank ||
+        qkv_out->nelem() != qkv_in->nelem()) {
+        std::vector<long> shape(qkv_in->Sizes.begin(), qkv_in->Sizes.begin() + qkv_in->Rank);
+        *qkv_out = ctx.rs.temp_alloc(qkv_in->DType, shape);
+    }
+
     if (qkv_in->Data != qkv_out->Data) {
         cudaMemcpyAsync(qkv_out->Data, qkv_in->Data, qkv_in->bytes(),
                         cudaMemcpyDeviceToDevice, ctx.rs.MainStream);
@@ -1549,9 +1556,13 @@ void execute_mrope(RecomputeContext& ctx,
     int rotary_dim = resolve_rotary_dim(op.attrs, ctx.cfg);
     const auto mrope_section = resolve_mrope_section(op.attrs, ctx.cfg);
 
-    Tensor qkv_rope = (qkv_out->Rank == 4)
-        ? *qkv_out
-        : view_tensor(*qkv_out, {B, T, Hq + 2 * Hkv, Hs});
+    Tensor qkv_rope = *qkv_out;
+    const long qkv_channels = static_cast<long>(Hq + 2 * Hkv) * static_cast<long>(Hs);
+    const long needed = B * T * qkv_channels;
+    if ((qkv_out->Rank == 4 || (qkv_out->Rank == 3 && qkv_out->Sizes[2] != qkv_channels)) &&
+        static_cast<long>(qkv_out->nelem()) >= needed) {
+        qkv_rope = view_tensor(*qkv_out, {B, T, Hq + 2 * Hkv, Hs});
+    }
 
     const int* pos_ptr = reinterpret_cast<int*>(pos_ids->Data);
     int pos_planes = 1;
@@ -1625,12 +1636,46 @@ void execute_flash_attention(RecomputeContext& ctx,
         }
     }
 
-    if (ctx.cu_seqlens_gpu) {
-        // Document-level masking: use Flash Attention varlen (must match main forward path).
+    const bool cudnn_supported = (window_size <= 0) &&
+                                 (Hs > 0) &&
+                                 (Hs % 8 == 0) &&
+                                 (Hs <= 128) &&
+                                 (ctx.rs.scratch().cudnn_workspace.Data != nullptr);
+    const bool use_varlen = (ctx.cu_seqlens_gpu != nullptr) || (window_size <= 0 && !cudnn_supported);
+
+    const int32_t* cu_seqlens_ptr = ctx.cu_seqlens_gpu;
+    int num_docs = ctx.doc_masking_num_docs;
+    int max_doc_seqlen = ctx.doc_masking_max_seqlen;
+    int total_doc_tokens = ctx.doc_masking_total_q;
+    Tensor dense_cu_seqlens;
+    if (use_varlen && cu_seqlens_ptr == nullptr) {
+        num_docs = static_cast<int>(B);
+        max_doc_seqlen = static_cast<int>(T);
+        total_doc_tokens = num_docs * max_doc_seqlen;
+
+        dense_cu_seqlens = ctx.rs.temp_alloc(ETensorDType::INT32, {static_cast<long>(num_docs + 1)});
+        std::vector<int32_t> host_cu_seqlens(static_cast<std::size_t>(num_docs + 1));
+        for (int i = 0; i <= num_docs; ++i) {
+            host_cu_seqlens[static_cast<std::size_t>(i)] = i * max_doc_seqlen;
+        }
+        CUDA_CHECK(cudaMemcpyAsync(
+            dense_cu_seqlens.get<int32_t>(),
+            host_cu_seqlens.data(),
+            host_cu_seqlens.size() * sizeof(int32_t),
+            cudaMemcpyHostToDevice,
+            ctx.rs.MainStream));
+        cu_seqlens_ptr = dense_cu_seqlens.get<int32_t>();
+    }
+
+    if (use_varlen) {
+        if (att_view.DType != ETensorDType::BF16 || qkv_view.DType != ETensorDType::BF16) {
+            throw std::runtime_error("DSL recompute: flash_attention varlen path currently requires BF16 tensors");
+        }
+        // Document-level masking or dense fallback: use Flash Attention varlen.
         attention_forward_flash_varlen(
             att_view.get<nv_bfloat16>(), lse_view.get<float>(), qkv_view.get<nv_bfloat16>(),
-            ctx.cu_seqlens_gpu, ctx.doc_masking_num_docs, ctx.doc_masking_max_seqlen,
-            ctx.doc_masking_total_q, Hq, Hkv, Hs, ctx.rs.MainStream);
+            cu_seqlens_ptr, num_docs, max_doc_seqlen, total_doc_tokens,
+            Hq, Hkv, Hs, ctx.rs.MainStream);
     } else if (window_size > 0) {
         attention_forward_custom(att_view, lse_view, qkv_view,
                                  static_cast<int>(B), static_cast<int>(T),

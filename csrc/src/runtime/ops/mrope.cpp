@@ -24,7 +24,16 @@ void CompiledExecutor::dispatch_mrope(const CompiledOp& op) {
     Tensor& freqs = resolve_tensor(op.inputs[1]);
     Tensor& pos_ids = resolve_tensor(op.inputs[2]);
 
-    Tensor& qkv_out = ensure_output_tensor(op.outputs[0]);
+    Tensor* qkv_out_ptr = &ensure_output_tensor(op.outputs[0]);
+    if (qkv_out_ptr->DType != qkv_in.DType ||
+        qkv_out_ptr->Rank != qkv_in.Rank ||
+        qkv_out_ptr->nelem() != qkv_in.nelem()) {
+        std::vector<long> shape(qkv_in.Sizes.begin(), qkv_in.Sizes.begin() + qkv_in.Rank);
+        Tensor tmp = mRunState.temp_alloc(qkv_in.DType, shape);
+        mTemps.push_back(tmp);
+        qkv_out_ptr = &mTemps.back();
+    }
+    Tensor& qkv_out = *qkv_out_ptr;
 
     const int Hq = static_cast<int>(mConfig.NumQueryHeads);
     const int Hkv = static_cast<int>(mConfig.NumKeyValHeads);
@@ -36,7 +45,12 @@ void CompiledExecutor::dispatch_mrope(const CompiledOp& op) {
                                    qkv_in.bytes(), cudaMemcpyDeviceToDevice, mRunState.MainStream));
     }
 
-    Tensor qkv_view = (qkv_out.Rank == 4) ? view_tensor(qkv_out, {mB, mT, qkv_channels}) : qkv_out;
+    Tensor qkv_view = qkv_out;
+    const long needed = static_cast<long>(mB) * static_cast<long>(mT) * qkv_channels;
+    if ((qkv_out.Rank == 4 || (qkv_out.Rank == 3 && qkv_out.Sizes[2] != qkv_channels)) &&
+        static_cast<long>(qkv_out.nelem()) >= needed) {
+        qkv_view = view_tensor(qkv_out, {mB, mT, qkv_channels});
+    }
     int rotary_dim = op.attrs.rotary_dim;
 
     const int* pos_ptr = reinterpret_cast<int*>(pos_ids.Data);
@@ -65,7 +79,14 @@ void CompiledExecutor::dispatch_mrope_backward(const CompiledOp& op) {
     Tensor& freqs = resolve_tensor(op.inputs[has_qkv ? 2 : 1]);
     Tensor& pos_ids = resolve_tensor(op.inputs[has_qkv ? 3 : 2]);
 
-    Tensor& d_qkv = ensure_output_tensor(op.outputs[0]);
+    Tensor* d_qkv_ptr = &ensure_output_tensor(op.outputs[0]);
+    if (d_qkv_ptr->Rank == 0 || d_qkv_ptr->nelem() != d_out.nelem() || d_qkv_ptr->DType != d_out.DType) {
+        std::vector<long> shape(d_out.Sizes.begin(), d_out.Sizes.begin() + d_out.Rank);
+        Tensor tmp = mRunState.temp_alloc(d_out.DType, shape);
+        mTemps.push_back(tmp);
+        d_qkv_ptr = &mTemps.back();
+    }
+    Tensor& d_qkv = *d_qkv_ptr;
 
     const int Hq = static_cast<int>(mConfig.NumQueryHeads);
     const int Hkv = static_cast<int>(mConfig.NumKeyValHeads);
@@ -96,6 +117,10 @@ void CompiledExecutor::dispatch_mrope_backward(const CompiledOp& op) {
                    op.attrs.mrope_section[0], op.attrs.mrope_section[1], op.attrs.mrope_section[2],
                    nullptr, static_cast<int>(mB), static_cast<int>(mT), Hq, Hkv, Hs, rotary_dim,
                    mRunState.MainStream);
+
+    if (!op.outputs.empty() && !op.outputs[0].name.empty()) {
+        store_tensor(op.outputs[0], d_qkv);
+    }
 }
 
 }  // namespace dsl

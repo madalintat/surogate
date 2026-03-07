@@ -207,11 +207,34 @@ void DslModel::forward(Tensor inputs, Tensor position_ids, NCCLCommunicator& com
             } break;
             case modules::ForwardHookPoint::AfterMLPDownProjection: {
                 if (lora_block.mlp.down.has_value()) {
-                    modules::detail::apply_lora_contribution(acts.mlp_down, 0, acts.swiglu, lora_block.mlp.down.value(),
-                                                    mLoRARunState->intermediate, mLoRARunState->slice,
-                                                    scaling, dropout, get_dropout_seed(6), is_training,
-                                                    B * T, D, C, rank,
-                                                    rs.CublasLtHandle, rs.CuBlasWorkspace, stream);
+                    Tensor down_input = acts.swiglu;
+                    Tensor down_input_tmp{};
+                    bool free_down_input_tmp = false;
+                    if (!down_input.Data && gated_mlp && acts.mlp_up.Data) {
+                        down_input_tmp = rs.temp_alloc(acts.mlp_down.DType, {B * T, D});
+                        Tensor down_input_view = down_input_tmp;
+                        down_input_view.Rank = 3;
+                        down_input_view.Sizes[0] = B;
+                        down_input_view.Sizes[1] = T;
+                        down_input_view.Sizes[2] = D;
+                        for (int i = 3; i < MAX_TENSOR_DIM; ++i) down_input_view.Sizes[i] = 1;
+                        swiglu_forward(down_input_view, acts.mlp_up, nullptr, B, T, D, stream);
+                        down_input = down_input_view;
+                        free_down_input_tmp = true;
+                    }
+                    if (down_input.Data) {
+                        try {
+                            modules::detail::apply_lora_contribution(acts.mlp_down, 0, down_input, lora_block.mlp.down.value(),
+                                                            mLoRARunState->intermediate, mLoRARunState->slice,
+                                                            scaling, dropout, get_dropout_seed(6), is_training,
+                                                            B * T, D, C, rank,
+                                                            rs.CublasLtHandle, rs.CuBlasWorkspace, stream);
+                        } catch (...) {
+                            if (free_down_input_tmp) rs.temp_free(down_input_tmp);
+                            throw;
+                        }
+                    }
+                    if (free_down_input_tmp) rs.temp_free(down_input_tmp);
                 }
             } break;
             default:
@@ -304,11 +327,34 @@ float DslModel::validate(Tensor inputs, Tensor position_ids, Tensor targets, NCC
             } break;
             case modules::ForwardHookPoint::AfterMLPDownProjection: {
                 if (lora_block.mlp.down.has_value()) {
-                    modules::detail::apply_lora_contribution(acts.mlp_down, 0, acts.swiglu, lora_block.mlp.down.value(),
-                                                    mLoRARunState->intermediate, mLoRARunState->slice,
-                                                    scaling, 0.0f, 0, false,
-                                                    B * T, D, C, rank,
-                                                    rs.CublasLtHandle, rs.CuBlasWorkspace, stream);
+                    Tensor down_input = acts.swiglu;
+                    Tensor down_input_tmp{};
+                    bool free_down_input_tmp = false;
+                    if (!down_input.Data && gated_mlp && acts.mlp_up.Data) {
+                        down_input_tmp = rs.temp_alloc(acts.mlp_down.DType, {B * T, D});
+                        Tensor down_input_view = down_input_tmp;
+                        down_input_view.Rank = 3;
+                        down_input_view.Sizes[0] = B;
+                        down_input_view.Sizes[1] = T;
+                        down_input_view.Sizes[2] = D;
+                        for (int i = 3; i < MAX_TENSOR_DIM; ++i) down_input_view.Sizes[i] = 1;
+                        swiglu_forward(down_input_view, acts.mlp_up, nullptr, B, T, D, stream);
+                        down_input = down_input_view;
+                        free_down_input_tmp = true;
+                    }
+                    if (down_input.Data) {
+                        try {
+                            modules::detail::apply_lora_contribution(acts.mlp_down, 0, down_input, lora_block.mlp.down.value(),
+                                                            mLoRARunState->intermediate, mLoRARunState->slice,
+                                                            scaling, 0.0f, 0, false,
+                                                            B * T, D, C, rank,
+                                                            rs.CublasLtHandle, rs.CuBlasWorkspace, stream);
+                        } catch (...) {
+                            if (free_down_input_tmp) rs.temp_free(down_input_tmp);
+                            throw;
+                        }
+                    }
+                    if (free_down_input_tmp) rs.temp_free(down_input_tmp);
                 }
             } break;
             default:
@@ -380,10 +426,6 @@ void DslModel::backward(Tensor inputs, Tensor targets, NCCLCommunicator& comm, i
 
                 auto& a = rs.simplified_acts(layer_idx);
                 auto& da = rs.simplified_grads(layer_idx);
-
-                // Projection type 6 = Down
-                const unsigned int dropout_seed = get_dropout_seed(6);
-
                 modules::detail::backward_lora_layer(
                     lora_grads.mlp.down->A, lora_grads.mlp.down->B,
                     da.d_swiglu,
@@ -391,7 +433,7 @@ void DslModel::backward(Tensor inputs, Tensor targets, NCCLCommunicator& comm, i
                     a.swiglu,
                     lora_block.mlp.down->A, lora_block.mlp.down->B,
                     mLoRAConfig->scaling(),
-                    dropout, dropout_seed, is_training,
+                    dropout, get_dropout_seed(6), is_training,
                     mLoRARunState->intermediate, mLoRARunState->slice,
                     B * T, D, C, rank, lora_accum,
                     rs.CublasLtHandle, rs.CuBlasWorkspace, stream);
@@ -693,6 +735,18 @@ void DslModel::allocate_run_state(const RuntimeOptions& options, NCCLCommunicato
                                   base_size * base_multiplier + moe_extra + safety_bytes + extra_tmp + attn_fallback_bytes);
     const long slack_bytes = lora_stack_tight ? (256L * 1024 * 1024) : (512L * 1024 * 1024);
     required_size += slack_bytes;  // extra slack for unmodeled temps
+    const bool is_qwen3_hybrid_lora =
+        lora_stack_tight &&
+        (mModelConfig.architecture == modules::ArchitectureType::Hybrid) &&
+        (mModelConfig.Architecture == PretrainedConfig::QWEN3);
+    if (is_qwen3_hybrid_lora) {
+        // Qwen3.5 hybrid blocks can hit an additional transient peak around SwiGLU
+        // backward + LoRA hook temps that is not fully captured by the sizing simulation.
+        // Reserve one extra BT x MUp buffer plus fixed margin.
+        const long qwen35_swiglu_peak = BT * static_cast<long>(mModelConfig.mlp_up_rows()) * dtype_bytes;
+        const long qwen35_extra_slack = std::max(128L * 1024 * 1024, qwen35_swiglu_peak + 64L * 1024 * 1024);
+        required_size += qwen35_extra_slack;
+    }
     long moe_stack_slack = 0;
     if (mModelConfig.NumExperts > 0) {
         moe_stack_slack = 2048L * 1024 * 1024;  // MoE backward temps can spike beyond simulated high-water mark
@@ -702,7 +756,30 @@ void DslModel::allocate_run_state(const RuntimeOptions& options, NCCLCommunicato
         moe_stack_slack = std::max(moe_stack_slack, mb * 1024 * 1024);
     }
     required_size += moe_stack_slack;
-    const long min_stack_base = lora_stack_tight ? (512L * 1024 * 1024) : (3L * 1024 * 1024 * 1024);
+    long min_stack_base = lora_stack_tight ? (512L * 1024 * 1024) : (3L * 1024 * 1024 * 1024);
+    if (is_qwen3_hybrid_lora) {
+        min_stack_base = std::max(min_stack_base, 1024L * 1024 * 1024);
+    }
+    if (mOptions.UseCudaGraphs) {
+        // CUDA graph capture/replay requires stable temp addresses and tends to keep
+        // additional transient allocations live during capture. Reserve extra headroom
+        // to avoid capture-only stack OOMs.
+        const long graph_extra_slack = lora_stack_tight ? (512L * 1024 * 1024) : (1024L * 1024 * 1024);
+        required_size += graph_extra_slack;
+        min_stack_base = std::max(min_stack_base, lora_stack_tight ? (1024L * 1024 * 1024)
+                                                                    : (4L * 1024 * 1024 * 1024));
+        if (is_qwen3_hybrid_lora) {
+            // Qwen3.5 hybrid + LoRA + CUDA graphs retains additional transient tensors
+            // during capture/replay that are not represented by simulation. Keep a
+            // dedicated margin so mamba_gated_rmsnorm/swiglu backward peaks fit.
+            required_size += 512L * 1024 * 1024;
+            min_stack_base = std::max(min_stack_base, 1536L * 1024 * 1024);
+        }
+    }
+    if (const char* env = std::getenv("SUROGATE_MIN_STACK_MB")) {
+        const long mb = std::max(64L, std::atol(env));
+        min_stack_base = mb * 1024 * 1024;
+    }
     const long min_stack_bytes = min_stack_base + attn_fallback_bytes + moe_stack_slack;
     required_size = std::max(required_size, min_stack_bytes);  // Full fine-tune keeps 3GB+fallback; LoRA can use tighter floor.
     const auto high_mark = mRunState->Stack.get_high_mark();
@@ -882,11 +959,34 @@ std::vector<float> DslModel::compute_logprobs(const std::int32_t* input_ids,
                 } break;
                 case modules::ForwardHookPoint::AfterMLPDownProjection: {
                     if (lora_block.mlp.down.has_value()) {
-                        modules::detail::apply_lora_contribution(acts.mlp_down, 0, acts.swiglu, lora_block.mlp.down.value(),
-                                                        mLoRARunState->intermediate, mLoRARunState->slice,
-                                                        scaling, 0.0f, 0, false,
-                                                        B_ * T_, D, C, rank,
-                                                        rs.CublasLtHandle, rs.CuBlasWorkspace, stream);
+                        Tensor down_input = acts.swiglu;
+                        Tensor down_input_tmp{};
+                        bool free_down_input_tmp = false;
+                        if (!down_input.Data && gated_mlp && acts.mlp_up.Data) {
+                            down_input_tmp = rs.temp_alloc(acts.mlp_down.DType, {B_ * T_, D});
+                            Tensor down_input_view = down_input_tmp;
+                            down_input_view.Rank = 3;
+                            down_input_view.Sizes[0] = B_;
+                            down_input_view.Sizes[1] = T_;
+                            down_input_view.Sizes[2] = D;
+                            for (int i = 3; i < MAX_TENSOR_DIM; ++i) down_input_view.Sizes[i] = 1;
+                            swiglu_forward(down_input_view, acts.mlp_up, nullptr, B_, T_, D, stream);
+                            down_input = down_input_view;
+                            free_down_input_tmp = true;
+                        }
+                        if (down_input.Data) {
+                            try {
+                                modules::detail::apply_lora_contribution(acts.mlp_down, 0, down_input, lora_block.mlp.down.value(),
+                                                                mLoRARunState->intermediate, mLoRARunState->slice,
+                                                                scaling, 0.0f, 0, false,
+                                                                B_ * T_, D, C, rank,
+                                                                rs.CublasLtHandle, rs.CuBlasWorkspace, stream);
+                            } catch (...) {
+                                if (free_down_input_tmp) rs.temp_free(down_input_tmp);
+                                throw;
+                            }
+                        }
+                        if (free_down_input_tmp) rs.temp_free(down_input_tmp);
                     }
                 } break;
                 default:

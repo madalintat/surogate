@@ -54,7 +54,24 @@ __global__ void relu2_backward_kernel(T* dinp, const T* inp, const T* dout, long
 
 template<typename T>
 __device__ __forceinline__ float sigmoid(float x) {
-    return 1.0f / (1.0f + expf(-x));
+    // Numerically stable sigmoid that avoids overflow in expf().
+    if (x >= 0.0f) {
+        float z = expf(-x);
+        return 1.0f / (1.0f + z);
+    }
+    float z = expf(x);
+    return z / (1.0f + z);
+}
+
+__device__ __forceinline__ float silu_grad(float x) {
+    // d/dx [x * sigmoid(x)].
+    // Handle infinities explicitly to avoid inf*0 -> NaN.
+    if (!isfinite(x)) {
+        return x > 0.0f ? 1.0f : 0.0f;
+    }
+    float s = sigmoid<float>(x);
+    float ds = s * (1.0f - s);
+    return fmaf(x, ds, s);  // s + x * ds
 }
 
 template<typename T>
@@ -86,7 +103,14 @@ __global__ void silu_forward_kernel(T* out, const T* inp, long n) {
     if (idx >= n) return;
     float x = to_float(inp[idx]);
     float s = sigmoid<T>(x);
-    out[idx] = from_float<T>(x * s);
+    float y;
+    if (!isfinite(x)) {
+        // Asymptotic limits of SiLU.
+        y = x > 0.0f ? x : 0.0f;
+    } else {
+        y = x * s;
+    }
+    out[idx] = from_float<T>(y);
 }
 
 template<typename T>
@@ -103,8 +127,8 @@ __global__ void silu_backward_kernel(T* dinp, const T* inp, const T* dout, long 
     if (idx >= n) return;
     float x = to_float(inp[idx]);
     float dy = to_float(dout[idx]);
-    float s = sigmoid<T>(x);
-    float dx = dy * (s * (1.0f + x * (1.0f - s)));
+    float grad = silu_grad(x);
+    float dx = dy * grad;
     dinp[idx] = from_float<T>(dx);
 }
 

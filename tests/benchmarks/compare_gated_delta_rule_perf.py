@@ -26,7 +26,16 @@ def main() -> None:
     if not common:
         raise RuntimeError("No common benchmark cases between surogate and FLA artifacts.")
 
+    required_cases = {
+        (1, 512, 8, 128, 128),   # dev
+        (2, 2048, 16, 128, 128), # production-shaped
+    }
+    missing = sorted(required_cases.difference(common))
+    if missing:
+        raise RuntimeError(f"Missing required 128x128 benchmark cases: {missing}")
+
     print("B T H K V     | su_fwd  fla_fwd  speedup | su_bwd  fla_bwd  speedup | su_total fla_total speedup")
+    perf_failures: list[tuple[tuple[int, int, int, int, int], float, float]] = []
     for k in common:
         su = su_cases[k]
         fl = fl_cases[k]
@@ -39,6 +48,15 @@ def main() -> None:
             f"{sb:7.3f} {fb:7.3f} {fb/sb:7.2f}x | "
             f"{st:8.3f} {ft:8.3f} {ft/st:7.2f}x"
         )
+        if k in required_cases and st > ft:
+            perf_failures.append((k, st, ft))
+
+    if perf_failures:
+        msg = ", ".join(
+            f"{k}: su_total={st:.3f}ms > fla_total={ft:.3f}ms"
+            for k, st, ft in perf_failures
+        )
+        raise RuntimeError(f"Performance gate failed for required cases: {msg}")
 
 
 if __name__ == "__main__":

@@ -51,7 +51,7 @@ std::vector<float> bf16_to_float(const std::vector<nv_bfloat16>& in) {
     return out;
 }
 
-json stats(const std::vector<float>& x) {
+json stats(const std::vector<float>& x, bool include_values) {
     double sum = 0.0;
     double l1 = 0.0;
     double l2 = 0.0;
@@ -77,11 +77,13 @@ json stats(const std::vector<float>& x) {
     j["l2"] = std::sqrt(l2);
     j["linf"] = linf;
     j["first8"] = std::move(first8);
-    json values = json::array();
-    for (float v : x) {
-        values.push_back(static_cast<double>(v));
+    if (include_values) {
+        json values = json::array();
+        for (float v : x) {
+            values.push_back(static_cast<double>(v));
+        }
+        j["values"] = std::move(values);
     }
-    j["values"] = std::move(values);
     return j;
 }
 
@@ -149,6 +151,7 @@ struct DumpConfig {
     int H;
     int K;
     int V;
+    bool emit_values;
 };
 
 json benchmark_case(const BenchConfig& cfg, int warmup_iters, int bench_iters) {
@@ -276,6 +279,7 @@ json benchmark_case(const BenchConfig& cfg, int warmup_iters, int bench_iters) {
             chunk_size,
             use_qk_l2norm_in_kernel,
             &checkpoints_t,   // save checkpoints during forward
+            nullptr,
             stream);
     };
     auto run_bwd = [&]() {
@@ -404,6 +408,7 @@ json dump_case(const DumpConfig& cfg) {
         chunk_size,
         use_qk_l2norm_in_kernel,
         &checkpoints_fwd_t,
+        nullptr,
         /*stream=*/0);
     CUDA_CHECK(cudaDeviceSynchronize());
 
@@ -501,15 +506,16 @@ json dump_case(const DumpConfig& cfg) {
         {"chunk_size", chunk_size},
         {"scale", scale},
         {"use_qk_l2norm_in_kernel", use_qk_l2norm_in_kernel},
+        {"emit_values", cfg.emit_values},
     };
-    report["out"] = stats(out_h);
-    report["final_state"] = stats(final_state_h);
-    report["d_query"] = stats(dq_h);
-    report["d_key"] = stats(dk_h);
-    report["d_value"] = stats(dv_h);
-    report["d_g"] = stats(dg_h);
-    report["d_beta"] = stats(dbeta_h);
-    report["d_initial_state"] = stats(dinit_h);
+    report["out"] = stats(out_h, cfg.emit_values);
+    report["final_state"] = stats(final_state_h, cfg.emit_values);
+    report["d_query"] = stats(dq_h, cfg.emit_values);
+    report["d_key"] = stats(dk_h, cfg.emit_values);
+    report["d_value"] = stats(dv_h, cfg.emit_values);
+    report["d_g"] = stats(dg_h, cfg.emit_values);
+    report["d_beta"] = stats(dbeta_h, cfg.emit_values);
+    report["d_initial_state"] = stats(dinit_h, cfg.emit_values);
     return report;
 }
 
@@ -525,8 +531,10 @@ TEST_CASE("gated delta rule deterministic surogate value dump", "[kernels][gated
     CUDA_CHECK(cudaSetDevice(0));
 
     const std::vector<DumpConfig> configs{
-        {"single_chunk_small", 1, 8, 2, 4, 3},
-        {"multi_chunk_tail", 1, 130, 2, 64, 64},
+        {"single_chunk_small", 1, 8, 2, 4, 3, true},
+        {"multi_chunk_tail", 1, 130, 2, 64, 64, true},
+        {"multi_chunk_128x128_dev", 1, 96, 2, 128, 128, true},
+        {"multi_chunk_128x128_prod_stats", 2, 2048, 16, 128, 128, false},
     };
 
     json report;
@@ -568,8 +576,8 @@ TEST_CASE("gated delta rule surogate perf benchmark", "[kernels][gated_delta_rul
     constexpr int bench_iters = 3;
 
     const std::vector<BenchConfig> configs{
-        {1, 256, 8, 64, 64},
-        {1, 512, 8, 64, 64},
+        {1, 512, 8, 128, 128},
+        {2, 2048, 16, 128, 128},
     };
 
     json report;

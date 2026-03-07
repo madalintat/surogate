@@ -326,6 +326,8 @@ private:
     bool mBackwardGraphsEnabled = false;
     bool mBackwardGraphCapturable = true;
     std::size_t mBackwardGraphCut = 0;
+    bool mLoggedQwen35LoraFwdGraphDisable = false;
+    bool mLoggedQwen35LoraBwdGraphDisable = false;
     long mGraphB = 0;
     long mGraphT = 0;
     cudaGraphExec_t mForwardGraph = nullptr;

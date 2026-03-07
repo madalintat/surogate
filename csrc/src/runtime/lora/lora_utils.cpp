@@ -3,6 +3,10 @@
 //
 
 #include "lora_utils.h"
+#include <algorithm>
+#include <cctype>
+#include <string>
+#include <string_view>
 #include "utilities/dtype.h"
 
 namespace modules {
@@ -16,7 +20,23 @@ std::size_t lora_num_parameters(const ModelConfig& model_config, const ModularLo
     const std::size_t Hq = static_cast<std::size_t>(model_config.NumQueryHeads);
     const std::size_t Hkv = static_cast<std::size_t>(model_config.NumKeyValHeads);
     const std::size_t Hs = static_cast<std::size_t>(model_config.head_size());
+    auto contains_ci = [](std::string_view haystack, std::string_view needle) {
+        std::string h(haystack);
+        std::string n(needle);
+        std::transform(h.begin(), h.end(), h.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        std::transform(n.begin(), n.end(), n.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        return h.find(n) != std::string::npos;
+    };
+    const bool is_qwen3_5 =
+        contains_ci(model_config.ModelTypeName, "qwen3_5") ||
+        contains_ci(model_config.ModelTypeName, "qwen3.5") ||
+        contains_ci(model_config.ArchitectureName, "qwen3_5") ||
+        contains_ci(model_config.ArchitectureName, "qwen3.5");
+
     const std::size_t q_out = Hq * Hs;
+    const std::size_t q_lora_out = is_qwen3_5 ? (2 * q_out) : q_out;
     const std::size_t kv_out = Hkv * Hs;
     const bool use_shared_expert = model_config.moe_config.has_value() &&
                                    model_config.moe_config->use_shared_expert;
@@ -27,7 +47,7 @@ std::size_t lora_num_parameters(const ModelConfig& model_config, const ModularLo
                                                                     : model_config.IntermediateSize);
 
     std::size_t per_layer = 0;
-    if (lora_config.applies_to_q()) per_layer += r * C + q_out * r;
+    if (lora_config.applies_to_q()) per_layer += r * C + q_lora_out * r;
     if (lora_config.applies_to_k()) per_layer += r * C + kv_out * r;
     if (lora_config.applies_to_v()) per_layer += r * C + kv_out * r;
     if (lora_config.applies_to_o()) per_layer += r * q_out + C * r;

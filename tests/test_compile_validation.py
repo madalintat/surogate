@@ -152,8 +152,15 @@ def test_config_roundtrip_qwen3():
     # Build DSL config from HF config
     config = {}
     for dsl_key, hf_key in hf_mapping.items():
-        if hf_key in hf_config and hf_config[hf_key] is not None:
-            config[dsl_key] = hf_config[hf_key]
+        cur = hf_config
+        ok = True
+        for part in hf_key.split("."):
+            if not isinstance(cur, dict) or part not in cur:
+                ok = False
+                break
+            cur = cur[part]
+        if ok and cur is not None:
+            config[dsl_key] = cur
 
     payload = compile_model(Qwen3Model, config, raise_on_error=True)
     doc = json.loads(payload)
@@ -208,8 +215,15 @@ def test_config_roundtrip_nemotron_h():
 
     config = {}
     for dsl_key, hf_key in hf_mapping.items():
-        if hf_key in hf_config and hf_config[hf_key] is not None:
-            config[dsl_key] = hf_config[hf_key]
+        cur = hf_config
+        ok = True
+        for part in hf_key.split("."):
+            if not isinstance(cur, dict) or part not in cur:
+                ok = False
+                break
+            cur = cur[part]
+        if ok and cur is not None:
+            config[dsl_key] = cur
 
     payload = compile_model(NemotronHModel, config, raise_on_error=True)
     doc = json.loads(payload)
@@ -260,6 +274,118 @@ def test_config_roundtrip_qwen3_moe():
 
     ir_config = doc["modules"][0]["config"]
 
+    for dsl_key in hf_mapping:
+        assert dsl_key in ir_config, (
+            f"DSL key '{dsl_key}' (mapped from HF '{hf_mapping[dsl_key]}') "
+            f"missing from compiled IR config"
+        )
+
+
+def test_config_roundtrip_qwen3_5_conditional():
+    """All @hf_config mapped fields for Qwen3.5 conditional should appear in IR config."""
+    from surogate.dsl.models.qwen3_5 import Qwen3_5ConditionalModel
+
+    spec = Qwen3_5ConditionalModel._dsl_spec
+    hf_mapping = spec.hf_config.param_mapping
+
+    hf_config = {
+        "text_config": {
+            "hidden_size": 256,
+            "num_hidden_layers": 4,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "intermediate_size": 512,
+            "vocab_size": 32000,
+            "max_position_embeddings": 2048,
+            "head_dim": 64,
+            "rms_norm_eps": 1e-6,
+            "attention_bias": False,
+            "rope_parameters": {
+                "partial_rotary_factor": 0.25,
+                "mrope_section": [11, 11, 10],
+            },
+            "linear_conv_kernel_dim": 4,
+            "linear_key_head_dim": 32,
+            "linear_value_head_dim": 32,
+            "linear_num_key_heads": 2,
+            "linear_num_value_heads": 4,
+            "layer_types": ["linear_attention", "full_attention", "linear_attention", "full_attention"],
+            "full_attention_interval": 2,
+        }
+    }
+
+    config = {}
+    for dsl_key, hf_key in hf_mapping.items():
+        cur = hf_config
+        ok = True
+        for part in hf_key.split("."):
+            if not isinstance(cur, dict) or part not in cur:
+                ok = False
+                break
+            cur = cur[part]
+        if ok and cur is not None:
+            config[dsl_key] = cur
+
+    payload = compile_model(Qwen3_5ConditionalModel, config, raise_on_error=True)
+    doc = json.loads(payload)
+    assert doc["success"] is True
+
+    ir_config = doc["modules"][0]["config"]
+    for dsl_key in hf_mapping:
+        assert dsl_key in ir_config, (
+            f"DSL key '{dsl_key}' (mapped from HF '{hf_mapping[dsl_key]}') "
+            f"missing from compiled IR config"
+        )
+
+
+def test_config_roundtrip_qwen3_5_causal():
+    """All @hf_config mapped fields for Qwen3.5 causal should appear in IR config."""
+    from surogate.dsl.models.qwen3_5 import Qwen3_5CausalModel
+
+    spec = Qwen3_5CausalModel._dsl_spec
+    hf_mapping = spec.hf_config.param_mapping
+
+    hf_config = {
+        "hidden_size": 256,
+        "num_hidden_layers": 4,
+        "num_attention_heads": 4,
+        "num_key_value_heads": 2,
+        "intermediate_size": 512,
+        "vocab_size": 32000,
+        "max_position_embeddings": 2048,
+        "head_dim": 64,
+        "rms_norm_eps": 1e-6,
+        "attention_bias": False,
+        "rope_parameters": {
+            "partial_rotary_factor": 0.25,
+            "mrope_section": [11, 11, 10],
+        },
+        "linear_conv_kernel_dim": 4,
+        "linear_key_head_dim": 32,
+        "linear_value_head_dim": 32,
+        "linear_num_key_heads": 2,
+        "linear_num_value_heads": 4,
+        "layer_types": ["linear_attention", "full_attention", "linear_attention", "full_attention"],
+        "full_attention_interval": 2,
+    }
+
+    config = {}
+    for dsl_key, hf_key in hf_mapping.items():
+        cur = hf_config
+        ok = True
+        for part in hf_key.split("."):
+            if not isinstance(cur, dict) or part not in cur:
+                ok = False
+                break
+            cur = cur[part]
+        if ok and cur is not None:
+            config[dsl_key] = cur
+
+    payload = compile_model(Qwen3_5CausalModel, config, raise_on_error=True)
+    doc = json.loads(payload)
+    assert doc["success"] is True
+
+    ir_config = doc["modules"][0]["config"]
     for dsl_key in hf_mapping:
         assert dsl_key in ir_config, (
             f"DSL key '{dsl_key}' (mapped from HF '{hf_mapping[dsl_key]}') "

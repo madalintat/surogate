@@ -180,9 +180,16 @@ CompiledOpType op_type_from_string(const std::string& op_type) {
     static const std::unordered_map<std::string, CompiledOpType> type_map = {
         {"embedding", CompiledOpType::Embedding},
         {"zeros", CompiledOpType::Zeros},
+        {"ones", CompiledOpType::Ones},
         {"fused_residual_rmsnorm", CompiledOpType::FusedResidualRMSNorm},
         {"layernorm", CompiledOpType::LayerNorm},
         {"view", CompiledOpType::View},
+        {"transpose", CompiledOpType::Transpose},
+        {"transpose_backward", CompiledOpType::Transpose},
+        {"split", CompiledOpType::Split},
+        {"split_backward", CompiledOpType::Split},
+        {"concat", CompiledOpType::Concat},
+        {"concat_backward", CompiledOpType::Concat},
         {"add", CompiledOpType::Add},
         {"matmul", CompiledOpType::Matmul},
         {"matmul_bias", CompiledOpType::MatmulBias},
@@ -241,6 +248,7 @@ CompiledOpType op_type_from_string(const std::string& op_type) {
         {"mrope_backward", CompiledOpType::MRoPEBackward},
         {"flash_attention_backward", CompiledOpType::FlashAttentionBackward},
         {"zeros_backward", CompiledOpType::ZerosBackward},
+        {"ones_backward", CompiledOpType::ZerosBackward},
         {"fused_residual_rmsnorm_backward", CompiledOpType::FusedResidualRMSNormBackward},
         {"layernorm_backward", CompiledOpType::LayerNormBackward},
         {"embedding_backward", CompiledOpType::EmbeddingBackward},
@@ -601,6 +609,41 @@ CompiledAttrs GraphCompiler::resolve_attrs(const Operation& op, CompiledOpType t
         // Store the reference name for runtime lookup
         if (auto ref_name = attr_string(*shape_like_attr)) {
             attrs.shape_like = *ref_name;
+        }
+    }
+
+    // Common axis attribute for split/concat-like operations.
+    if (auto* dim_attr = find_attr(op.attrs, "dim")) {
+        if (auto v = attr_int(*dim_attr)) {
+            attrs.split_concat_dim = static_cast<int>(*v);
+        }
+    }
+
+    if (auto* dim0_attr = find_attr(op.attrs, "dim0")) {
+        if (auto v = attr_int(*dim0_attr)) {
+            attrs.dim0 = static_cast<int>(*v);
+        }
+    }
+    if (auto* dim1_attr = find_attr(op.attrs, "dim1")) {
+        if (auto v = attr_int(*dim1_attr)) {
+            attrs.dim1 = static_cast<int>(*v);
+        }
+    }
+
+    // Split sizes for split operation.
+    if (type == CompiledOpType::Split) {
+        if (auto* split_attr = find_attr(op.attrs, "split_size")) {
+            if (auto list = attr_list_int(*split_attr)) {
+                attrs.split_sizes = *list;
+            } else if (auto v = attr_int(*split_attr)) {
+                attrs.split_sizes = {static_cast<long>(*v)};
+            }
+        } else if (auto* sections_attr = find_attr(op.attrs, "sections")) {
+            if (auto list = attr_list_int(*sections_attr)) {
+                attrs.split_sizes = *list;
+            } else if (auto v = attr_int(*sections_attr)) {
+                attrs.split_sizes = {static_cast<long>(*v)};
+            }
         }
     }
 
@@ -1276,6 +1319,123 @@ void GraphCompiler::infer_output_shapes(
             break;
         }
 
+        case CompiledOpType::Transpose: {
+            if (input_shapes.empty() || input_shapes[0].empty()) {
+                break;
+            }
+            auto out_shape = input_shapes[0];
+            const int rank = static_cast<int>(out_shape.size());
+            int dim0 = 0;
+            int dim1 = 1;
+            if (auto* a = find_attr(op.attrs, "dim0")) {
+                if (auto v = attr_int(*a)) dim0 = static_cast<int>(*v);
+            }
+            if (auto* a = find_attr(op.attrs, "dim1")) {
+                if (auto v = attr_int(*a)) dim1 = static_cast<int>(*v);
+            }
+            if (dim0 < 0) dim0 += rank;
+            if (dim1 < 0) dim1 += rank;
+            if (dim0 >= 0 && dim0 < rank && dim1 >= 0 && dim1 < rank && dim0 != dim1) {
+                std::swap(out_shape[dim0], out_shape[dim1]);
+                output_shapes.push_back(std::move(out_shape));
+            }
+            break;
+        }
+
+        case CompiledOpType::Concat: {
+            if (input_shapes.empty() || input_shapes[0].empty()) {
+                break;
+            }
+            const int rank = static_cast<int>(input_shapes[0].size());
+            int dim = 0;
+            if (auto* dim_attr = find_attr(op.attrs, "dim")) {
+                if (auto v = attr_int(*dim_attr)) {
+                    dim = static_cast<int>(*v);
+                }
+            }
+            if (dim < 0) dim += rank;
+            if (dim < 0 || dim >= rank) {
+                break;
+            }
+
+            auto out_shape = input_shapes[0];
+            long concat_dim = 0;
+            bool valid = true;
+            for (const auto& in_shape : input_shapes) {
+                if (in_shape.size() != static_cast<std::size_t>(rank)) {
+                    valid = false;
+                    break;
+                }
+                for (int d = 0; d < rank; ++d) {
+                    if (d == dim) continue;
+                    if (in_shape[d] != out_shape[d]) {
+                        valid = false;
+                        break;
+                    }
+                }
+                if (!valid) break;
+                concat_dim += in_shape[dim];
+            }
+            if (valid) {
+                out_shape[dim] = concat_dim;
+                output_shapes.push_back(std::move(out_shape));
+            }
+            break;
+        }
+
+        case CompiledOpType::Split: {
+            if (input_shapes.empty() || input_shapes[0].empty()) {
+                break;
+            }
+            const auto& in_shape = input_shapes[0];
+            const int rank = static_cast<int>(in_shape.size());
+            int dim = 0;
+            if (auto* dim_attr = find_attr(op.attrs, "dim")) {
+                if (auto v = attr_int(*dim_attr)) {
+                    dim = static_cast<int>(*v);
+                }
+            }
+            if (dim < 0) dim += rank;
+            if (dim < 0 || dim >= rank) {
+                break;
+            }
+
+            std::vector<long> split_sizes;
+            if (auto* split_attr = find_attr(op.attrs, "split_size")) {
+                if (auto list = attr_list_int(*split_attr)) {
+                    split_sizes = *list;
+                } else if (auto v = attr_int(*split_attr)) {
+                    const long chunk = static_cast<long>(*v);
+                    if (chunk > 0) {
+                        long rem = in_shape[dim];
+                        while (rem > 0) {
+                            const long take = std::min(chunk, rem);
+                            split_sizes.push_back(take);
+                            rem -= take;
+                        }
+                    }
+                }
+            }
+
+            if (split_sizes.empty() && !op.outputs.empty()) {
+                if (in_shape[dim] % static_cast<long>(op.outputs.size()) == 0) {
+                    split_sizes.assign(op.outputs.size(),
+                                       in_shape[dim] / static_cast<long>(op.outputs.size()));
+                }
+            }
+
+            for (std::size_t i = 0; i < op.outputs.size(); ++i) {
+                if (i >= split_sizes.size()) {
+                    output_shapes.push_back({});
+                    continue;
+                }
+                auto out_shape = in_shape;
+                out_shape[dim] = split_sizes[i];
+                output_shapes.push_back(std::move(out_shape));
+            }
+            break;
+        }
+
         case CompiledOpType::Add: {
             // Output shape = broadcast(input shapes)
             if (!input_shapes.empty()) {
@@ -1342,11 +1502,29 @@ void GraphCompiler::infer_output_shapes(
             break;
         }
 
-        case CompiledOpType::Zeros: {
+        case CompiledOpType::Zeros:
+        case CompiledOpType::Ones: {
             // Try to infer from 'shape' attribute
             if (auto* shape_attr = find_attr(op.attrs, "shape")) {
                 auto out_shape = resolve_attr_shape(*shape_attr, mShapeEnv);
                 output_shapes.push_back(out_shape);
+            } else if (auto* shape_like_attr = find_attr(op.attrs, "shape_like")) {
+                if (auto ref_name = attr_string(*shape_like_attr)) {
+                    std::string ref = *ref_name;
+                    if (starts_with(ref, kSavedPrefix)) {
+                        ref = ref.substr(kSavedPrefix.size());
+                    }
+                    std::vector<long> ref_shape;
+                    auto it = mExtraShapes.find(ref);
+                    if (it != mExtraShapes.end()) {
+                        ref_shape = it->second;
+                    } else if (!resolve_tensor_shape(ref, ref_shape)) {
+                        infer_known_tensor_shape(ref, mConfig, mB, mT, ref_shape);
+                    }
+                    if (!ref_shape.empty()) {
+                        output_shapes.push_back(std::move(ref_shape));
+                    }
+                }
             }
             break;
         }
@@ -2323,7 +2501,8 @@ CompiledGraph GraphCompiler::compile(const Graph& graph, long B, long T) {
                         ref.dtype = base_dtype;
                         ref.shape = {Mdim, Ndim > 0 ? Ndim : (2 * Ddim)};
                     }
-                } else if (compiled.type == CompiledOpType::Zeros) {
+                } else if (compiled.type == CompiledOpType::Zeros ||
+                           compiled.type == CompiledOpType::Ones) {
                     // Preserve explicit output dtype/shape from graph.
                     // Read dtype from op attributes if specified
                     if (auto* dtype_attr = find_attr(op.attrs, "dtype")) {

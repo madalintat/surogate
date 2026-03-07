@@ -755,7 +755,20 @@ std::pair<float, float> MultiGPUPyTrainer::train_step_graphed(const std::int32_t
                                    sizeof(opt_step_host), cudaMemcpyHostToDevice, rs.MainStream));
 
         // If graphs are disabled or unsupported, fall back to eager execution.
-        if (!mOptions.UseCudaGraphs) {
+        const bool qwen3_family_model =
+            (mConfig != nullptr) &&
+            (mConfig->Architecture == PretrainedConfig::QWEN3);
+        const bool disable_outer_full_step_graph = qwen3_family_model;
+        if (!mOptions.UseCudaGraphs || disable_outer_full_step_graph) {
+            if (disable_outer_full_step_graph) {
+                static bool warned_once = false;
+                if (!warned_once && ctx.Communicator && ctx.Communicator->rank() == 0) {
+                    fprintf(stderr,
+                            "[CUDA graphs] Qwen3-family model: disabling outer full-step graph "
+                            "capture and using eager full-step with internal DSL graphs.\n");
+                    warned_once = true;
+                }
+            }
             const bool do_timing = mOptions.TriggerTimingEvents;
             if (do_timing && rs.TimingForwardStart.empty()) {
                 rs.setup_timing_events(micro_steps);
@@ -1289,7 +1302,6 @@ std::vector<std::pair<std::string, Tensor>> MultiGPUPyTrainer::get_lora_gradient
         const bool is_nemotron = (config.Architecture == PretrainedConfig::NEMOTRON_H) ||
                                  contains_ci(config.ArchitectureName, "nemotron") ||
                                  contains_ci(config.ModelTypeName, "nemotron");
-        const bool is_moe = dsl_model->is_moe_model();
         CUDA_CHECK(cudaDeviceSynchronize());
 
         for (int l = 0; l < config.NumLayers; ++l) {
@@ -1316,19 +1328,31 @@ std::vector<std::pair<std::string, Tensor>> MultiGPUPyTrainer::get_lora_gradient
                 add_layer(prefix + ".self_attn.o_proj", block.attention.o);
             }
 
-            if (is_moe) {
-                if (block.moe.use_grouped) {
-                    std::string expert_prefix;
-                    if (is_nemotron) {
-                        expert_prefix = fmt::format("{}.mixer.experts", prefix);
-                    } else {
-                        expert_prefix = fmt::format("{}.mlp.experts", prefix);
-                    }
-                    add_grouped_layer(expert_prefix + ".gate_proj", block.moe.grouped.gate);
-                    add_grouped_layer(expert_prefix + ".gate_up_proj", block.moe.grouped.gate_up);
-                    add_grouped_layer(expert_prefix + ".up_proj", block.moe.grouped.up);
-                    add_grouped_layer(expert_prefix + ".down_proj", block.moe.grouped.down);
+            // Dense MLP LoRA (present in dense and hybrid non-MoE blocks).
+            if (is_nemotron) {
+                const std::string mixer_prefix = prefix + ".mixer";
+                add_layer(mixer_prefix + ".gate_proj", block.mlp.gate);
+                add_layer(mixer_prefix + ".up_proj", block.mlp.up);
+                add_layer(mixer_prefix + ".down_proj", block.mlp.down);
+            } else {
+                add_layer(prefix + ".mlp.gate_proj", block.mlp.gate);
+                add_layer(prefix + ".mlp.up_proj", block.mlp.up);
+                add_layer(prefix + ".mlp.down_proj", block.mlp.down);
+            }
+
+            // MoE LoRA (if this layer is an MoE block).
+            if (block.moe.use_grouped) {
+                std::string expert_prefix;
+                if (is_nemotron) {
+                    expert_prefix = fmt::format("{}.mixer.experts", prefix);
                 } else {
+                    expert_prefix = fmt::format("{}.mlp.experts", prefix);
+                }
+                add_grouped_layer(expert_prefix + ".gate_proj", block.moe.grouped.gate);
+                add_grouped_layer(expert_prefix + ".gate_up_proj", block.moe.grouped.gate_up);
+                add_grouped_layer(expert_prefix + ".up_proj", block.moe.grouped.up);
+                add_grouped_layer(expert_prefix + ".down_proj", block.moe.grouped.down);
+            } else {
                 for (int e = 0; e < (int)block.moe.experts.size(); ++e) {
                     auto& expert = block.moe.experts[e];
                     std::string expert_prefix;
@@ -1341,18 +1365,6 @@ std::vector<std::pair<std::string, Tensor>> MultiGPUPyTrainer::get_lora_gradient
                     add_layer(expert_prefix + ".gate_up_proj", expert.gate_up);
                     add_layer(expert_prefix + ".up_proj", expert.up);
                     add_layer(expert_prefix + ".down_proj", expert.down);
-                }
-                }
-            } else {
-                if (is_nemotron) {
-                    const std::string mixer_prefix = prefix + ".mixer";
-                    add_layer(mixer_prefix + ".gate_proj", block.mlp.gate);
-                    add_layer(mixer_prefix + ".up_proj", block.mlp.up);
-                    add_layer(mixer_prefix + ".down_proj", block.mlp.down);
-                } else {
-                    add_layer(prefix + ".mlp.gate_proj", block.mlp.gate);
-                    add_layer(prefix + ".mlp.up_proj", block.mlp.up);
-                    add_layer(prefix + ".mlp.down_proj", block.mlp.down);
                 }
             }
         }
@@ -1397,7 +1409,6 @@ std::vector<std::pair<std::string, Tensor>> MultiGPUPyTrainer::get_lora_weights(
         const bool is_nemotron = (config.Architecture == PretrainedConfig::NEMOTRON_H) ||
                                  contains_ci(config.ArchitectureName, "nemotron") ||
                                  contains_ci(config.ModelTypeName, "nemotron");
-        const bool is_moe = dsl_model->is_moe_model();
         CUDA_CHECK(cudaDeviceSynchronize());
 
         for (int l = 0; l < config.NumLayers; ++l) {
@@ -1423,43 +1434,43 @@ std::vector<std::pair<std::string, Tensor>> MultiGPUPyTrainer::get_lora_weights(
                 add_layer(prefix + ".self_attn.o_proj", block.attention.o);
             }
 
-            if (is_moe) {
-                if (block.moe.use_grouped) {
+            // Dense MLP LoRA (present in dense and hybrid non-MoE blocks).
+            if (is_nemotron) {
+                const std::string mixer_prefix = prefix + ".mixer";
+                add_layer(mixer_prefix + ".gate_proj", block.mlp.gate);
+                add_layer(mixer_prefix + ".up_proj", block.mlp.up);
+                add_layer(mixer_prefix + ".down_proj", block.mlp.down);
+            } else {
+                add_layer(prefix + ".mlp.gate_proj", block.mlp.gate);
+                add_layer(prefix + ".mlp.up_proj", block.mlp.up);
+                add_layer(prefix + ".mlp.down_proj", block.mlp.down);
+            }
+
+            // MoE LoRA (if this layer is an MoE block).
+            if (block.moe.use_grouped) {
+                std::string expert_prefix;
+                if (is_nemotron) {
+                    expert_prefix = fmt::format("{}.mixer.experts", prefix);
+                } else {
+                    expert_prefix = fmt::format("{}.mlp.experts", prefix);
+                }
+                add_grouped_layer(expert_prefix + ".gate_proj", block.moe.grouped.gate);
+                add_grouped_layer(expert_prefix + ".gate_up_proj", block.moe.grouped.gate_up);
+                add_grouped_layer(expert_prefix + ".up_proj", block.moe.grouped.up);
+                add_grouped_layer(expert_prefix + ".down_proj", block.moe.grouped.down);
+            } else {
+                for (int e = 0; e < (int)block.moe.experts.size(); ++e) {
+                    auto& expert = block.moe.experts[e];
                     std::string expert_prefix;
                     if (is_nemotron) {
-                        expert_prefix = fmt::format("{}.mixer.experts", prefix);
+                        expert_prefix = fmt::format("{}.mixer.experts.{}", prefix, e);
                     } else {
-                        expert_prefix = fmt::format("{}.mlp.experts", prefix);
+                        expert_prefix = fmt::format("{}.mlp.experts.{}", prefix, e);
                     }
-                    add_grouped_layer(expert_prefix + ".gate_proj", block.moe.grouped.gate);
-                    add_grouped_layer(expert_prefix + ".gate_up_proj", block.moe.grouped.gate_up);
-                    add_grouped_layer(expert_prefix + ".up_proj", block.moe.grouped.up);
-                    add_grouped_layer(expert_prefix + ".down_proj", block.moe.grouped.down);
-                } else {
-                    for (int e = 0; e < (int)block.moe.experts.size(); ++e) {
-                        auto& expert = block.moe.experts[e];
-                        std::string expert_prefix;
-                        if (is_nemotron) {
-                            expert_prefix = fmt::format("{}.mixer.experts.{}", prefix, e);
-                        } else {
-                            expert_prefix = fmt::format("{}.mlp.experts.{}", prefix, e);
-                        }
-                        add_layer(expert_prefix + ".gate_proj", expert.gate);
-                        add_layer(expert_prefix + ".gate_up_proj", expert.gate_up);
-                        add_layer(expert_prefix + ".up_proj", expert.up);
-                        add_layer(expert_prefix + ".down_proj", expert.down);
-                    }
-                }
-            } else {
-                if (is_nemotron) {
-                    const std::string mixer_prefix = prefix + ".mixer";
-                    add_layer(mixer_prefix + ".gate_proj", block.mlp.gate);
-                    add_layer(mixer_prefix + ".up_proj", block.mlp.up);
-                    add_layer(mixer_prefix + ".down_proj", block.mlp.down);
-                } else {
-                    add_layer(prefix + ".mlp.gate_proj", block.mlp.gate);
-                    add_layer(prefix + ".mlp.up_proj", block.mlp.up);
-                    add_layer(prefix + ".mlp.down_proj", block.mlp.down);
+                    add_layer(expert_prefix + ".gate_proj", expert.gate);
+                    add_layer(expert_prefix + ".gate_up_proj", expert.gate_up);
+                    add_layer(expert_prefix + ".up_proj", expert.up);
+                    add_layer(expert_prefix + ".down_proj", expert.down);
                 }
             }
         }

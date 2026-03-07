@@ -290,8 +290,11 @@ target_sources(surogate-common PRIVATE
 
     src/runtime/ops/embedding.cpp
     src/runtime/ops/zeros.cpp
+    src/runtime/ops/ones.cpp
     src/runtime/ops/fused_residual_rmsnorm.cpp
     src/runtime/ops/view.cpp
+    src/runtime/ops/transpose.cpp
+    src/runtime/ops/concat_split.cpp
     src/runtime/ops/add.cpp
     src/runtime/ops/bias_add.cpp
     src/runtime/ops/matmul.cpp
@@ -378,9 +381,15 @@ target_sources(surogate-common PRIVATE
     src/kernels/moe_kernels.cu
     src/kernels/ep_dispatch.cu
     src/kernels/mamba_kernels.cu
-    src/kernels/gated_delta_rule.cu
-    src/kernels/gated_delta_rule_v2_fwd.cu
-    src/kernels/gated_delta_rule_v2_bwd.cu
+    src/kernels/gated_delta_rule/gated_delta_rule_v2_fwd.cu
+    src/kernels/gated_delta_rule/gdr_chunk_fwd_precompute.cu
+    src/kernels/gated_delta_rule/gdr_chunk_fwd_state.cu
+    src/kernels/gated_delta_rule/gdr_chunk_fwd_output.cu
+    src/kernels/gated_delta_rule/gated_delta_rule_v2_bwd.cu
+    src/kernels/gated_delta_rule/gdr_chunk_checkpoint.cu
+    src/kernels/gated_delta_rule/gdr_chunk_bwd_phase1.cu
+    src/kernels/gated_delta_rule/gdr_chunk_bwd_phase2.cu
+    src/kernels/gated_delta_rule/gdr_chunk_bwd_phase3.cu
     src/kernels/rope.cu
     src/kernels/mrope.cu
     src/kernels/mask_scatter.cu
@@ -409,6 +418,7 @@ target_sources(surogate-common PRIVATE
     src/kernels/fill.cu
     src/kernels/convert.cu
     src/kernels/lora_dropout.cu
+    src/kernels/lora_small_rank.cu
 
     # Vendored Mamba2 kernels (selective scan + causal conv1d)
     src/third_party/mamba/selective_scan/selective_scan_fwd_bf16.cu

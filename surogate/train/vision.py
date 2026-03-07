@@ -23,6 +23,36 @@ def _labels_to_input_mask(labels: np.ndarray) -> np.ndarray:
     return out
 
 
+def _extract_mm_feature_outputs(mm_out):
+    """Normalize HF multimodal feature outputs across model variants.
+
+    Returns:
+        pooled_list: list[Tensor] of pooled visual chunks.
+        deepstack_list: list[Tensor] or [] when model does not expose deepstack.
+    """
+    pooled = getattr(mm_out, "pooler_output", None)
+    if pooled is None:
+        pooled_list = []
+    elif isinstance(pooled, torch.Tensor):
+        pooled_list = [pooled]
+    elif isinstance(pooled, (list, tuple)):
+        pooled_list = [p for p in pooled if isinstance(p, torch.Tensor)]
+    else:
+        pooled_list = []
+
+    deepstack = getattr(mm_out, "deepstack_features", None)
+    if deepstack is None:
+        deepstack_list = []
+    elif isinstance(deepstack, torch.Tensor):
+        deepstack_list = [deepstack]
+    elif isinstance(deepstack, (list, tuple)):
+        deepstack_list = [d for d in deepstack if isinstance(d, torch.Tensor)]
+    else:
+        deepstack_list = []
+
+    return pooled_list, deepstack_list
+
+
 def init_mm_helpers(config):
     _, _, hf_model, processor = get_model_info_and_tokenizer(
         config.model_dir,
@@ -415,9 +445,8 @@ class OnTheFlyMultimodalBatcher:
                     _img_out = self.hf_model.get_image_features(
                         pixel_values, image_grid_thw=image_grid_thw_vis
                     )
-                    image_embeds_list = _img_out.pooler_output
-                    deepstack_image = _img_out.deepstack_features or []
-                    if image_embeds_list:
+                    image_embeds_list, deepstack_image = _extract_mm_feature_outputs(_img_out)
+                    if len(image_embeds_list) > 0:
                         image_embeds_flat = torch.cat(image_embeds_list, dim=0)
 
                 if video_pixel_values_list:
@@ -428,9 +457,8 @@ class OnTheFlyMultimodalBatcher:
                     _vid_out = self.hf_model.get_video_features(
                         pixel_values_v, video_grid_thw=video_grid_thw_vis
                     )
-                    video_embeds_list = _vid_out.pooler_output
-                    deepstack_video = _vid_out.deepstack_features or []
-                    if video_embeds_list:
+                    video_embeds_list, deepstack_video = _extract_mm_feature_outputs(_vid_out)
+                    if len(video_embeds_list) > 0:
                         video_embeds_flat = torch.cat(video_embeds_list, dim=0)
 
                 if self.deepstack_layers:

@@ -184,13 +184,29 @@ std::unique_ptr<PretrainedConfig> load_pretrained_config(const char* file_name, 
 
     // Position + RoPE
     if (auto v = get_opt_int("max_position_embeddings")) cfg->MaxPositionEmbeddings = *v;
-    if (auto v = get_opt_float("rope_theta")) cfg->RopeTheta = *v;
+
+    const nlohmann::json* rope_parameters = nullptr;
+    if (config_json.contains("rope_parameters") && config_json["rope_parameters"].is_object()) {
+        rope_parameters = &config_json["rope_parameters"];
+    } else if (text_cfg && (*text_cfg).contains("rope_parameters") && (*text_cfg)["rope_parameters"].is_object()) {
+        rope_parameters = &(*text_cfg)["rope_parameters"];
+    }
+
+    if (auto v = get_opt_float("rope_theta")) {
+        cfg->RopeTheta = *v;
+    } else if (rope_parameters) {
+        if (auto v = get_opt<float>(*rope_parameters, "rope_theta")) {
+            cfg->RopeTheta = *v;
+        }
+    }
     cfg->Rope = RoPEConfig::full(cfg->RopeTheta);
 
-    if (auto partial = get_opt_float("partial_rotary_factor")) {
-        if (*partial > 0.0f && *partial < 1.0f) {
-            cfg->Rope = RoPEConfig::partial(*partial, cfg->RopeTheta);
-        }
+    std::optional<float> partial_factor = get_opt_float("partial_rotary_factor");
+    if (!partial_factor && rope_parameters) {
+        partial_factor = get_opt<float>(*rope_parameters, "partial_rotary_factor");
+    }
+    if (partial_factor && *partial_factor > 0.0f && *partial_factor < 1.0f) {
+        cfg->Rope = RoPEConfig::partial(*partial_factor, cfg->RopeTheta);
     }
 
     const nlohmann::json* mrope_arr = nullptr;
@@ -198,6 +214,9 @@ std::unique_ptr<PretrainedConfig> load_pretrained_config(const char* file_name, 
         mrope_arr = &config_json["mrope_section"];
     } else if (text_cfg && text_cfg->contains("mrope_section") && (*text_cfg)["mrope_section"].is_array()) {
         mrope_arr = &(*text_cfg)["mrope_section"];
+    } else if (rope_parameters && rope_parameters->contains("mrope_section") &&
+               (*rope_parameters)["mrope_section"].is_array()) {
+        mrope_arr = &(*rope_parameters)["mrope_section"];
     }
     if (mrope_arr) {
         const auto& arr = *mrope_arr;
@@ -206,6 +225,16 @@ std::unique_ptr<PretrainedConfig> load_pretrained_config(const char* file_name, 
             const int h = as_int(arr[1]).value_or(0);
             const int w = as_int(arr[2]).value_or(0);
             cfg->Rope = RoPEConfig::multimodal(t, h, w, cfg->RopeTheta);
+            // Qwen3.5 supports multimodal interleaving + partial rotary together.
+            if (partial_factor && *partial_factor > 0.0f && *partial_factor < 1.0f) {
+                cfg->Rope.partial_factor = *partial_factor;
+            }
+        }
+    }
+
+    if (rope_parameters) {
+        if (auto rope_type = get_opt<std::string>(*rope_parameters, "rope_type")) {
+            cfg->Rope.rope_type = *rope_type;
         }
     }
 

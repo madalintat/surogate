@@ -36,9 +36,13 @@ def _signal(
     return x.reshape(shape).to(dtype)
 
 
-def _stats(t: torch.Tensor) -> dict[str, float | list[float] | int]:
+def _stats(
+    t: torch.Tensor,
+    *,
+    include_values: bool,
+) -> dict[str, float | list[float] | int]:
     x = t.detach().float().reshape(-1)
-    return {
+    out: dict[str, float | list[float] | int] = {
         "numel": int(x.numel()),
         "sum": float(x.sum().item()),
         "mean": float(x.mean().item()),
@@ -46,8 +50,10 @@ def _stats(t: torch.Tensor) -> dict[str, float | list[float] | int]:
         "l2": float(torch.linalg.vector_norm(x, ord=2).item()),
         "linf": float(x.abs().max().item()),
         "first8": [float(v) for v in x[:8].cpu().tolist()],
-        "values": [float(v) for v in x.cpu().tolist()],
     }
+    if include_values:
+        out["values"] = [float(v) for v in x.cpu().tolist()]
+    return out
 
 
 def _run_case(
@@ -60,6 +66,7 @@ def _run_case(
     v: int,
     chunk_size: int,
     use_qk_l2norm_in_kernel: bool,
+    emit_values: bool,
 ) -> dict[str, object]:
     device = "cuda"
     dtype = torch.bfloat16
@@ -127,15 +134,16 @@ def _run_case(
             "chunk_size": chunk_size,
             "scale": scale,
             "use_qk_l2norm_in_kernel": use_qk_l2norm_in_kernel,
+            "emit_values": emit_values,
         },
-        "out": _stats(out),
-        "final_state": _stats(final_state),
-        "d_query": _stats(dq),
-        "d_key": _stats(dk),
-        "d_value": _stats(dv),
-        "d_g": _stats(dg),
-        "d_beta": _stats(dbeta),
-        "d_initial_state": _stats(d_initial_state),
+        "out": _stats(out, include_values=emit_values),
+        "final_state": _stats(final_state, include_values=emit_values),
+        "d_query": _stats(dq, include_values=emit_values),
+        "d_key": _stats(dk, include_values=emit_values),
+        "d_value": _stats(dv, include_values=emit_values),
+        "d_g": _stats(dg, include_values=emit_values),
+        "d_beta": _stats(dbeta, include_values=emit_values),
+        "d_initial_state": _stats(d_initial_state, include_values=emit_values),
     }
 
 
@@ -151,6 +159,7 @@ def test_chunk_gated_delta_rule_fla_reference_value_dump() -> None:
             v=3,
             chunk_size=64,
             use_qk_l2norm_in_kernel=True,
+            emit_values=True,
         ),
         _run_case(
             case_name="multi_chunk_tail",
@@ -161,6 +170,29 @@ def test_chunk_gated_delta_rule_fla_reference_value_dump() -> None:
             v=64,
             chunk_size=64,
             use_qk_l2norm_in_kernel=True,
+            emit_values=True,
+        ),
+        _run_case(
+            case_name="multi_chunk_128x128_dev",
+            b=1,
+            t=96,
+            h=2,
+            k=128,
+            v=128,
+            chunk_size=64,
+            use_qk_l2norm_in_kernel=True,
+            emit_values=True,
+        ),
+        _run_case(
+            case_name="multi_chunk_128x128_prod_stats",
+            b=2,
+            t=2048,
+            h=16,
+            k=128,
+            v=128,
+            chunk_size=64,
+            use_qk_l2norm_in_kernel=True,
+            emit_values=False,
         ),
     ]
 

@@ -167,6 +167,98 @@ std::vector<Operation> add_backward(const BackwardRuleContext& ctx) {
 }
 
 // -----------------------------------------------------------------------------
+// Concat backward rule
+// Forward: y = concat(x1, x2, ..., dim)
+// Backward: dx1, dx2, ... = split(dy, dim)
+// -----------------------------------------------------------------------------
+std::vector<Operation> concat_backward(const BackwardRuleContext& ctx) {
+    std::vector<Operation> ops;
+    const auto& fwd = ctx.fwd_op;
+
+    bool any_needed = false;
+    for (std::size_t i = 0; i < fwd.inputs.size(); ++i) {
+        if (ctx.needs_grad(i)) {
+            any_needed = true;
+            break;
+        }
+    }
+    if (!any_needed) {
+        return ops;
+    }
+
+    AttrMap attrs = copy_attrs(fwd.attrs, {"dim"}, "concat");
+    std::vector<std::string> outputs;
+    outputs.reserve(fwd.inputs.size());
+    for (std::size_t i = 0; i < fwd.inputs.size(); ++i) {
+        outputs.push_back(ctx.needs_grad(i) ? ctx.d_inputs[i] : "");
+    }
+
+    ops.push_back(make_operation(
+        "concat_backward_" + std::to_string(ctx.op_counter++),
+        "split",
+        "split",
+        {ctx.d_output},
+        outputs,
+        attrs));
+
+    return ops;
+}
+
+// -----------------------------------------------------------------------------
+// Split backward rule
+// Forward: y1, y2, ... = split(x, split_size, dim)
+// Backward: dx = concat(dy1, dy2, ..., dim)
+// -----------------------------------------------------------------------------
+std::vector<Operation> split_backward(const BackwardRuleContext& ctx) {
+    std::vector<Operation> ops;
+    const auto& fwd = ctx.fwd_op;
+
+    if (!ctx.needs_grad(0)) {
+        return ops;
+    }
+
+    AttrMap concat_attrs = copy_attrs(fwd.attrs, {"dim"}, "split");
+    std::vector<std::string> concat_inputs;
+    concat_inputs.reserve(fwd.outputs.size());
+
+    for (std::size_t i = 0; i < fwd.outputs.size(); ++i) {
+        const bool has_grad = (i < ctx.d_outputs.size() && !ctx.d_outputs[i].empty());
+        if (has_grad) {
+            concat_inputs.push_back(ctx.d_outputs[i]);
+            continue;
+        }
+
+        // Missing branch gradient => explicit zero tensor, shaped like the
+        // corresponding forward split output, so concat gets a full partition.
+        const std::string zero_name = "split_zero_grad_" + std::to_string(ctx.op_counter++);
+        AttrMap zattrs;
+        zattrs["shape_like"] = AttrValue(saved_ref(fwd.outputs[i]));
+        ops.push_back(make_operation(
+            "split_zero_" + std::to_string(ctx.op_counter++),
+            "zeros",
+            "zeros",
+            {},
+            {zero_name},
+            zattrs));
+        concat_inputs.push_back(zero_name);
+    }
+
+    if (concat_inputs.empty()) {
+        return ops;
+    }
+
+    ops.push_back(make_operation(
+        "split_backward_" + std::to_string(ctx.op_counter++),
+        "concat",
+        "concat",
+        concat_inputs,
+        {ctx.d_inputs[0]},
+        concat_attrs));
+
+    return ops;
+}
+
+// -----------------------------------------------------------------------------
 // Multiply backward rule
 // Forward: C = A * B (elementwise)
 // Backward: dA = dC * B, dB = dC * A
@@ -808,9 +900,40 @@ std::vector<Operation> view_backward(const BackwardRuleContext& ctx) {
 }
 
 // -----------------------------------------------------------------------------
+// Transpose backward rule
+// Forward: y = transpose(x, dim0, dim1)
+// Backward: dx = transpose(dy, dim0, dim1)
+// -----------------------------------------------------------------------------
+std::vector<Operation> transpose_backward(const BackwardRuleContext& ctx) {
+    std::vector<Operation> ops;
+    if (!ctx.needs_grad(0)) {
+        return ops;
+    }
+
+    const auto& fwd = ctx.fwd_op;
+    AttrMap attrs = copy_attrs(fwd.attrs, {"dim0", "dim1"});
+    ops.push_back(make_operation(
+        "transpose_backward_" + std::to_string(ctx.op_counter++),
+        "transpose",
+        "transpose",
+        {ctx.d_output},
+        {ctx.d_inputs[0]},
+        attrs));
+    return ops;
+}
+
+// -----------------------------------------------------------------------------
 // Zeros - no backward (constant has zero gradient)
 // -----------------------------------------------------------------------------
 std::vector<Operation> zeros_backward(const BackwardRuleContext& ctx) {
+    // No operations needed - gradient of a constant is zero
+    return {};
+}
+
+// -----------------------------------------------------------------------------
+// Ones - no backward (constant has zero gradient)
+// -----------------------------------------------------------------------------
+std::vector<Operation> ones_backward(const BackwardRuleContext& ctx) {
     // No operations needed - gradient of a constant is zero
     return {};
 }
@@ -1626,7 +1749,11 @@ void register_builtin_backward_rules() {
     // Tensor ops
     reg.register_rule("view", view_backward);
     reg.register_rule("reshape", view_backward);
+    reg.register_rule("transpose", transpose_backward);
+    reg.register_rule("concat", concat_backward);
+    reg.register_rule("split", split_backward);
     reg.register_rule("zeros", zeros_backward);
+    reg.register_rule("ones", ones_backward);
     reg.register_rule("identity", identity_backward);
     reg.register_rule("copy", identity_backward);
 

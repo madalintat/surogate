@@ -4,7 +4,10 @@
 
 #include "lora_grads_manager.h"
 
+#include <algorithm>
+#include <cctype>
 #include <fmt/format.h>
+#include <string>
 
 #include "kernels/kernels.h"
 #include "runtime/core/model_config.h"
@@ -36,6 +39,21 @@ void ModularLoRAGradsManager::allocate_gradients() {
     const int kv_out = mConfig.num_kv_heads * mConfig.head_size;
     const int r = mConfig.lora_config.rank;
     const int E = mConfig.num_experts;
+    auto contains_ci = [](std::string_view haystack, std::string_view needle) {
+        std::string h(haystack);
+        std::string n(needle);
+        std::transform(h.begin(), h.end(), h.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        std::transform(n.begin(), n.end(), n.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        return h.find(n) != std::string::npos;
+    };
+    const bool model_is_qwen3_5 =
+        mConfig.model_config &&
+        (contains_ci(mConfig.model_config->ModelTypeName, "qwen3_5") ||
+         contains_ci(mConfig.model_config->ModelTypeName, "qwen3.5") ||
+         contains_ci(mConfig.model_config->ArchitectureName, "qwen3_5") ||
+         contains_ci(mConfig.model_config->ArchitectureName, "qwen3.5"));
     const bool use_shared_expert = mConfig.model_config &&
                                    mConfig.model_config->moe_config.has_value() &&
                                    mConfig.model_config->moe_config->use_shared_expert;
@@ -77,10 +95,16 @@ void ModularLoRAGradsManager::allocate_gradients() {
         // Determine block type for this layer (hybrid-aware)
         BlockType bt = BlockType::Dense;
         bool is_hybrid = false;
+        bool is_qwen3_hybrid = false;
         if (mConfig.model_config) {
             bt = mConfig.model_config->get_block_type(l);
             is_hybrid = (mConfig.model_config->architecture == ArchitectureType::Hybrid);
+            const bool is_qwen3_family =
+                contains_ci(mConfig.model_config->ModelTypeName, "qwen3") ||
+                contains_ci(mConfig.model_config->ArchitectureName, "qwen3");
+            is_qwen3_hybrid = is_hybrid && is_qwen3_family;
         }
+        const int q_lora_out = model_is_qwen3_5 ? (2 * q_out) : q_out;
 
         // Attention LoRA grads: Dense always, Attention always, MoE/SwitchMoE only in non-hybrid.
         // Non-hybrid MoE layers contain both attention AND MoE; hybrid MoE layers have only MoE.
@@ -88,8 +112,8 @@ void ModularLoRAGradsManager::allocate_gradients() {
                                    ((bt == BlockType::MoE || bt == BlockType::SwitchMoE) && !is_hybrid));
         if (has_attention) {
             if (mConfig.lora_config.applies_to_q()) {
-                full.attention.q = alloc_full(C, q_out, prefix + "_q");
-                shard.attention.q = alloc_shard(C, q_out, prefix + "_q_shard");
+                full.attention.q = alloc_full(C, q_lora_out, prefix + "_q");
+                shard.attention.q = alloc_shard(C, q_lora_out, prefix + "_q_shard");
             }
             if (mConfig.lora_config.applies_to_k()) {
                 full.attention.k = alloc_full(C, kv_out, prefix + "_k");
@@ -107,11 +131,18 @@ void ModularLoRAGradsManager::allocate_gradients() {
 
         // MoE LoRA grads: enable for MoE block types or Dense blocks in global MoE models.
         // Hybrid MoE blocks are supported via grouped GEMM LoRA hooks.
+        const bool has_global_moe = (mConfig.num_experts > 0);
         const bool layer_is_moe =
             (bt == BlockType::MoE || bt == BlockType::SwitchMoE) ||
-            (bt == BlockType::Dense && mConfig.is_moe);
+            (bt == BlockType::Dense && has_global_moe);
+        // Qwen3.5 hybrid blocks (both linear-attention and full-attention)
+        // contain standard MLP projections that should support LoRA.
+        const bool layer_is_qwen3_linear_mlp = (bt == BlockType::Mamba) && is_qwen3_hybrid;
+        const bool layer_is_qwen3_attention_mlp = (bt == BlockType::Attention) && is_qwen3_hybrid;
         const bool layer_is_dense_mlp = (bt == BlockType::MLP) ||
-                                         (bt == BlockType::Dense && !mConfig.is_moe);
+                                         (bt == BlockType::Dense && !has_global_moe) ||
+                                         layer_is_qwen3_linear_mlp ||
+                                         layer_is_qwen3_attention_mlp;
 
         if (layer_is_moe && E > 0) {
             const bool has_mlp_lora = mConfig.lora_config.applies_to_gate() ||
@@ -176,7 +207,7 @@ void ModularLoRAGradsManager::allocate_gradients() {
                 shard.mlp.down = alloc_shard(D, C, prefix + "_down_shard");
             }
         }
-        // Mamba blocks: no LoRA grads allocated
+        // Non-Qwen3 Mamba/SSM blocks still do not have dedicated LoRA gradient coverage here.
     }
 }
 

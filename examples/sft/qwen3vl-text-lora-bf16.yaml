@@ -23,7 +23,6 @@ lora_target_modules:
   - up_proj
   - down_proj
 
-train_vision: false
 
 dataloader_num_workers: 4
 datasets:

@@ -46,9 +46,13 @@ class DslWeightManager;
 enum class CompiledOpType : std::uint8_t {
     Embedding,
     Zeros,
+    Ones,
     FusedResidualRMSNorm,
     LayerNorm,
     View,
+    Transpose,
+    Split,
+    Concat,
     Add,
     Matmul,
     MatmulBias,
@@ -231,6 +235,14 @@ struct CompiledAttrs {
     // Gated delta rule specific
     float delta_rule_scale = 0.0f;  // 0.0 means "derive from K at runtime"
     bool use_qk_l2norm_in_kernel = false;
+
+    // Tensor split/concat attributes
+    int split_concat_dim = 0;
+    std::vector<long> split_sizes;
+
+    // Tensor transpose attributes
+    int dim0 = 0;
+    int dim1 = 1;
 };
 
 // ============================================================================

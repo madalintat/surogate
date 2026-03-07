@@ -510,9 +510,14 @@ void DslRunState::allocate_simplified_activations(const PretrainedConfig& cfg) {
     const bool share_mlp_down = should_share_slot("mlp_down");
     const bool share_qk_rstd = use_qk_norm && should_share_slot("q_rstd");
 
-    // FFN temps: Use stack-backed temps only in LoRA mode with recompute enabled.
-    // This keeps FFT behavior unchanged while enabling QLoRA memory savings.
-    const bool ffn_temps_on_stack = recompute_enabled && lora_only;
+    // FFN temps: Use stack-backed temps only when backward recompute can actually
+    // reconstruct them. For models without DSL recompute metadata (e.g. partially
+    // onboarded blocks), forcing stack-backed FFN temps causes large persistent
+    // save-buffer copies and severe memory pressure.
+    const bool can_recompute_ffn_temps =
+        mSlotRegistry.will_recompute("mlp_up", lora_only) &&
+        mSlotRegistry.will_recompute("swiglu", lora_only);
+    const bool ffn_temps_on_stack = recompute_enabled && lora_only && can_recompute_ffn_temps;
     mFfnTempsOnStack = ffn_temps_on_stack;
     if (mStackSimulate && ffn_temps_on_stack) {
         const long mlp_up_bytes = B * T * MUp * get_dtype_size(dtype);
@@ -1099,6 +1104,9 @@ void DslRunState::create_cuda_resources() {
     CUDA_CHECK(cudaEventCreate(&mAllReduceDone));
     CUBLAS_CHECK(cublasCreate(&mCublasHandle));
     CUBLAS_CHECK(cublasSetMathMode(mCublasHandle, CUBLAS_TF32_TENSOR_OP_MATH));
+    // Must be initialized before any CUDA graph capture; otherwise first
+    // fallback GEMM can call cublasCreate inside capture and fail.
+    init_cublas_fallback_handle();
 }
 
 void DslRunState::release_cuda_resources() noexcept {

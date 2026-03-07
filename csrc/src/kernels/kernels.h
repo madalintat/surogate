@@ -2336,6 +2336,7 @@ void gated_delta_rule_chunk_forward_v2(
     int chunk_size,
     bool use_qk_l2norm_in_kernel,
     Tensor* fwd_checkpoints,
+    Tensor* fwd_workspace,
     cudaStream_t stream);
 
 void gated_delta_rule_chunk_backward_v2(
@@ -2410,5 +2411,24 @@ void repeat_interleave_heads_backward(Tensor& d_inp,
  * @param stream CUDA stream
  */
 void lora_dropout_scale(Tensor& intermediate, float dropout_prob, unsigned int seed, cudaStream_t stream);
+
+/**
+ * @brief Compute LoRA rank-projection for BF16 tensors using a custom small-rank kernel.
+ *
+ * Computes out = input @ A^T where:
+ * - input: [BT, in_features] BF16
+ * - A:     [rank, in_features] BF16
+ * - out:   [BT, rank] BF16
+ *
+ * Returns true when the custom kernel handled the given rank, false otherwise.
+ */
+bool lora_project_small_rank_bf16(
+    Tensor& out,
+    const Tensor& A,
+    const Tensor& input,
+    int BT,
+    int in_features,
+    int rank,
+    cudaStream_t stream);
 
 #endif //SUROGATE_SRC_KERNELS_KERNELS_H

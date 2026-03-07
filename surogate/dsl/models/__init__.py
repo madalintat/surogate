@@ -1,6 +1,7 @@
 """Model Definitions for Python DSL"""
 
 from .qwen3 import Qwen3Model
+from .qwen3_5 import Qwen3_5CausalModel, Qwen3_5ConditionalModel
 from .qwen3_vl import Qwen3VLModel
 from .qwen3_moe import Qwen3MoEModel
 from .gpt_oss import GptOssModel
@@ -9,6 +10,8 @@ from .nemotron_h import NemotronHModel, parse_hybrid_pattern, to_standard_hybrid
 
 __all__ = [
     "Qwen3Model",
+    "Qwen3_5CausalModel",
+    "Qwen3_5ConditionalModel",
     "Qwen3VLModel",
     "Qwen3MoEModel",
     "GptOssModel",

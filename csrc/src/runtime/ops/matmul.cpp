@@ -1,9 +1,12 @@
 #include "runtime/dsl/compiled_ops.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cstdio>
 #include <limits>
 #include <stdexcept>
+#include <string>
+#include <string_view>
 #include <vector>
 
 #include "runtime/dsl/compiled_ops_helpers.h"
@@ -11,10 +14,39 @@
 #include "kernels/kernels.h"
 #include "utilities/dtype.h"
 #include "runtime/dsl/graph_executor_helpers.h"
+#include "runtime/core/forward_hooks.h"
 #include "runtime/lora/lora_model_utils.h"
 #include "runtime/lora/lora_run_state.h"
 
 namespace dsl {
+
+namespace {
+
+bool contains_ci(std::string_view haystack, std::string_view needle) {
+    std::string h(haystack);
+    std::string n(needle);
+    std::transform(h.begin(), h.end(), h.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    std::transform(n.begin(), n.end(), n.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return h.find(n) != std::string::npos;
+}
+
+bool is_qwen3_5_model(const modules::ModelConfig& cfg) {
+    return contains_ci(cfg.ModelTypeName, "qwen3_5") ||
+           contains_ci(cfg.ModelTypeName, "qwen3.5") ||
+           contains_ci(cfg.ArchitectureName, "qwen3_5") ||
+           contains_ci(cfg.ArchitectureName, "qwen3.5");
+}
+
+Tensor flatten_bt(const Tensor& t, long B, long T) {
+    if (t.Rank > 2 && t.Sizes[0] == B && t.Sizes[1] == T) {
+        return view_tensor(t, {B * T, t.Sizes[t.Rank - 1]});
+    }
+    return t;
+}
+
+}  // namespace
 
 void CompiledExecutor::dispatch_matmul(const CompiledOp& op, const modules::ForwardHook* hook) {
     Tensor& a = resolve_tensor(op.inputs[0]);
@@ -101,57 +133,75 @@ void CompiledExecutor::dispatch_matmul(const CompiledOp& op, const modules::Forw
     bool used_recipe = false;
     modules::MatmulContext ctx{};
     modules::MatmulContext* ctx_ptr = nullptr;
-    if (mRecipe && op.attrs.transpose == EMMTranspose::NT && a.Sizes[0] == mB * mT) {
-        if (op.attrs.allow_quant && op.attrs.matmul_op.has_value()) {
-            ctx.out = &out;
-            ctx.inp = &a;
-            ctx.weight = &b;
-            ctx.bias = bias ? &*bias : nullptr;
-            ctx.B = static_cast<int>(mB);
-            ctx.T = static_cast<int>(mT);
-            ctx.C_in = K;
-            ctx.C_out = N;
-            ctx.run_state = &mRunState;
-            ctx.stream = mRunState.MainStream;
-            ctx.layer_idx = op.attrs.layer_idx;
-            ctx.op = *op.attrs.matmul_op;
-            ctx.allow_fp8 = mRecipe->uses_fp8_forward();
-            ctx.allow_fp4 = mRecipe->uses_fp4_forward();
+    try {
+        if (mRecipe && op.attrs.transpose == EMMTranspose::NT && a.Sizes[0] == mB * mT) {
+            if (op.attrs.allow_quant && op.attrs.matmul_op.has_value()) {
+                ctx.out = &out;
+                ctx.inp = &a;
+                ctx.weight = &b;
+                ctx.bias = bias ? &*bias : nullptr;
+                ctx.B = static_cast<int>(mB);
+                ctx.T = static_cast<int>(mT);
+                ctx.C_in = K;
+                ctx.C_out = N;
+                ctx.run_state = &mRunState;
+                ctx.stream = mRunState.MainStream;
+                ctx.layer_idx = op.attrs.layer_idx;
+                ctx.op = *op.attrs.matmul_op;
+                ctx.allow_fp8 = mRecipe->uses_fp8_forward();
+                ctx.allow_fp4 = mRecipe->uses_fp4_forward();
 
-            // Wire FP8/FP4 buffers + static weight caches (GraphExecutor primes caches before CUDA graph capture).
-            if (ctx.allow_fp8) {
-                ctx.inp_quant = fp8_forward_buffer(mRunState, *op.attrs.matmul_op);
-                ctx.delayed_quantizer_idx = fp8_quantizer_index(mRunState, *op.attrs.matmul_op, op.attrs.layer_idx);
-                if (b.DType == ETensorDType::FP8_E4M3) {
-                    ctx.cached_weight = &b;
-                } else if (mFP8Cache) {
-                    auto it = mFP8Cache->find(weight_name);
-                    if (it != mFP8Cache->end() && it->second.initialized && it->second.weight.Data) {
-                        ctx.cached_weight = &it->second.weight;
+                // Wire FP8/FP4 buffers + static weight caches (GraphExecutor primes caches before CUDA graph capture).
+                if (ctx.allow_fp8) {
+                    ctx.inp_quant = fp8_forward_buffer(mRunState, *op.attrs.matmul_op);
+                    ctx.delayed_quantizer_idx = fp8_quantizer_index(mRunState, *op.attrs.matmul_op, op.attrs.layer_idx);
+                    if (b.DType == ETensorDType::FP8_E4M3) {
+                        ctx.cached_weight = &b;
+                    } else if (mFP8Cache) {
+                        auto it = mFP8Cache->find(weight_name);
+                        if (it != mFP8Cache->end() && it->second.initialized && it->second.weight.Data) {
+                            ctx.cached_weight = &it->second.weight;
+                        }
                     }
                 }
-            }
-            if (ctx.allow_fp4 && mFP4Cache) {
-                auto it = mFP4Cache->find(weight_name);
-                if (it != mFP4Cache->end() && it->second.initialized &&
-                    it->second.data.Data && it->second.scales.Data && it->second.amax.Data) {
-                    ctx.cached_fp4_data = &it->second.data;
-                    ctx.cached_fp4_scales = &it->second.scales;
-                    ctx.cached_fp4_amax = it->second.amax.get<float>();
+                if (ctx.allow_fp4 && mFP4Cache) {
+                    auto it = mFP4Cache->find(weight_name);
+                    if (it != mFP4Cache->end() && it->second.initialized &&
+                        it->second.data.Data && it->second.scales.Data && it->second.amax.Data) {
+                        ctx.cached_fp4_data = &it->second.data;
+                        ctx.cached_fp4_scales = &it->second.scales;
+                        ctx.cached_fp4_amax = it->second.amax.get<float>();
+                    }
                 }
+
+                mRecipe->forward_matmul(ctx);
+                used_recipe = true;
+                ctx_ptr = &ctx;
             }
-
-            mRecipe->forward_matmul(ctx);
-            used_recipe = true;
-            ctx_ptr = &ctx;
         }
-    }
 
-    if (!used_recipe) {
-        EMMTranspose mode_col = swap_transpose(op.attrs.transpose);
-        matmul(out, b, a, bias, nullptr, nullptr,
-               mRunState.CublasLtHandle, mRunState.CuBlasWorkspace,
-               N, M, K, mode_col, false, mRunState.MainStream);
+        if (!used_recipe) {
+            EMMTranspose mode_col = swap_transpose(op.attrs.transpose);
+            matmul(out, b, a, bias, nullptr, nullptr,
+                   mRunState.CublasLtHandle, mRunState.CuBlasWorkspace,
+                   N, M, K, mode_col, false, mRunState.MainStream);
+        }
+    } catch (const std::exception& e) {
+        throw std::runtime_error(
+            "dispatch_matmul failed for op_id='" + op.op_id +
+            "' weight='" + weight_name +
+            "' transpose=" + std::to_string(static_cast<int>(op.attrs.transpose)) +
+            " used_recipe=" + std::string(used_recipe ? "1" : "0") +
+            " M=" + std::to_string(M) +
+            " N=" + std::to_string(N) +
+            " K=" + std::to_string(K) +
+            " a_rank=" + std::to_string(a.Rank) +
+            " b_rank=" + std::to_string(b.Rank) +
+            " out_rank=" + std::to_string(out.Rank) +
+            " a_dtype=" + std::to_string(static_cast<int>(a.DType)) +
+            " b_dtype=" + std::to_string(static_cast<int>(b.DType)) +
+            " out_dtype=" + std::to_string(static_cast<int>(out.DType)) +
+            ": " + e.what());
     }
 
     // Apply shared-expert LoRA contributions (Nemotron/DeepSeek) for shared expert matmuls.
@@ -202,6 +252,61 @@ void CompiledExecutor::dispatch_matmul(const CompiledOp& op, const modules::Forw
         }
     }
 
+    // Qwen3.5 full-attention LoRA (separate q/k/v/o projections).
+    // This path applies LoRA directly on the current matmul tensors and avoids
+    // the fused-QKV hook assumptions used by other architectures.
+    if (mLoRAConfig && mLoRAWeights && mLoRARunState && mLoRAConfig->enabled() && is_qwen3_5_model(mConfig)) {
+        int layer_idx = -1;
+        std::string field;
+        if (parse_block_param(weight_name, layer_idx, field) && layer_idx >= 0) {
+            const bool is_q = (field == "full_q_proj_weight");
+            const bool is_k = (field == "full_k_proj_weight");
+            const bool is_v = (field == "full_v_proj_weight");
+            const bool is_o = (field == "full_out_weight");
+            if (is_q || is_k || is_v || is_o) {
+                auto& lora_block = mLoRAWeights->get_block(layer_idx, mRunState.MainStream);
+                const std::optional<modules::LoRALayerWeights<Tensor>>* layer_lora = nullptr;
+                int proj_type = -1;
+                if (is_q) {
+                    layer_lora = &lora_block.attention.q;
+                    proj_type = 0;
+                } else if (is_k) {
+                    layer_lora = &lora_block.attention.k;
+                    proj_type = 1;
+                } else if (is_v) {
+                    layer_lora = &lora_block.attention.v;
+                    proj_type = 2;
+                } else {
+                    layer_lora = &lora_block.attention.o;
+                    proj_type = 3;
+                }
+
+                if (layer_lora && layer_lora->has_value() && layer_lora->value().has_value()) {
+                    Tensor a_flat = flatten_bt(a, mB, mT);
+                    Tensor out_flat = flatten_bt(out, mB, mT);
+                    const int BT = static_cast<int>(a_flat.Sizes[0]);
+                    const int in_features = static_cast<int>(a_flat.Sizes[1]);
+                    const int out_features = static_cast<int>(out_flat.Sizes[1]);
+                    const int rank = mLoRAConfig->rank;
+                    const float scaling = mLoRAConfig->scaling();
+                    const float dropout = mLoRAConfig->dropout;
+                    const bool training = mLoRARunState->is_training;
+                    const unsigned int dropout_seed = mLoRARunState->dropout_base_seed
+                        + static_cast<unsigned int>(layer_idx) * 1000000u
+                        + static_cast<unsigned int>(proj_type) * 100000u
+                        + static_cast<unsigned int>(mLoRARunState->micro_step) * 10000u;
+
+                    modules::detail::apply_lora_contribution(
+                        out_flat, 0, a_flat, layer_lora->value(),
+                        mLoRARunState->intermediate, mLoRARunState->slice,
+                        scaling, dropout, dropout_seed, training,
+                        BT, in_features, out_features, rank,
+                        mRunState.CublasLtHandle, mRunState.CuBlasWorkspace, mRunState.MainStream);
+                }
+            }
+        }
+    }
+
     if (mForwardPlan && op.attrs.matmul_op.has_value() && op.attrs.layer_idx >= 0 &&
         static_cast<std::size_t>(op.attrs.layer_idx) < mForwardPlan->size() &&
         *op.attrs.matmul_op != modules::MatmulOp::LMHead) {
@@ -237,6 +342,28 @@ void CompiledExecutor::dispatch_matmul(const CompiledOp& op, const modules::Forw
 
     // Hook invocation
     if (hook && *hook && op.attrs.forward_hook_point.has_value()) {
+        // In stack/recompute mode, some activation slots are represented as shape-only
+        // tensors with Data=nullptr. Bind them to the just-produced matmul output so
+        // forward hooks (LoRA) can safely write into the live buffer.
+        if (op.attrs.layer_idx >= 0 && op.attrs.layer_idx < mConfig.NumLayers) {
+            auto& acts = mRunState.simplified_acts(op.attrs.layer_idx);
+            switch (*op.attrs.forward_hook_point) {
+                case modules::ForwardHookPoint::AfterQKVProjection:
+                    if (!acts.qkv.Data) acts.qkv.Data = out.Data;
+                    break;
+                case modules::ForwardHookPoint::AfterAttnOutProjection:
+                    if (!acts.att_out.Data) acts.att_out.Data = out.Data;
+                    break;
+                case modules::ForwardHookPoint::AfterMLPUpProjection:
+                    if (!acts.mlp_up.Data) acts.mlp_up.Data = out.Data;
+                    break;
+                case modules::ForwardHookPoint::AfterMLPDownProjection:
+                    if (!acts.mlp_down.Data) acts.mlp_down.Data = out.Data;
+                    break;
+                default:
+                    break;
+            }
+        }
         (*hook)(op.attrs.layer_idx, mRunState.MainStream, *op.attrs.forward_hook_point, mHookContext);
     }
 }
@@ -283,6 +410,32 @@ void CompiledExecutor::dispatch_matmul_backward(const CompiledOp& op, const modu
     Tensor& d_out = resolve_tensor(op.inputs[0]);
     Tensor& a = resolve_tensor(op.inputs[1]);
     Tensor& b = resolve_tensor(op.inputs[2]);
+
+    if (std::getenv("SUROGATE_DEBUG_MATMUL_BWD")) {
+        auto print_shape = [](const Tensor& t) {
+            std::string s = "[";
+            for (int i = 0; i < t.Rank; ++i) {
+                if (i) s += ",";
+                s += std::to_string(t.Sizes[i]);
+            }
+            s += "]";
+            return s;
+        };
+        const bool d_out_stack = d_out.Data && mRunState.Stack.owns(d_out.Data);
+        const bool a_stack = a.Data && mRunState.Stack.owns(a.Data);
+        const bool b_stack = b.Data && mRunState.Stack.owns(b.Data);
+        std::fprintf(stderr,
+                     "[MATMUL-BWD] op=%s layer=%d mode=%d matmul_op=%d skip_wgrad=%d "
+                     "d_out=%s(dtype=%d,ptr=%p,stack=%d,slot=%d) "
+                     "a=%s(dtype=%d,ptr=%p,stack=%d,slot=%d) "
+                     "b=%s(dtype=%d,ptr=%p,stack=%d,slot=%d)\n",
+                     op.op_id.c_str(), layer_idx, static_cast<int>(mode),
+                     op.attrs.matmul_op.has_value() ? static_cast<int>(*op.attrs.matmul_op) : -1,
+                     (int)skip_weight_grad,
+                     print_shape(d_out).c_str(), static_cast<int>(d_out.DType), (void*)d_out.Data, (int)d_out_stack, (int)op.inputs[0].slot,
+                     print_shape(a).c_str(), static_cast<int>(a.DType), (void*)a.Data, (int)a_stack, (int)op.inputs[1].slot,
+                     print_shape(b).c_str(), static_cast<int>(b.DType), (void*)b.Data, (int)b_stack, (int)op.inputs[2].slot);
+    }
 
     const bool is_qkv_op = op.attrs.matmul_op.has_value() &&
         (*op.attrs.matmul_op == modules::MatmulOp::QKV);
@@ -575,6 +728,86 @@ void CompiledExecutor::dispatch_matmul_backward(const CompiledOp& op, const modu
         }
     }
 
+    // Qwen3.5 full-attention LoRA backward for separate q/k/v/o projections.
+    if (mLoRAConfig && mLoRAWeights && mLoRAGrads && mLoRARunState && mLoRAConfig->enabled() &&
+        mComm && is_qwen3_5_model(mConfig)) {
+        int layer = -1;
+        std::string field;
+        if (parse_block_param(weight_name, layer, field) && layer >= 0) {
+            const bool is_q = (field == "full_q_proj_weight");
+            const bool is_k = (field == "full_k_proj_weight");
+            const bool is_v = (field == "full_v_proj_weight");
+            const bool is_o = (field == "full_out_weight");
+            if (is_q || is_k || is_v || is_o) {
+                auto& lora_block = mLoRAWeights->get_block(layer, mRunState.MainStream);
+                bool lora_accum = false;
+                auto& lora_grads = mLoRAGrads->get_block_full(layer, mRunState.MainStream, *mComm, lora_accum);
+                lora_accum = lora_accum || do_accumulate;
+
+                const std::optional<modules::LoRALayerWeights<Tensor>>* lora_layer = nullptr;
+                std::optional<modules::LoRALayerWeights<Tensor>>* grad_layer = nullptr;
+                int proj_type = -1;
+                if (is_q) {
+                    lora_layer = &lora_block.attention.q;
+                    grad_layer = &lora_grads.attention.q;
+                    proj_type = 0;
+                } else if (is_k) {
+                    lora_layer = &lora_block.attention.k;
+                    grad_layer = &lora_grads.attention.k;
+                    proj_type = 1;
+                } else if (is_v) {
+                    lora_layer = &lora_block.attention.v;
+                    grad_layer = &lora_grads.attention.v;
+                    proj_type = 2;
+                } else {
+                    lora_layer = &lora_block.attention.o;
+                    grad_layer = &lora_grads.attention.o;
+                    proj_type = 3;
+                }
+
+                if (lora_layer && grad_layer &&
+                    lora_layer->has_value() && lora_layer->value().has_value() &&
+                    grad_layer->has_value() && grad_layer->value().has_value()) {
+                    Tensor a_flat = flatten_bt(a, mB, mT);
+                    Tensor d_out_flat = flatten_bt(d_out, mB, mT);
+
+                    Tensor dA_tmp{};
+                    Tensor* dA_use = dA_ptr;
+                    if (!dA_use) {
+                        dA_tmp = mRunState.temp_alloc(a_flat.DType, {a_flat.Sizes[0], a_flat.Sizes[1]});
+                        fill_zero(dA_tmp, mRunState.MainStream);
+                        mTemps.push_back(dA_tmp);
+                        dA_use = &dA_tmp;
+                    }
+
+                    const int BT = static_cast<int>(a_flat.Sizes[0]);
+                    const int in_features = static_cast<int>(a_flat.Sizes[1]);
+                    const int out_features = static_cast<int>(d_out_flat.Sizes[1]);
+                    const int rank = mLoRAConfig->rank;
+                    const float scaling = mLoRAConfig->scaling();
+                    const float dropout = mLoRAConfig->dropout;
+                    const bool training = mLoRARunState->is_training;
+                    const unsigned int dropout_seed = mLoRARunState->dropout_base_seed
+                        + static_cast<unsigned int>(layer) * 1000000u
+                        + static_cast<unsigned int>(proj_type) * 100000u
+                        + static_cast<unsigned int>(mLoRARunState->micro_step) * 10000u;
+
+                    modules::detail::backward_lora_layer(
+                        grad_layer->value().A, grad_layer->value().B,
+                        *dA_use,
+                        d_out_flat, 0,
+                        a_flat,
+                        lora_layer->value().A, lora_layer->value().B,
+                        scaling,
+                        dropout, dropout_seed, training,
+                        mLoRARunState->intermediate, mLoRARunState->slice,
+                        BT, in_features, out_features, rank, lora_accum,
+                        mRunState.CublasLtHandle, mRunState.CuBlasWorkspace, mRunState.MainStream);
+                }
+            }
+        }
+    }
+
 
     // Hook invocation for LoRA backward
     // Skip dense MLP hooks for MoE models - MoE has different backward path (grouped GEMM)
@@ -594,10 +827,12 @@ void CompiledExecutor::dispatch_matmul_backward(const CompiledOp& op, const modu
             std::byte* d_res_att{nullptr};
             std::byte* d_att_out{nullptr};
             std::byte* d_qkv{nullptr};
+            Tensor a_swiglu{};
         } prev{};
 
         if (op.attrs.matmul_op.has_value() && layer_idx >= 0) {
             auto& grads = mRunState.simplified_grads(layer_idx);
+            auto& acts = mRunState.simplified_acts(layer_idx);
             prev.d_swiglu = reinterpret_cast<std::byte*>(grads.d_swiglu.Data);
             prev.d_ln2 = reinterpret_cast<std::byte*>(grads.d_ln2.Data);
             prev.d_att = reinterpret_cast<std::byte*>(grads.d_att.Data);
@@ -607,6 +842,7 @@ void CompiledExecutor::dispatch_matmul_backward(const CompiledOp& op, const modu
             prev.d_res_att = reinterpret_cast<std::byte*>(grads.d_res_att.Data);
             prev.d_att_out = reinterpret_cast<std::byte*>(grads.d_att_out.Data);
             prev.d_qkv = reinterpret_cast<std::byte*>(grads.d_qkv.Data);
+            prev.a_swiglu = acts.swiglu;
 
             if (dA_ptr) {
                 switch (*op.attrs.matmul_op) {
@@ -625,6 +861,13 @@ void CompiledExecutor::dispatch_matmul_backward(const CompiledOp& op, const modu
                     default:
                         break;
                 }
+            }
+
+            // For MLPDown backward, the matmul input `a` is the exact SwiGLU
+            // activation needed by LoRA down-proj gradients. Use it directly so
+            // hooks do not depend on separately cached `acts.swiglu` metadata.
+            if (*op.attrs.matmul_op == modules::MatmulOp::MLPDown && a.Data) {
+                acts.swiglu = a;
             }
 
             switch (*op.attrs.matmul_op) {
@@ -652,10 +895,20 @@ void CompiledExecutor::dispatch_matmul_backward(const CompiledOp& op, const modu
                 // LoRA backward hook needs acts.swiglu (forward activation).
                 // With recompute enabled, swiglu may have been stack-allocated and freed.
                 if (!acts.swiglu.Data && acts.mlp_up.Data) {
-                    mRunState.temp_acquire(acts.swiglu);
                     const int Bv = static_cast<int>(mB);
                     const int Tv = static_cast<int>(mT);
                     const int D = static_cast<int>(mConfig.IntermediateSize);
+                    const bool has_valid_shape =
+                        acts.swiglu.Rank == 3 &&
+                        acts.swiglu.Sizes[0] == mB &&
+                        acts.swiglu.Sizes[1] == mT &&
+                        acts.swiglu.Sizes[2] == D;
+                    if (has_valid_shape) {
+                        mRunState.temp_acquire(acts.swiglu);
+                    } else {
+                        acts.swiglu = mRunState.temp_alloc(acts.mlp_up.DType, {mB, mT, static_cast<long>(D)});
+                        mTemps.push_back(acts.swiglu);
+                    }
                     switch (mConfig.activation_type) {
                         case modules::ActivationType::SwiGLU:
                         case modules::ActivationType::GeGLU:
@@ -688,6 +941,7 @@ void CompiledExecutor::dispatch_matmul_backward(const CompiledOp& op, const modu
             grads.d_res_att.Data = prev.d_res_att;
             grads.d_att_out.Data = prev.d_att_out;
             grads.d_qkv.Data = prev.d_qkv;
+            mRunState.simplified_acts(layer_idx).swiglu = prev.a_swiglu;
         }
     }
 }

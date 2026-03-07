@@ -3,6 +3,7 @@
 from .common import Activation
 from .dense import DenseTransformerBlock
 from .qwen3 import Qwen3Block
+from .qwen3_5 import Qwen3_5AttentionBlock, Qwen3_5LinearBlock
 from .qwen3_vl import Qwen3VLBlock
 from .qwen3_moe import Qwen3MoEBlock
 from .gpt_oss import GptOssBlock
@@ -18,6 +19,8 @@ __all__ = [
     "Activation",
     "DenseTransformerBlock",
     "Qwen3Block",
+    "Qwen3_5AttentionBlock",
+    "Qwen3_5LinearBlock",
     "Qwen3VLBlock",
     "Qwen3MoEBlock",
     "GptOssBlock",

@@ -182,8 +182,11 @@ __device__ void fused_residual_rmsnorm_forward_kernel(floatX* residual, floatX* 
         const x128 in2 = x128::load_cs(inp2 + c);
         x128 out;
         for(int k = 0; k < x128::size; ++k) {
-            out[k] = static_cast<floatX>((float)in1[k] + (float)in2[k]);
-            sum_squared += (float)out[k] * (float)out[k];
+            // Match HF RMSNorm numerics: compute statistics from fp32 residual sums
+            // before bf16/fp16 rounding for residual_out storage.
+            float res_f = (float)in1[k] + (float)in2[k];
+            out[k] = static_cast<floatX>(res_f);
+            sum_squared += res_f * res_f;
         }
         out.store(residual + c);   // TODO cs
     }

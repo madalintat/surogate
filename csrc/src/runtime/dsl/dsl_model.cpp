@@ -132,6 +132,7 @@ struct DslConfigView {
     std::optional<bool> use_qk_norm;
     std::optional<long> sliding_window;
     std::optional<std::vector<int>> layer_types;
+    std::optional<std::vector<std::string>> layer_type_names;
     std::optional<long> num_experts;
     std::optional<long> num_experts_per_tok;
     std::optional<long> moe_intermediate_size;
@@ -206,6 +207,24 @@ std::optional<std::vector<int>> get_layer_types_attr(const AttrMap& map, const c
     return std::nullopt;
 }
 
+std::optional<std::vector<std::string>> get_string_list_attr(const AttrMap& map, const char* key) {
+    if (const auto* value = internal::find_key(&map, key)) {
+        if (const auto* list = internal::as_list(*value)) {
+            std::vector<std::string> out;
+            out.reserve(list->size());
+            for (const auto& item : *list) {
+                if (auto s = internal::as_string(item)) {
+                    out.emplace_back(*s);
+                } else if (auto v = internal::as_int(item)) {
+                    out.emplace_back(std::to_string(*v));
+                }
+            }
+            return out;
+        }
+    }
+    return std::nullopt;
+}
+
 std::optional<modules::ActivationType> parse_activation_type(std::string_view name) {
     std::string clean;
     clean.reserve(name.size());
@@ -240,6 +259,7 @@ DslConfigView parse_dsl_config(const Module& module) {
     view.use_qk_norm = get_bool_attr(cfg, "use_qk_norm");
     view.sliding_window = get_long_attr(cfg, "sliding_window");
     view.layer_types = get_layer_types_attr(cfg, "layer_types");
+    view.layer_type_names = get_string_list_attr(cfg, "layer_types");
     view.num_experts = get_long_attr(cfg, "num_experts");
     view.num_experts_per_tok = get_long_attr(cfg, "num_experts_per_tok");
     view.moe_intermediate_size = get_long_attr(cfg, "moe_intermediate_size");
@@ -347,6 +367,46 @@ std::vector<modules::LayerOverride> parse_hybrid_pattern_to_overrides(const std:
     return overrides;
 }
 
+std::optional<std::vector<modules::LayerOverride>> parse_layer_types_to_overrides(
+    const std::vector<std::string>& layer_types) {
+    std::vector<modules::LayerOverride> overrides;
+    overrides.reserve(layer_types.size());
+
+    for (int i = 0; i < static_cast<int>(layer_types.size()); ++i) {
+        const std::string lower = internal::to_lower(layer_types[static_cast<std::size_t>(i)]);
+
+        // Qwen3.5 dense convention:
+        // - "linear_attention" is the gated-delta (Mamba-typed) token mixer + MLP.
+        // - "full_attention" is a standard dense transformer block (attn + MLP).
+        if (lower == "linear_attention") {
+            overrides.push_back(modules::LayerOverride::mamba(i));
+            continue;
+        }
+        if (lower == "full_attention") {
+            overrides.push_back(modules::LayerOverride::dense(i));
+            continue;
+        }
+
+        // Generic hybrid pattern spellings.
+        if (lower == "dense") {
+            overrides.push_back(modules::LayerOverride::dense(i));
+        } else if (lower == "attention" || lower == "attn") {
+            overrides.push_back(modules::LayerOverride::attention(i));
+        } else if (lower == "mlp") {
+            overrides.push_back(modules::LayerOverride::mlp(i));
+        } else if (lower == "mamba") {
+            overrides.push_back(modules::LayerOverride::mamba(i));
+        } else if (lower == "moe") {
+            overrides.push_back(modules::LayerOverride::moe(i));
+        } else if (lower == "switch_moe" || lower == "switchmoe") {
+            overrides.push_back(modules::LayerOverride::switch_moe(i));
+        } else {
+            return std::nullopt;
+        }
+    }
+    return overrides;
+}
+
 modules::ModelConfig build_model_config(const Module& module,
                                         const PretrainedConfig& base,
                                         const DslRuntimeConfig& runtime) {
@@ -356,6 +416,8 @@ modules::ModelConfig build_model_config(const Module& module,
 
     // Copy base fields
     cfg.Architecture = base.Architecture;
+    cfg.ArchitectureName = base.ArchitectureName;
+    cfg.ModelTypeName = base.ModelTypeName;
     cfg.BosTokenId = base.BosTokenId;
     cfg.EosTokenId = base.EosTokenId;
     cfg.PadTokenId = base.PadTokenId;
@@ -438,7 +500,8 @@ modules::ModelConfig build_model_config(const Module& module,
         cfg.architecture = modules::ArchitectureType::Dense;
     }
 
-    // Hybrid pattern: build per-layer overrides and refine architecture type
+    // Hybrid pattern: build per-layer overrides and refine architecture type.
+    // Prefer explicit `hybrid_pattern`; fallback to string `layer_types` (e.g. Qwen3.5).
     if (view.hybrid_pattern.has_value() && !view.hybrid_pattern->empty()) {
         auto overrides = parse_hybrid_pattern_to_overrides(*view.hybrid_pattern);
         if (static_cast<int>(overrides.size()) != cfg.NumLayers) {
@@ -468,9 +531,34 @@ modules::ModelConfig build_model_config(const Module& module,
         if (has_multiple_types) {
             cfg.architecture = modules::ArchitectureType::Hybrid;
         }
+    } else if (view.layer_type_names.has_value() && !view.layer_type_names->empty()) {
+        auto overrides_opt = parse_layer_types_to_overrides(*view.layer_type_names);
+        if (overrides_opt.has_value()) {
+            auto overrides = std::move(*overrides_opt);
+            if (static_cast<int>(overrides.size()) == cfg.NumLayers) {
+                cfg.layer_overrides = std::move(overrides);
+
+                bool has_multiple_types = false;
+                const auto first = cfg.layer_overrides[0].block_type;
+                for (const auto& ov : cfg.layer_overrides) {
+                    if (ov.block_type != first) {
+                        has_multiple_types = true;
+                        break;
+                    }
+                }
+                if (has_multiple_types) {
+                    cfg.architecture = modules::ArchitectureType::Hybrid;
+                }
+            }
+        }
     }
 
-    if (view.mlp_activation.has_value()) {
+    // Infer MLP activation from graph semantics first.
+    // Some architectures (e.g. Qwen3.5 linear blocks) use `activation="silu"`
+    // for non-MLP ops (mamba_conv1d) while the MLP is still SwiGLU.
+    if (graph_has_kernel(module, "swiglu") || graph_has_kernel(module, "matmul_swiglu")) {
+        cfg.activation_type = modules::ActivationType::SwiGLU;
+    } else if (view.mlp_activation.has_value()) {
         if (auto act = parse_activation_type(*view.mlp_activation)) {
             cfg.activation_type = *act;
         }

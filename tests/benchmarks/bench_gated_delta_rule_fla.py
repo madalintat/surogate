@@ -190,11 +190,11 @@ def main() -> None:
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
 
-    warmup_iters = 5
-    bench_iters = 20
+    warmup_iters = 1
+    bench_iters = 3
     configs = [
-        (1, 256, 8, 64, 64),
-        (1, 512, 8, 64, 64),
+        (1, 512, 8, 128, 128),
+        (2, 2048, 16, 128, 128),
     ]
 
     report: dict[str, object] = {

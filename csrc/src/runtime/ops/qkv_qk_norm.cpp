@@ -172,7 +172,14 @@ void CompiledExecutor::dispatch_qkv_qk_norm_backward(const CompiledOp& op) {
     Tensor& q_rstd = resolve_tensor(op.inputs[4]);
     Tensor& k_rstd = resolve_tensor(op.inputs[5]);
 
-    Tensor& d_qkv = ensure_output_tensor(op.outputs[0]);
+    Tensor* d_qkv_ptr = &ensure_output_tensor(op.outputs[0]);
+    if (d_qkv_ptr->Rank == 0 || d_qkv_ptr->nelem() != d_out.nelem() || d_qkv_ptr->DType != d_out.DType) {
+        std::vector<long> shape(d_out.Sizes.begin(), d_out.Sizes.begin() + d_out.Rank);
+        Tensor tmp = mRunState.temp_alloc(d_out.DType, shape);
+        mTemps.push_back(tmp);
+        d_qkv_ptr = &mTemps.back();
+    }
+    Tensor& d_qkv = *d_qkv_ptr;
 
     int Hq = static_cast<int>(mConfig.NumQueryHeads);
     int Hkv = static_cast<int>(mConfig.NumKeyValHeads);
@@ -298,6 +305,16 @@ void CompiledExecutor::dispatch_qkv_qk_norm_backward(const CompiledOp& op) {
     qkv_head_rmsnorm_backward_dx(d_qkv_view, qkv_view, k_norm, k_rstd_view,
                                  static_cast<int>(mB), static_cast<int>(mT), qkv_channels,
                                  Hkv, Hs, q_rows, mRunState.MainStream);
+
+    if (!op.outputs.empty() && !op.outputs[0].name.empty()) {
+        store_tensor(op.outputs[0], d_qkv);
+    }
+    if (d_q_norm && op.outputs.size() > 1 && !op.outputs[1].name.empty()) {
+        store_tensor(op.outputs[1], *d_q_norm);
+    }
+    if (d_k_norm && op.outputs.size() > 2 && !op.outputs[2].name.empty()) {
+        store_tensor(op.outputs[2], *d_k_norm);
+    }
 }
 
 }  // namespace dsl

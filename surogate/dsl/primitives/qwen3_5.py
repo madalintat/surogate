@@ -11,7 +11,6 @@ def qwen3_5_decay(
     a: Tensor["B", "T", "H"],
     a_log: Tensor["H"],
     dt_bias: Tensor["H"],
-) -> Tensor["B", "T", "H"]:
+) -> Tensor["B", "T", "H", "fp32"]:
     """Compute Qwen3.5 decay term: -exp(A_log) * softplus(a + dt_bias)."""
     ...
-

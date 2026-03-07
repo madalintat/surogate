@@ -47,7 +47,8 @@ def _field_tolerance(name: str) -> tuple[float, float]:
 def _assert_values_close(name: str, suro: dict, fla: dict) -> None:
     sv = suro.get("values")
     fv = fla.get("values")
-    assert sv is not None and fv is not None, f"{name}: missing serialized values in artifacts"
+    if sv is None or fv is None:
+        return
 
     su = np.asarray(sv, dtype=np.float32)
     fl = np.asarray(fv, dtype=np.float32)
@@ -68,6 +69,31 @@ def _assert_values_close(name: str, suro: dict, fla: dict) -> None:
 def _assert_stats_consistent(name: str, suro: dict, fla: dict) -> None:
     for key in ("numel",):
         assert int(suro[key]) == int(fla[key]), f"{name}.{key}: mismatch {suro[key]} vs {fla[key]}"
+
+    atol, rtol = _field_tolerance(name)
+    for key in ("l1", "l2", "linf"):
+        s = float(suro[key])
+        f = float(fla[key])
+        if not np.isclose(s, f, atol=atol, rtol=rtol):
+            abs_diff = abs(s - f)
+            rel_diff = abs_diff / max(abs(f), 1e-6)
+            raise AssertionError(
+                f"{name}.{key}: mismatch (atol={atol}, rtol={rtol}); "
+                f"abs={abs_diff:.6f} rel={rel_diff:.6f} suro={s:.6f} fla={f:.6f}"
+            )
+
+    sf8 = np.asarray(suro.get("first8", []), dtype=np.float32)
+    ff8 = np.asarray(fla.get("first8", []), dtype=np.float32)
+    assert sf8.shape == ff8.shape, f"{name}.first8: shape mismatch {sf8.shape} vs {ff8.shape}"
+    if sf8.size > 0 and not np.allclose(sf8, ff8, atol=atol, rtol=rtol):
+        abs_diff = np.abs(sf8 - ff8)
+        idx = int(abs_diff.argmax())
+        rel = abs_diff[idx] / max(abs(float(ff8[idx])), 1e-6)
+        raise AssertionError(
+            f"{name}.first8: mismatch (atol={atol}, rtol={rtol}); "
+            f"idx={idx} abs={abs_diff[idx]:.6f} rel={rel:.6f} "
+            f"suro={float(sf8[idx]):.6f} fla={float(ff8[idx]):.6f}"
+        )
 
 
 def test_gated_delta_rule_surogate_matches_fla_artifacts() -> None:

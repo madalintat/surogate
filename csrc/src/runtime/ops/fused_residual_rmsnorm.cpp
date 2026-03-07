@@ -105,7 +105,50 @@ void CompiledExecutor::dispatch_fused_residual_rmsnorm_backward(const CompiledOp
          op.inputs[3].name.find("ln_f") != std::string::npos);
 
     Tensor* residual_out_ptr = &resolve_tensor(op.inputs[2]);
-    Tensor& weight = resolve_tensor(op.inputs[3]);
+    Tensor weight_eff_fallback{};
+    Tensor weight_eff_ones{};
+    Tensor* weight_ptr = nullptr;
+    try {
+        weight_ptr = &resolve_tensor(op.inputs[3]);
+    } catch (const std::exception&) {
+        const std::string& eff_name = op.inputs[3].name;
+        const bool has_eff_suffix =
+            eff_name.size() > 4 &&
+            eff_name.compare(eff_name.size() - 4, 4, "_eff") == 0;
+        if (!has_eff_suffix) {
+            throw;
+        }
+
+        const std::string base_name = eff_name.substr(0, eff_name.size() - 4);
+        Tensor* base_ptr = nullptr;
+        if (mWeights.has(base_name)) {
+            base_ptr = &mWeights.get(base_name);
+        } else {
+            TensorRef base_ref = op.inputs[3];
+            base_ref.name = base_name;
+            base_ref.tensor_id = mCurrentGraph ? mCurrentGraph->find_tensor_id(base_name) : -1;
+            try {
+                base_ptr = &resolve_tensor(base_ref);
+            } catch (const std::exception&) {
+                base_ptr = nullptr;
+            }
+        }
+        if (!base_ptr || !base_ptr->Data) {
+            throw;
+        }
+
+        std::vector<long> shape(base_ptr->Sizes.begin(), base_ptr->Sizes.begin() + base_ptr->Rank);
+        weight_eff_fallback = mRunState.temp_alloc(base_ptr->DType, shape);
+        weight_eff_ones = mRunState.temp_alloc(base_ptr->DType, shape);
+        mTemps.push_back(weight_eff_fallback);
+        mTemps.push_back(weight_eff_ones);
+        fill_constant(weight_eff_ones, 1.0f, static_cast<std::size_t>(weight_eff_ones.nelem()),
+                      mRunState.MainStream);
+        vector_add_sr(weight_eff_fallback, *base_ptr, weight_eff_ones, 1.0f,
+                      static_cast<long>(base_ptr->nelem()), 0, mRunState.MainStream);
+        weight_ptr = &weight_eff_fallback;
+    }
+    Tensor& weight = *weight_ptr;
     Tensor* rstd_ptr = &resolve_tensor(op.inputs[4]);
 
     int ln_layer_idx = -1;

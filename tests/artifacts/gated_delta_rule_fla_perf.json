@@ -3,33 +3,33 @@
     {
       "B": 1,
       "H": 8,
-      "K": 64,
-      "T": 256,
-      "V": 64,
-      "backward_ms": 0.4119247913360596,
+      "K": 128,
+      "T": 512,
+      "V": 128,
+      "backward_ms": 0.5565973520278931,
       "chunk_size": 64,
       "dtype": "torch.bfloat16",
-      "forward_ms": 0.30016798973083497,
-      "total_ms": 0.7158959865570068,
+      "forward_ms": 0.3884799877802531,
+      "total_ms": 0.8140373229980469,
       "use_qk_l2norm_in_kernel": true
     },
     {
-      "B": 1,
-      "H": 8,
-      "K": 64,
-      "T": 512,
-      "V": 64,
-      "backward_ms": 0.4119887828826904,
+      "B": 2,
+      "H": 16,
+      "K": 128,
+      "T": 2048,
+      "V": 128,
+      "backward_ms": 0.5789653460184733,
       "chunk_size": 64,
       "dtype": "torch.bfloat16",
-      "forward_ms": 0.29092159271240237,
-      "total_ms": 0.7362800121307373,
+      "forward_ms": 0.3809066613515218,
+      "total_ms": 0.9426453113555908,
       "use_qk_l2norm_in_kernel": true
     }
   ],
   "meta": {
-    "bench_iters": 20,
+    "bench_iters": 3,
     "device": "NVIDIA GeForce RTX 5090",
-    "warmup_iters": 5
+    "warmup_iters": 1
   }
 }
