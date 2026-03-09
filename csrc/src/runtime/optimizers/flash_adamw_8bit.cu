@@ -114,7 +114,6 @@ __global__ void kFlashAdamW8bitKernel(
 
     // Per-thread storage
     float g_vals[FLASH_N_PER_THREAD];
-    float p_vals[FLASH_N_PER_THREAD];
     float m_vals[FLASH_N_PER_THREAD];
     float v_vals[FLASH_N_PER_THREAD];
 
@@ -390,7 +389,6 @@ __global__ void kFlashAdamW8bitMultiTensorKernel(
     const float correction2 = 1.0f - __powf(beta2_val, step_val);
 
     float g_vals[FLASH_N_PER_THREAD];
-    float p_vals[FLASH_N_PER_THREAD];
     float m_vals[FLASH_N_PER_THREAD];
     float v_vals[FLASH_N_PER_THREAD];
 
