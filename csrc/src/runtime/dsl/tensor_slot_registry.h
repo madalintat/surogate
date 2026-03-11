@@ -39,14 +39,8 @@ public:
         std::optional<ETensorDType> dtype;   ///< Override dtype
         bool save_for_backward = false;
         bool recompute_in_backward = false;  ///< Can be recomputed instead of saved
-        std::vector<std::string> recompute_from;
-        std::string recompute_op;
-        AttrMap recompute_attrs;
-        std::string recompute_policy;
-        std::string recompute_group;
-        std::vector<std::string> recompute_outputs;
-        std::vector<std::string> lora_targets;
-        SharePolicy share_policy = SharePolicy::WhenRecomputed;  ///< Cross-layer sharing policy
+        std::string recompute_policy;        // Derived from share_policy in init_from_layout
+        SharePolicy share_policy = SharePolicy::PerLayer;  ///< Cross-layer sharing policy
         ActivationMemoryHint memory_hint = ActivationMemoryHint::Persistent;
         std::string shares_with;             ///< Slot to share memory with (if hint == Shared)
         std::string gradient_of;             ///< For gradient slots

@@ -82,122 +82,28 @@ class Qwen3_5AttentionBlock:
     # =========================================================================
 
     # Pre-attention normalization
-    ln1 = Activation(
-        Tensor["B", "T", "C"],
-        aliases=["ln1_flat"],
-        recompute=True,
-        recompute_from=["res_ffn", "ln1_rstd", "@param:ln1_weight"],
-        recompute_op="rmsnorm_apply_saved",
-        recompute_policy="always",
-        share_policy="when_recomputed",
-    )
-    ln1_rstd = Activation(
-        Tensor["B", "T"], dtype="fp32", save=True,
-        share_policy="per_layer",
-    )
+    ln1 = Activation(Tensor["B", "T", "C"], aliases=["ln1_flat"], share_policy="when_recomputed")
+    ln1_rstd = Activation(Tensor["B", "T"], dtype="fp32", save=True, share_policy="per_layer")
 
     # Attention output (flash_attention)
-    att = Activation(
-        Tensor["B", "T", "AttnDim"],
-        aliases=["att_flat"],
-        save=True,
-        recompute=True,
-        recompute_group="attn_fwd",
-        recompute_outputs=["att", "lse"],
-        recompute_from=["qkv_rope"],
-        recompute_op="flash_attention",
-        recompute_attrs={"attn_impl": "cudnn"},
-        recompute_policy="fft_only",
-        share_policy="always_recompute",
-    )
-    lse = Activation(
-        Tensor["B", "Hq", "T"],
-        dtype="fp32",
-        save=True,
-        recompute=True,
-        recompute_group="attn_fwd",
-        recompute_policy="fft_only",
-        share_policy="always_recompute",
-    )
-    att_out = Activation(
-        Tensor["B", "T", "C"],
-        aliases=["att_out_flat"],
-        recompute=True,
-        recompute_from=["att", "@param:full_out_weight"],
-        recompute_op="matmul",
-        recompute_attrs={"matmul_op": "attn_out", "transpose": "NT"},
-        recompute_policy="always",
-        lora_targets=["o"],
-        share_policy="when_recomputed",
-    )
+    att = Activation(Tensor["B", "T", "AttnDim"], aliases=["att_flat"], save=True, share_policy="always_recompute")
+    lse = Activation(Tensor["B", "Hq", "T"], dtype="fp32", save=True, share_policy="always_recompute")
+    att_out = Activation(Tensor["B", "T", "C"], aliases=["att_out_flat"], share_policy="when_recomputed")
 
     # First residual
-    res_att = Activation(
-        Tensor["B", "T", "C"],
-        aliases=["residual_att"],
-        recompute=True,
-        recompute_group="ln2_fused",
-        recompute_outputs=["res_att", "ln2"],
-        recompute_from=["res_ffn", "att_out", "ln2_rstd", "@param:ln2_weight"],
-        recompute_op="fused_residual_rmsnorm_apply_saved",
-        recompute_policy="always",
-        share_policy="when_recomputed",
-    )
+    res_att = Activation(Tensor["B", "T", "C"], aliases=["residual_att"], share_policy="when_recomputed")
 
     # Pre-MLP normalization
-    ln2 = Activation(
-        Tensor["B", "T", "C"],
-        aliases=["ln2_flat"],
-        recompute=True,
-        recompute_group="ln2_fused",
-        recompute_policy="always",
-        share_policy="when_recomputed",
-    )
-    ln2_rstd = Activation(
-        Tensor["B", "T"], dtype="fp32", save=True,
-        share_policy="per_layer",
-    )
+    ln2 = Activation(Tensor["B", "T", "C"], aliases=["ln2_flat"], share_policy="when_recomputed")
+    ln2_rstd = Activation(Tensor["B", "T"], dtype="fp32", save=True, share_policy="per_layer")
 
     # MLP
-    mlp_up = Activation(
-        Tensor["B", "T", "MUp"],
-        aliases=["mlp_up_flat"],
-        recompute=True,
-        recompute_from=["ln2", "@param:mlp_up_weight"],
-        recompute_op="matmul",
-        recompute_attrs={"matmul_op": "mlp_up", "transpose": "NT"},
-        recompute_policy="always",
-        lora_targets=["up", "gate"],
-        share_policy="when_recomputed",
-    )
-    swiglu = Activation(
-        Tensor["B", "T", "M"],
-        aliases=["swiglu_flat"],
-        recompute=True,
-        recompute_from=["mlp_up"],
-        recompute_op="swiglu",
-        recompute_attrs={"activation": "swiglu"},
-        recompute_policy="always",
-        share_policy="when_recomputed",
-    )
-    mlp_down = Activation(
-        Tensor["B", "T", "C"],
-        aliases=["mlp_down_flat"],
-        recompute=True,
-        recompute_from=["swiglu", "@param:mlp_down_weight"],
-        recompute_op="matmul",
-        recompute_attrs={"matmul_op": "mlp_down", "transpose": "NT"},
-        recompute_policy="always",
-        lora_targets=["down"],
-        share_policy="when_recomputed",
-    )
+    mlp_up = Activation(Tensor["B", "T", "MUp"], aliases=["mlp_up_flat"], share_policy="when_recomputed")
+    swiglu = Activation(Tensor["B", "T", "M"], aliases=["swiglu_flat"], share_policy="when_recomputed")
+    mlp_down = Activation(Tensor["B", "T", "C"], aliases=["mlp_down_flat"], share_policy="when_recomputed")
 
     # Second residual (block output)
-    res_ffn = Activation(
-        Tensor["B", "T", "C"],
-        aliases=["residual_ffn"],
-        share_policy="per_layer",
-    )
+    res_ffn = Activation(Tensor["B", "T", "C"], aliases=["residual_ffn"], share_policy="per_layer")
 
     # =========================================================================
     # Gradient slots
@@ -397,87 +303,23 @@ class Qwen3_5LinearBlock:
     # Activation slots (shared MLP part — same names as AttentionBlock)
     # =========================================================================
 
-    ln1 = Activation(
-        Tensor["B", "T", "C"],
-        aliases=["ln1_flat"],
-        recompute=True,
-        recompute_from=["res_ffn", "ln1_rstd", "@param:ln1_weight"],
-        recompute_op="rmsnorm_apply_saved",
-        recompute_policy="always",
-        share_policy="when_recomputed",
-    )
-    ln1_rstd = Activation(
-        Tensor["B", "T"], dtype="fp32", save=True,
-        share_policy="per_layer",
-    )
+    ln1 = Activation(Tensor["B", "T", "C"], aliases=["ln1_flat"], share_policy="when_recomputed")
+    ln1_rstd = Activation(Tensor["B", "T"], dtype="fp32", save=True, share_policy="per_layer")
 
     # First residual
-    res_att = Activation(
-        Tensor["B", "T", "C"],
-        aliases=["residual_att"],
-        recompute=True,
-        recompute_group="ln2_fused",
-        recompute_outputs=["res_att", "ln2"],
-        recompute_from=["res_ffn", "lin_att_out", "ln2_rstd", "@param:ln2_weight"],
-        recompute_op="fused_residual_rmsnorm_apply_saved",
-        recompute_policy="always",
-        share_policy="when_recomputed",
-    )
+    res_att = Activation(Tensor["B", "T", "C"], aliases=["residual_att"], share_policy="when_recomputed")
 
     # Pre-MLP normalization
-    ln2 = Activation(
-        Tensor["B", "T", "C"],
-        aliases=["ln2_flat"],
-        recompute=True,
-        recompute_group="ln2_fused",
-        recompute_policy="always",
-        share_policy="when_recomputed",
-    )
-    ln2_rstd = Activation(
-        Tensor["B", "T"], dtype="fp32", save=True,
-        share_policy="per_layer",
-    )
+    ln2 = Activation(Tensor["B", "T", "C"], aliases=["ln2_flat"], share_policy="when_recomputed")
+    ln2_rstd = Activation(Tensor["B", "T"], dtype="fp32", save=True, share_policy="per_layer")
 
     # MLP
-    mlp_up = Activation(
-        Tensor["B", "T", "MUp"],
-        aliases=["mlp_up_flat"],
-        recompute=True,
-        recompute_from=["ln2", "@param:mlp_up_weight"],
-        recompute_op="matmul",
-        recompute_attrs={"matmul_op": "mlp_up", "transpose": "NT"},
-        recompute_policy="always",
-        lora_targets=["up", "gate"],
-        share_policy="when_recomputed",
-    )
-    swiglu = Activation(
-        Tensor["B", "T", "M"],
-        aliases=["swiglu_flat"],
-        recompute=True,
-        recompute_from=["mlp_up"],
-        recompute_op="swiglu",
-        recompute_attrs={"activation": "swiglu"},
-        recompute_policy="always",
-        share_policy="when_recomputed",
-    )
-    mlp_down = Activation(
-        Tensor["B", "T", "C"],
-        aliases=["mlp_down_flat"],
-        recompute=True,
-        recompute_from=["swiglu", "@param:mlp_down_weight"],
-        recompute_op="matmul",
-        recompute_attrs={"matmul_op": "mlp_down", "transpose": "NT"},
-        recompute_policy="always",
-        lora_targets=["down"],
-        share_policy="when_recomputed",
-    )
+    mlp_up = Activation(Tensor["B", "T", "MUp"], aliases=["mlp_up_flat"], share_policy="when_recomputed")
+    swiglu = Activation(Tensor["B", "T", "M"], aliases=["swiglu_flat"], share_policy="when_recomputed")
+    mlp_down = Activation(Tensor["B", "T", "C"], aliases=["mlp_down_flat"], share_policy="when_recomputed")
 
     # Second residual (block output)
-    res_ffn = Activation(
-        Tensor["B", "T", "C"],
-        aliases=["residual_ffn"],
-        share_policy="per_layer",
-    )
+    res_ffn = Activation(Tensor["B", "T", "C"], aliases=["residual_ffn"], share_policy="per_layer")
 
     # =========================================================================
     # Gradient slots

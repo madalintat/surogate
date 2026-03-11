@@ -314,8 +314,10 @@ void CompiledExecutor::dispatch_flash_attention_backward(const CompiledOp& op) {
     }
 
     if (op.outputs.size() > 1 && !op.outputs[1].name.empty()) {
-        if (!sinks) {
-            throw std::runtime_error("flash_attention_backward: d_sinks requested but sinks input missing");
+        if (!sinks || !sinks->Data) {
+            // Sinks parameter not available (e.g., offloaded in QLoRA mode or not a LoRA target).
+            // Skip sinks gradient computation — it's unused when sinks isn't being trained.
+            goto skip_sinks;
         }
         Tensor& d_sinks_out = ensure_output_tensor(op.outputs[1]);
 
@@ -387,6 +389,7 @@ void CompiledExecutor::dispatch_flash_attention_backward(const CompiledOp& op) {
             throw std::logic_error("flash_attention_backward: unsupported d_sinks dtype");
         }
     }
+    skip_sinks:
 
     if (!op.outputs.empty() && !op.outputs[0].name.empty()) {
         store_tensor(op.outputs[0], d_qkv);

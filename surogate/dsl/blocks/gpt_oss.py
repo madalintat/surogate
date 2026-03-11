@@ -7,7 +7,6 @@ from ..decorators import block, forward, Param, Activation, Gradient
 from ..graph_builder import graph
 from ..dim import Dim, B, T
 
-
 @block
 class GptOssBlock:
     """GPT-OSS transformer block with sinks and MoE experts.
@@ -92,10 +91,6 @@ class GptOssBlock:
     ln1 = Activation(
         Tensor["B", "T", "C"],
         aliases=["ln1_flat"],
-        recompute=True,
-        recompute_from=["res_ffn", "ln1_rstd", "@param:ln1_weight"],
-        recompute_op="rmsnorm_apply_saved",
-        recompute_policy="fft_only",
         share_policy="fft_share",
     )
     ln1_rstd = Activation(
@@ -109,22 +104,11 @@ class GptOssBlock:
         Tensor["B", "T", "QKV"],
         aliases=["qkv_flat", "qkv_biased"],
         save=True,
-        recompute=True,
-        recompute_from=["ln1", "@param:qkv_weight", "?@param:qkv_bias"],
-        recompute_op="matmul",
-        recompute_attrs={"matmul_op": "qkv", "transpose": "NT"},
-        recompute_policy="fft_only",
-        lora_targets=["q", "k", "v"],
         share_policy="fft_share",
     )
     qkv_rope = Activation(
         Tensor["B", "T", "QKV"],
         save=True,
-        recompute=True,
-        recompute_from=["qkv", "@global:freq_cis", "@input:position_ids"],
-        recompute_op="rope",
-        recompute_attrs={"rotary_dim": "D"},
-        recompute_policy="fft_only",
         share_policy="fft_share",
         description="QKV after RoPE",
     )
@@ -134,13 +118,6 @@ class GptOssBlock:
         Tensor["B", "T", "AttnDim"],
         aliases=["att_flat", "attn"],
         save=True,
-        recompute=True,
-        recompute_group="attn_fwd",
-        recompute_outputs=["att", "lse"],
-        recompute_from=["qkv_rope", "@param:sinks"],
-        recompute_op="flash_attention",
-        recompute_attrs={"attn_impl": "cudnn"},
-        recompute_policy="fft_only",
         share_policy="always_recompute",
         description="Attention output (pre out-proj)",
     )
@@ -148,21 +125,12 @@ class GptOssBlock:
         Tensor["B", "Hq", "T"],
         dtype="fp32",
         save=True,
-        recompute=True,
-        recompute_group="attn_fwd",
-        recompute_policy="fft_only",
         share_policy="always_recompute",
         description="Log-sum-exp from flash attention",
     )
     att_out = Activation(
         Tensor["B", "T", "C"],
         aliases=["att_out_flat"],
-        recompute=True,
-        recompute_from=["att", "@param:out_weight", "?@param:out_bias"],
-        recompute_op="matmul",
-        recompute_attrs={"matmul_op": "attn_out", "transpose": "NT"},
-        recompute_policy="fft_only",
-        lora_targets=["o"],
         share_policy="fft_share",
         description="After output projection",
     )
@@ -179,12 +147,6 @@ class GptOssBlock:
     res_att = Activation(
         Tensor["B", "T", "C"],
         aliases=["residual_att"],
-        recompute=True,
-        recompute_group="ln2_fused",
-        recompute_outputs=["res_att", "ln2"],
-        recompute_from=["res_ffn", "att_out", "ln2_rstd", "@param:ln2_weight"],
-        recompute_op="fused_residual_rmsnorm_apply_saved",
-        recompute_policy="fft_only",
         share_policy="fft_share",
         description="Residual after attention (pre-MoE)",
     )
@@ -194,9 +156,6 @@ class GptOssBlock:
         Tensor["B", "T", "C"],
         aliases=["ln2_flat"],
         save=True,
-        recompute=True,
-        recompute_group="ln2_fused",
-        recompute_policy="fft_only",
         share_policy="fft_share",
     )
     ln2_rstd = Activation(
@@ -209,11 +168,6 @@ class GptOssBlock:
     router_logits = Activation(
         Tensor["B * T", "E"],
         save=True,
-        recompute=True,
-        recompute_from=["ln2", "@param:router_weight", "@param:router_bias"],
-        recompute_op="matmul",
-        recompute_attrs={"transpose": "NT"},
-        recompute_policy="fft_only",
         share_policy="fft_share",
         description="Router logits before top-k",
     )
@@ -222,13 +176,6 @@ class GptOssBlock:
     routing_weights = Activation(
         Tensor["B * T", "K"],
         save=True,
-        recompute=True,
-        recompute_group="moe_topk",
-        recompute_outputs=["routing_weights", "routing_indices"],
-        recompute_from=["router_logits"],
-        recompute_op="moe_topk",
-        recompute_attrs={"top_k": "K", "normalize": False, "softmax": True},
-        recompute_policy="fft_only",
         share_policy="fft_share",
         description="Routing weights for selected experts",
     )
@@ -236,9 +183,6 @@ class GptOssBlock:
         Tensor["B * T", "K"],
         dtype="int32",
         save=True,
-        recompute=True,
-        recompute_group="moe_topk",
-        recompute_policy="fft_only",
         share_policy="fft_share",
         description="Expert indices for each token",
     )
@@ -247,13 +191,6 @@ class GptOssBlock:
     permuted_input = Activation(
         Tensor["B * T * K", "C"],
         save=True,
-        recompute=True,
-        recompute_group="moe_permute",
-        recompute_outputs=["permuted_input", "scatter_indices"],
-        recompute_from=["ln2", "routing_indices"],
-        recompute_op="moe_permute",
-        recompute_attrs={"top_k": "K"},
-        recompute_policy="fft_only",
         share_policy="fft_share",
         description="Permuted input for grouped GEMM",
     )
@@ -261,9 +198,6 @@ class GptOssBlock:
         Tensor["B * T * K"],
         dtype="int32",
         save=True,
-        recompute=True,
-        recompute_group="moe_permute",
-        recompute_policy="fft_only",
         share_policy="fft_share",
         description="Indices for scattering back to original order",
     )
@@ -289,51 +223,30 @@ class GptOssBlock:
     expert_gate_up = Activation(
         Tensor["B * T * K", "MUp"],
         save=False,
-        recompute=True,
-        recompute_from=["permuted_input", "@param:experts_gate_up", "scatter_indices"],
-        recompute_op="moe_grouped_gemm_gate_up",
-        recompute_policy="fft_only",
         share_policy="fft_share",
         description="Expert gate+up projection output (not saved: backward uses expert_gate_up_bias instead)",
     )
     expert_gate_up_bias = Activation(
         Tensor["B * T * K", "MUp"],
         save=True,
-        recompute=True,
-        recompute_from=["expert_gate_up", "@param:experts_gate_up_bias"],
-        recompute_op="moe_expert_bias_add",
-        recompute_policy="fft_only",
         share_policy="fft_share",
         description="Expert gate+up projection after bias",
     )
     expert_act = Activation(
         Tensor["B * T * K", "M"],
         save=True,
-        recompute=True,
-        recompute_from=["expert_gate_up_bias"],
-        recompute_op="gpt_oss_moe_act",
-        recompute_attrs={"alpha": 1.702, "limit": 7.0},
-        recompute_policy="fft_only",
         share_policy="fft_share",
         description="Expert GPT-OSS activation output",
     )
     expert_down = Activation(
         Tensor["B * T * K", "C"],
         save=False,
-        recompute=True,
-        recompute_from=["expert_act", "@param:experts_down", "scatter_indices"],
-        recompute_op="moe_grouped_gemm_down",
-        recompute_policy="fft_only",
         share_policy="fft_share",
         description="Expert down projection output (not saved: backward uses expert_down_bias instead)",
     )
     expert_down_bias = Activation(
         Tensor["B * T * K", "C"],
         save=True,
-        recompute=True,
-        recompute_from=["expert_down", "@param:experts_down_bias"],
-        recompute_op="moe_expert_bias_add",
-        recompute_policy="fft_only",
         share_policy="fft_share",
         description="Expert down projection after bias",
     )
@@ -352,11 +265,6 @@ class GptOssBlock:
         Tensor["B * T", "C"],
         aliases=["moe_out_flat"],
         save=True,
-        recompute=True,
-        recompute_from=["expert_down_bias", "routing_weights", "scatter_indices"],
-        recompute_op="moe_unpermute",
-        recompute_attrs={"top_k": "K"},
-        recompute_policy="fft_only",
         share_policy="fft_share",
         description="Combined MoE output",
     )

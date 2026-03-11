@@ -7,7 +7,6 @@ from ..decorators import block, forward, Param, Activation, Gradient
 from ..graph_builder import graph
 from ..dim import Dim, B, T
 
-
 @block
 class Qwen3MoEBlock:
     """Qwen3 MoE transformer block with QK-Norm and Mixture of Experts.
@@ -112,12 +111,6 @@ class Qwen3MoEBlock:
     ln1 = Activation(
         Tensor["B", "T", "C"],
         aliases=["ln1_flat"],
-        recompute=True,
-        # Recompute LN1 directly from saved res_ffn + rstd.
-        # This matches implementation (res_ffn is retrieved from residual storage, not re-derived).
-        recompute_from=["res_ffn", "ln1_rstd", "@param:ln1_weight"],
-        recompute_op="rmsnorm_apply_saved",
-        recompute_policy="fft_only",
         share_policy="fft_share",  # Share only in FFT mode
     )
     ln1_rstd = Activation(
@@ -131,30 +124,11 @@ class Qwen3MoEBlock:
         Tensor["B", "T", "QKV"],
         aliases=["qkv_flat", "qkv_biased"],
         save=True,
-        recompute=True,
-        recompute_from=["ln1", "@param:qkv_weight", "?@param:qkv_bias"],
-        recompute_op="matmul",
-        recompute_attrs={"matmul_op": "qkv", "transpose": "NT"},
-        recompute_policy="fft_only",
-        lora_targets=["q", "k", "v"],
         share_policy="fft_share",  # Share only in FFT mode
     )
     qkv_rope = Activation(
         Tensor["B", "T", "QKV"],
         save=True,
-        recompute=True,
-        recompute_group="qk_norm_rope",
-        recompute_outputs=["qkv_rope", "q_rstd", "k_rstd"],
-        recompute_from=[
-            "qkv",
-            "@global:freq_cis",
-            "@input:position_ids",
-            "?@param:q_norm_weight",
-            "?@param:k_norm_weight",
-        ],
-        recompute_op="qkv_qk_norm_rope",
-        recompute_attrs={"rotary_dim": "D"},
-        recompute_policy="fft_only",
         share_policy="fft_share",  # Share only in FFT mode
         description="QKV after QK-Norm + RoPE",
     )
@@ -164,9 +138,6 @@ class Qwen3MoEBlock:
         Tensor["B", "T", "Hq"],
         dtype="fp32",
         save=True,
-        recompute=True,
-        recompute_group="qk_norm_rope",
-        recompute_policy="fft_only",
         share_policy="fft_share",  # Share only in FFT mode
         when="use_qk_norm",
         description="Q head RMSNorm rstd",
@@ -175,9 +146,6 @@ class Qwen3MoEBlock:
         Tensor["B", "T", "Hkv"],
         dtype="fp32",
         save=True,
-        recompute=True,
-        recompute_group="qk_norm_rope",
-        recompute_policy="fft_only",
         share_policy="fft_share",  # Share only in FFT mode
         when="use_qk_norm",
         description="K head RMSNorm rstd",
@@ -188,13 +156,6 @@ class Qwen3MoEBlock:
         Tensor["B", "T", "AttnDim"],
         aliases=["att_flat", "attn"],
         save=True,
-        recompute=True,
-        recompute_group="attn_fwd",
-        recompute_outputs=["att", "lse"],
-        recompute_from=["qkv_rope"],
-        recompute_op="flash_attention",
-        recompute_attrs={"attn_impl": "cudnn"},
-        recompute_policy="fft_only",
         share_policy="always_recompute",
         description="Attention output (pre out-proj)",
     )
@@ -202,21 +163,12 @@ class Qwen3MoEBlock:
         Tensor["B", "Hq", "T"],
         dtype="fp32",
         save=True,
-        recompute=True,
-        recompute_group="attn_fwd",
-        recompute_policy="fft_only",
         share_policy="always_recompute",
         description="Log-sum-exp from flash attention",
     )
     att_out = Activation(
         Tensor["B", "T", "C"],
         aliases=["att_out_flat"],
-        recompute=True,
-        recompute_from=["att", "@param:out_weight"],
-        recompute_op="matmul",
-        recompute_attrs={"matmul_op": "attn_out", "transpose": "NT"},
-        recompute_policy="fft_only",
-        lora_targets=["o"],
         share_policy="fft_share",  # Share only in FFT mode
         description="After output projection",
     )
@@ -234,12 +186,6 @@ class Qwen3MoEBlock:
     res_att = Activation(
         Tensor["B", "T", "C"],
         aliases=["residual_att"],
-        recompute=True,
-        recompute_group="ln2_fused",
-        recompute_outputs=["res_att", "ln2"],
-        recompute_from=["res_ffn", "att_out", "ln2_rstd", "@param:ln2_weight"],
-        recompute_op="fused_residual_rmsnorm_apply_saved",
-        recompute_policy="fft_only",
         share_policy="fft_share",  # Share only in FFT mode
         description="Residual after attention (pre-MoE)",
     )
@@ -249,9 +195,6 @@ class Qwen3MoEBlock:
         Tensor["B", "T", "C"],
         aliases=["ln2_flat"],
         save=True,
-        recompute=True,
-        recompute_group="ln2_fused",
-        recompute_policy="fft_only",
         share_policy="fft_share",  # Share only in FFT mode
     )
     ln2_rstd = Activation(
@@ -264,23 +207,14 @@ class Qwen3MoEBlock:
     router_logits = Activation(
         Tensor["B * T", "E"],
         save=True,
-        recompute=True,
-        recompute_from=["ln2", "@param:router_weight"],
-        recompute_op="matmul",
-        recompute_attrs={"transpose": "NT"},
         # Router matmul uses quantized weights under QLoRA; skip recompute in LoRA mode.
-        recompute_policy="fft_only",
         share_policy="fft_share",  # Share only in FFT mode
         description="Router logits before softmax/sigmoid",
     )
     router_probs = Activation(
         Tensor["B * T", "E"],
         save=True,
-        recompute=True,
-        recompute_from=["router_logits"],
-        recompute_op="moe_router_probs",
         # Depends on router_logits; skip recompute in LoRA mode.
-        recompute_policy="fft_only",
         share_policy="fft_share",  # Share only in FFT mode
         description="Router probabilities after normalization",
     )
@@ -289,13 +223,6 @@ class Qwen3MoEBlock:
     routing_weights = Activation(
         Tensor["B * T", "K"],
         save=True,
-        recompute=True,
-        recompute_group="moe_topk",
-        recompute_outputs=["routing_weights", "routing_indices"],
-        recompute_from=["router_probs"],
-        recompute_op="moe_topk",
-        recompute_attrs={"top_k": "K", "normalize": "norm_topk_prob"},
-        recompute_policy="fft_only",
         share_policy="fft_share",  # Share only in FFT mode
         description="Routing weights for selected experts",
     )
@@ -303,9 +230,6 @@ class Qwen3MoEBlock:
         Tensor["B * T", "K"],
         dtype="int32",
         save=True,
-        recompute=True,
-        recompute_group="moe_topk",
-        recompute_policy="fft_only",
         share_policy="fft_share",  # Share only in FFT mode
         description="Expert indices for each token",
     )
@@ -314,15 +238,8 @@ class Qwen3MoEBlock:
     permuted_input = Activation(
         Tensor["B * T * K", "C"],
         save=True,
-        recompute=True,
-        recompute_group="moe_permute",
-        recompute_outputs=["permuted_input", "scatter_indices"],
-        recompute_from=["ln2", "routing_indices"],
-        recompute_op="moe_permute",
-        recompute_attrs={"top_k": "K"},
         # Recompute only in FFT mode; in LoRA/QLoRA use saved tensors to avoid
         # recompute drift and quantized-weight path mismatches.
-        recompute_policy="fft_only",
         share_policy="fft_share",  # Share only in FFT mode
         description="Permuted input for grouped GEMM",
     )
@@ -330,9 +247,6 @@ class Qwen3MoEBlock:
         Tensor["B * T * K"],
         dtype="int32",
         save=True,
-        recompute=True,
-        recompute_group="moe_permute",
-        recompute_policy="fft_only",
         share_policy="fft_share",  # Share only in FFT mode
         description="Indices for scattering back to original order",
     )
@@ -358,33 +272,20 @@ class Qwen3MoEBlock:
     expert_gate_up = Activation(
         Tensor["B * T * K", "MUp"],
         save=True,
-        recompute=True,
-        recompute_from=["permuted_input", "@param:experts_gate_up", "scatter_indices"],
-        recompute_op="moe_grouped_gemm_gate_up",
         # Expert GEMM uses quantized weights under QLoRA; skip recompute in LoRA mode.
-        recompute_policy="fft_only",
         share_policy="fft_share",  # Share only in FFT mode
         description="Expert gate+up projection output",
     )
     expert_act = Activation(
         Tensor["B * T * K", "M"],
         save=True,
-        recompute=True,
-        recompute_from=["expert_gate_up"],
-        recompute_op="swiglu",
-        recompute_attrs={"activation": "swiglu"},
-        recompute_policy="fft_only",
         share_policy="fft_share",  # Share only in FFT mode
         description="Expert SwiGLU activation output",
     )
     expert_down = Activation(
         Tensor["B * T * K", "C"],
         save=True,
-        recompute=True,
-        recompute_from=["expert_act", "@param:experts_down", "scatter_indices"],
-        recompute_op="moe_grouped_gemm_down",
         # Expert GEMM uses quantized weights under QLoRA; skip recompute in LoRA mode.
-        recompute_policy="fft_only",
         share_policy="fft_share",  # Share only in FFT mode
         description="Expert down projection output",
     )
@@ -403,11 +304,6 @@ class Qwen3MoEBlock:
         Tensor["B * T", "C"],
         aliases=["moe_out_flat"],
         save=True,
-        recompute=True,
-        recompute_from=["expert_down", "routing_weights", "scatter_indices"],
-        recompute_op="moe_unpermute",
-        recompute_attrs={"top_k": "K"},
-        recompute_policy="fft_only",
         share_policy="fft_share",  # Share only in FFT mode
         description="Combined MoE output",
     )

@@ -106,16 +106,6 @@ void CompiledExecutor::dispatch_fused_residual_rmsnorm(const CompiledOp& op) {
                 std::vector<long>(input.Sizes.begin(), input.Sizes.begin() + input.Rank));
             mTemps.push_back(zero_input);
             fill_zero(zero_input, mRunState.MainStream);
-            // Debug: validate tensor pointers before kernel call
-            static const bool replay_dbg = std::getenv("SUROGATE_REPLAY_SYNC") != nullptr;
-            if (replay_dbg) {
-                fprintf(stderr, "[REPLAY_BYPASS] layer=%d N=%d C=%d res_out=%p y=%p rstd=%p stored=%p zero=%p weight=%p"
-                        " res_out.nelem=%ld stored.nelem=%ld y.nelem=%ld rstd.nelem=%ld weight.nelem=%ld\n",
-                        fwd_layer_idx, static_cast<int>(mB * mT), mConfig.HiddenSize,
-                        (void*)residual_out.Data, (void*)y.Data, (void*)rstd.Data,
-                        (void*)stored_res_ffn.Data, (void*)zero_input.Data, (void*)weight.Data,
-                        residual_out.nelem(), stored_res_ffn.nelem(), y.nelem(), rstd.nelem(), weight.nelem());
-            }
             fused_residual_rmsnorm_forward(residual_out, y, rstd, stored_res_ffn, zero_input, weight, nullptr,
                                            op.attrs.eps, static_cast<int>(mB * mT),
                                            mConfig.HiddenSize, mRunState.MainStream);

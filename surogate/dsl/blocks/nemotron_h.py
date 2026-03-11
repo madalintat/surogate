@@ -20,7 +20,6 @@ from ..decorators import block, forward, Param, Activation, Gradient
 from ..graph_builder import graph
 from ..dim import B, T
 
-
 @block
 class NemotronHMamba2Block:
     """Mamba2 block for Nemotron-H hybrid architecture.
@@ -122,10 +121,6 @@ class NemotronHMamba2Block:
     # Pre-norm
     ln = Activation(
         Tensor["B", "T", "C"],
-        recompute=True,
-        recompute_from=["res_in", "ln_rstd", "@param:norm_weight"],
-        recompute_op="rmsnorm_apply_saved",
-        recompute_policy="always",
         share_policy="when_recomputed",
     )
     ln_rstd = Activation(
@@ -137,11 +132,6 @@ class NemotronHMamba2Block:
     projected = Activation(
         Tensor["B", "T", "P"],
         save=True,
-        recompute=True,
-        recompute_from=["ln", "@param:in_proj_weight"],
-        recompute_op="matmul",
-        recompute_attrs={"transpose": "NT"},
-        recompute_policy="fft_only",
         share_policy="fft_share",
     )
 
@@ -166,10 +156,6 @@ class NemotronHMamba2Block:
     conv_out = Activation(
         Tensor["B", "D_conv", "T"],
         save=True,
-        recompute=True,
-        recompute_from=["conv_input", "@param:conv_weight", "?@param:conv_bias"],
-        recompute_op="mamba_conv1d",
-        recompute_policy="fft_only",
         share_policy="fft_share",
     )
 
@@ -194,21 +180,11 @@ class NemotronHMamba2Block:
     ssm_out = Activation(
         Tensor["B", "T", "I"],
         save=True,
-        recompute=True,
-        recompute_group="ssm_scan",
-        recompute_outputs=["ssm_out", "ssm_state"],
-        recompute_from=["hidden_states", "dt", "ssm_B", "ssm_C",
-                        "@param:A_log", "@param:D_param", "@param:dt_bias"],
-        recompute_op="mamba_ssm_scan",
-        recompute_policy="fft_only",
         share_policy="fft_share",
     )
     ssm_state = Activation(
         Tensor["B", "H", "D", "N"],
         save=True,
-        recompute=True,
-        recompute_group="ssm_scan",
-        recompute_policy="fft_only",
         share_policy="fft_share",
         description="Final SSM state for caching",
     )
@@ -217,10 +193,6 @@ class NemotronHMamba2Block:
     gated_out = Activation(
         Tensor["B", "T", "I"],
         save=True,
-        recompute=True,
-        recompute_from=["ssm_out", "gate", "@param:gated_norm_weight"],
-        recompute_op="mamba_gated_rmsnorm",
-        recompute_policy="fft_only",
         share_policy="fft_share",
     )
 
@@ -346,7 +318,6 @@ class NemotronHMamba2Block:
 
             return out, res_in
 
-
 @block
 class NemotronHAttentionBlock:
     """Attention block for Nemotron-H hybrid architecture.
@@ -408,10 +379,6 @@ class NemotronHAttentionBlock:
 
     ln1 = Activation(
         Tensor["B", "T", "C"],
-        recompute=True,
-        recompute_from=["res_att", "ln1_rstd", "@param:norm_weight"],
-        recompute_op="rmsnorm_apply_saved",
-        recompute_policy="always",
         share_policy="when_recomputed",
     )
     ln1_rstd = Activation(
@@ -423,21 +390,11 @@ class NemotronHAttentionBlock:
         Tensor["B", "T", "QKV"],
         aliases=["qkv_flat"],
         save=True,
-        recompute=False,
-        recompute_from=["ln1", "@param:qkv_weight", "?@param:qkv_bias"],
-        recompute_op="matmul",
-        recompute_attrs={"transpose": "NT"},
-        recompute_policy="fft_only",
-        lora_targets=["q", "k", "v"],
         share_policy="when_recomputed",
     )
     qkv_rope = Activation(
         Tensor["B", "T", "QKV"],
         save=True,
-        recompute=True,
-        recompute_from=["qkv", "@global:freq_cis", "@input:position_ids"],
-        recompute_op="rope",
-        recompute_policy="fft_only",
         share_policy="when_recomputed",
         when="use_rope",
     )
@@ -445,32 +402,17 @@ class NemotronHAttentionBlock:
     att = Activation(
         Tensor["B", "T", "AttnDim"],
         save=True,
-        recompute=True,
-        recompute_group="attn_fwd",
-        recompute_outputs=["att", "lse"],
-        recompute_from=["qkv_rope"],
-        recompute_op="flash_attention",
-        recompute_policy="fft_only",
         share_policy="always_recompute",
     )
     lse = Activation(
         Tensor["B", "Hq", "T"],
         dtype="fp32",
         save=True,
-        recompute=True,
-        recompute_group="attn_fwd",
-        recompute_policy="fft_only",
         share_policy="always_recompute",
     )
     att_out = Activation(
         Tensor["B", "T", "C"],
         aliases=["att_out_flat"],
-        recompute=True,
-        recompute_from=["att", "@param:out_weight"],
-        recompute_op="matmul",
-        recompute_attrs={"transpose": "NT"},
-        recompute_policy="fft_only",
-        lora_targets=["o"],
         share_policy="fft_share",
     )
 
@@ -539,7 +481,6 @@ class NemotronHAttentionBlock:
 
             return att_out, res_att
 
-
 @block
 class NemotronHMLPBlock:
     """MLP block for Nemotron-H hybrid architecture.
@@ -588,10 +529,6 @@ class NemotronHMLPBlock:
 
     ln = Activation(
         Tensor["B", "T", "C"],
-        recompute=True,
-        recompute_from=["res_in", "ln_rstd", "@param:norm_weight"],
-        recompute_op="rmsnorm_apply_saved",
-        recompute_policy="always",
         share_policy="when_recomputed",
     )
     ln_rstd = Activation(
@@ -602,31 +539,15 @@ class NemotronHMLPBlock:
     mlp_up = Activation(
         Tensor["B", "T", "M"],
         save=True,
-        recompute=True,
-        recompute_from=["ln", "@param:up_weight", "?@param:up_bias"],
-        recompute_op="matmul",
-        recompute_attrs={"transpose": "NT"},
-        recompute_policy="always",
-        lora_targets=["up"],
         share_policy="when_recomputed",
     )
     swiglu = Activation(
         Tensor["B", "T", "M"],
         save=True,
-        recompute=True,
-        recompute_from=["mlp_up"],
-        recompute_op="relu2",  # Default for Nemotron
-        recompute_policy="always",
         share_policy="when_recomputed",
     )
     mlp_down = Activation(
         Tensor["B", "T", "C"],
-        recompute=True,
-        recompute_from=["swiglu", "@param:down_weight"],
-        recompute_op="matmul",
-        recompute_attrs={"transpose": "NT"},
-        recompute_policy="always",
-        lora_targets=["down"],
         share_policy="when_recomputed",
     )
 
@@ -693,7 +614,6 @@ class NemotronHMLPBlock:
             out = g.view(out_flat, shape=[B, T, self.C], out_name="out")
 
             return out, res_in
-
 
 @block
 class NemotronHMoEBlock:

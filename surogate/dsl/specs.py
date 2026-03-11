@@ -101,20 +101,8 @@ class ActivationSlotSpec:
     # If memory_hint == SAVE, this adds the tensor to forward save list
     save_for_backward: bool = False
 
-    # If memory_hint == RECOMPUTE, specifies when to recompute
-    recompute_in_backward: bool = False
-
-    # Recompute metadata (optional)
-    recompute_from: list[str] = field(default_factory=list)
-    recompute_op: str | None = None
-    recompute_attrs: dict[str, Any] = field(default_factory=dict)
-    recompute_policy: str = "always"
-    recompute_group: str | None = None
-    recompute_outputs: list[str] = field(default_factory=list)
-    lora_targets: list[str] = field(default_factory=list)
-
     # Sharing policy for cross-layer buffer sharing
-    share_policy: SharePolicy = SharePolicy.WHEN_RECOMPUTED
+    share_policy: SharePolicy = SharePolicy.PER_LAYER
 
     # For gradient slots, the corresponding forward activation
     gradient_of: str | None = None
@@ -194,7 +182,8 @@ class ActivationLayoutSpec:
 
     def get_recompute_list(self) -> list[str]:
         """Get list of slots that can be recomputed in backward."""
-        return [slot.name for slot in self.slots if slot.recompute_in_backward]
+        recompute_policies = {SharePolicy.WHEN_RECOMPUTED, SharePolicy.ALWAYS_RECOMPUTE, SharePolicy.FFT_SHARE, SharePolicy.LORA_SHARE}
+        return [slot.name for slot in self.slots if slot.share_policy in recompute_policies]
 
 
 @dataclass

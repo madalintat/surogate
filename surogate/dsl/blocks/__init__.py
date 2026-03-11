@@ -1,7 +1,6 @@
 """Transformer Blocks for Python DSL"""
 
 from .common import Activation
-from .dense import DenseTransformerBlock
 from .qwen3 import Qwen3Block
 from .qwen3_5 import Qwen3_5AttentionBlock, Qwen3_5LinearBlock
 from .qwen3_vl import Qwen3VLBlock
@@ -17,7 +16,6 @@ from .nemotron_h import (
 
 __all__ = [
     "Activation",
-    "DenseTransformerBlock",
     "Qwen3Block",
     "Qwen3_5AttentionBlock",
     "Qwen3_5LinearBlock",

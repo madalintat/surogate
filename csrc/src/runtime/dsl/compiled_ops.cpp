@@ -2154,7 +2154,6 @@ void CompiledExecutor::replay_layer_forward(int layer_idx, long B, long T,
     }
 
     // Replay the layer's forward ops
-    static const bool replay_debug_sync = std::getenv("SUROGATE_REPLAY_SYNC") != nullptr;
     for (std::size_t idx = start; idx <= end && idx < fwd_graph.ops.size(); ++idx) {
         const auto& op = fwd_graph.ops[idx];
 
@@ -2165,14 +2164,6 @@ void CompiledExecutor::replay_layer_forward(int layer_idx, long B, long T,
         }
 
         try {
-            // Debug: sync after each op to pinpoint async CUDA errors
-            if (replay_debug_sync) {
-                cudaError_t pre_err = cudaGetLastError();
-                if (pre_err != cudaSuccess) {
-                    fprintf(stderr, "[REPLAY_SYNC] layer=%d op=%zu type=%s: pending error BEFORE dispatch: %s\n",
-                            layer_idx, idx - start, op_type_to_string(op.type), cudaGetErrorString(pre_err));
-                }
-            }
             switch (op.type) {
                 case CompiledOpType::Embedding:           dispatch_embedding(op); break;
                 case CompiledOpType::Zeros:               dispatch_zeros(op); break;
@@ -2226,9 +2217,6 @@ void CompiledExecutor::replay_layer_forward(int layer_idx, long B, long T,
                 case CompiledOpType::Qwen3_5Decay:        dispatch_qwen3_5_decay(op); break;
                 case CompiledOpType::RepeatInterleaveHeads: dispatch_repeat_interleave_heads(op); break;
                 default: break;  // Skip unknown ops
-            }
-            if (replay_debug_sync) {
-                CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
             }
         } catch (const std::exception& e) {
             std::ostringstream oss;
@@ -2330,8 +2318,7 @@ void CompiledExecutor::replay_layer_forward(int layer_idx, long B, long T,
     mHasDeferredReplayCheckpoint = false;
 
     // Debug: dump saved tensor states after replay
-    static const bool debug_lora_grads = std::getenv("SUROGATE_DEBUG_LORA_GRADS") != nullptr;
-    if ((debug_replay || debug_lora_grads) && mSaved) {
+    if (debug_replay && mSaved) {
         CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
         int null_count = 0, live_count = 0;
         for (const auto& [sname, stensor] : *mSaved) {
@@ -2339,17 +2326,6 @@ void CompiledExecutor::replay_layer_forward(int layer_idx, long B, long T,
             if (parse_block_param(sname, lyr, fld) && lyr == layer_idx) {
                 if (stensor.Data) {
                     live_count++;
-                    if (debug_lora_grads && (fld == "ln1_flat" || fld == "full_att_flat")) {
-                        uint16_t vals[4] = {};
-                        long count = stensor.nelem() < 4 ? stensor.nelem() : 4;
-                        cudaMemcpy(vals, stensor.Data, count * sizeof(uint16_t), cudaMemcpyDeviceToHost);
-                        bool nz = false;
-                        for (int i = 0; i < 4; ++i) if (vals[i]) nz = true;
-                        fprintf(stderr, "[REPLAY-DATA] layer=%d %s ptr=%p %s stack=%d\n",
-                                layer_idx, sname.c_str(), (void*)stensor.Data,
-                                nz ? "NON-ZERO" : "ZERO",
-                                (int)mRunState.Stack.owns(stensor.Data));
-                    }
                 } else {
                     null_count++;
                     if (debug_replay) fprintf(stderr, "[REPLAY] layer=%d saved NULL: %s\n", layer_idx, sname.c_str());

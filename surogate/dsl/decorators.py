@@ -468,8 +468,8 @@ class Activation:
         dtype: Override dtype (default: inherit from runtime)
         aliases: Alternative names that map to this slot (e.g., "qkv_flat" -> "qkv")
         save: If True, save this tensor for backward pass
-        recompute: If True, this tensor can be recomputed in backward
         shares_with: Name of another slot to share memory with
+        share_policy: Sharing policy for cross-layer buffer sharing
         when: Condition for optional slots (e.g., "use_qk_norm")
         scope: "block" (default), "global", "gradient", or "global_gradient"
         description: Documentation for this slot
@@ -482,16 +482,8 @@ class Activation:
         dtype: str | None = None,
         aliases: list[str] | None = None,
         save: bool = False,
-        recompute: bool = False,
         shares_with: str | None = None,
-        recompute_from: list[str] | None = None,
-        recompute_op: str | None = None,
-        recompute_attrs: dict[str, Any] | None = None,
-        recompute_policy: str = "always",
-        recompute_group: str | None = None,
-        recompute_outputs: list[str] | None = None,
-        lora_targets: list[str] | None = None,
-        share_policy: str | SharePolicy = "when_recomputed",
+        share_policy: str | SharePolicy = "per_layer",
         when: str | Callable[[Any], bool] | None = None,
         scope: str = "block",
         description: str | None = None,
@@ -506,15 +498,7 @@ class Activation:
         self.dtype = dtype
         self.aliases = aliases or []
         self.save = save
-        self.recompute = recompute
         self.shares_with = shares_with
-        self.recompute_from = recompute_from or []
-        self.recompute_op = recompute_op
-        self.recompute_attrs = recompute_attrs or {}
-        self.recompute_policy = recompute_policy
-        self.recompute_group = recompute_group
-        self.recompute_outputs = recompute_outputs or []
-        self.lora_targets = lora_targets or []
         # Normalize share_policy to string
         if isinstance(share_policy, SharePolicy):
             self.share_policy = share_policy.value
@@ -538,22 +522,6 @@ class Activation:
             parts.append(f", aliases={self.aliases!r}")
         if self.save:
             parts.append(", save=True")
-        if self.recompute:
-            parts.append(", recompute=True")
-        if self.recompute_from:
-            parts.append(f", recompute_from={self.recompute_from!r}")
-        if self.recompute_op:
-            parts.append(f", recompute_op={self.recompute_op!r}")
-        if self.recompute_attrs:
-            parts.append(f", recompute_attrs={self.recompute_attrs!r}")
-        if self.recompute_policy != "always":
-            parts.append(f", recompute_policy={self.recompute_policy!r}")
-        if self.recompute_group:
-            parts.append(f", recompute_group={self.recompute_group!r}")
-        if self.recompute_outputs:
-            parts.append(f", recompute_outputs={self.recompute_outputs!r}")
-        if self.lora_targets:
-            parts.append(f", lora_targets={self.lora_targets!r}")
         if self.share_policy != "when_recomputed":
             parts.append(f", share_policy={self.share_policy!r}")
         if self.shares_with:
@@ -585,14 +553,14 @@ class Activation:
             "lora_share": SharePolicy.LORA_SHARE,
             "always_recompute": SharePolicy.ALWAYS_RECOMPUTE,
         }
-        share_policy_enum = share_policy_map.get(self.share_policy, SharePolicy.WHEN_RECOMPUTED)
+        share_policy_enum = share_policy_map.get(self.share_policy, SharePolicy.PER_LAYER)
 
         # Determine memory hint
         if self.shares_with:
             memory_hint = ActivationMemoryHint.SHARED
         elif self.save:
             memory_hint = ActivationMemoryHint.SAVE
-        elif self.recompute:
+        elif self.share_policy in ("when_recomputed", "always_recompute", "fft_share", "lora_share"):
             memory_hint = ActivationMemoryHint.RECOMPUTE
         else:
             memory_hint = ActivationMemoryHint.PERSISTENT
@@ -617,14 +585,6 @@ class Activation:
             memory_hint=memory_hint,
             shares_with=self.shares_with,
             save_for_backward=self.save,
-            recompute_in_backward=self.recompute,
-            recompute_from=list(self.recompute_from),
-            recompute_op=self.recompute_op,
-            recompute_attrs=dict(self.recompute_attrs),
-            recompute_policy=self.recompute_policy,
-            recompute_group=self.recompute_group,
-            recompute_outputs=list(self.recompute_outputs),
-            lora_targets=list(self.lora_targets),
             share_policy=share_policy_enum,
             condition=condition,
             condition_expr=condition_expr,

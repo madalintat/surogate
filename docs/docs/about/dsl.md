@@ -32,7 +32,7 @@ The Module DSL is a Python decorator-based domain-specific language for defining
 2. **Explicit computation**: Forward graphs are explicitly defined using a graph builder API (backward graphs are not compiled yet; see Section 11)
 3. **HuggingFace compatible**: First-class support for weight mapping, config translation, and checkpoint import/export
 4. **Shape metadata**: Tensor shapes/dtypes are annotated with symbolic dimensions and serialized into the JSON IR (no full static shape validation yet)
-5. **Memory control metadata**: Activation slots and save/recompute annotations are captured and serialized for the runtime to use
+5. **Memory control metadata**: Activation slots and share policy annotations are captured and serialized for the runtime to use
 
 ### 1.3 Non-Goals
 
@@ -71,18 +71,17 @@ from surogate.dsl import module, block, model, primitive, param, forward, backwa
 ### 2.2 Parameter Decorators
 
 ```python
-from surogate.dsl import param, Param, tied_to, save, recompute
+from surogate.dsl import param, Param, tied_to, save
 
 @param                           # Decorator style for parameters
 Param(Tensor["C", "D"])          # Class attribute style for parameters
 @tied_to("embedding")            # Tie parameter to another (method-style @param only)
 @save("x", "weight")             # Forward save list
-@recompute("hidden")             # Forward recompute list
 ```
 
 **Note**:
-- `@save(...)` / `@recompute(...)` can be placed either above or below `@forward` (both orders work).
-- The compiled `forward.save` / `forward.recompute` lists are the union of decorator directives and any explicit `g.save(...)` / `g.mark_recompute(...)` calls in the `graph()` context (Section 8.14).
+- `@save(...)` can be placed either above or below `@forward` (both orders work).
+- The compiled `forward.save` list is the union of decorator directives and any explicit `g.save(...)` calls in the `graph()` context (Section 8.14).
 
 ### 2.3 HuggingFace Decorators
 
@@ -372,8 +371,8 @@ class DenseTransformerBlock:
     mlp_down_weight = Param(Tensor["C", "M"])
 
     # Activation slots (see Section 10)
-    ln1 = Activation(Tensor["B", "T", "C"], aliases=["ln1_flat"], recompute=True)
-    ln1_rstd = Activation(Tensor["B", "T"], dtype="fp32", save=True)
+    ln1 = Activation(Tensor["B", "T", "C"], aliases=["ln1_flat"], share_policy="when_recomputed")
+    ln1_rstd = Activation(Tensor["B", "T"], dtype="fp32", save=True, share_policy="per_layer")
     qkv = Activation(Tensor["B", "T", "QKV"], aliases=["qkv_flat", "qkv_biased"])
     # ... more activation slots
 
@@ -773,19 +772,18 @@ res_out, y, rstd = g.fused_residual_rmsnorm(
 
 ### 8.14 Memory Directives and Saved Tensor Access
 
-The `GraphBuilder` supports explicit save/recompute lists (in addition to the `@save` / `@recompute` decorators):
+The `GraphBuilder` supports explicit save lists (in addition to the `@save` decorator):
 
 ```python
 with graph() as g:
-    # Mark tensors to save / recompute (names or GraphRef)
+    # Mark tensors to save for backward (names or GraphRef)
     g.save("x", "rstd")
-    g.mark_recompute("ln1")
 
     # Access a tensor saved from forward (for backward graphs; metadata only for now)
     x_saved = g.saved("x")  # yields a GraphRef named "saved.x"
 ```
 
-These lists are serialized into the JSON IR as `forward.save` / `forward.recompute`.
+These lists are serialized into the JSON IR as `forward.save`. Recompute behavior is controlled by `share_policy` on `Activation` slots (see Section 10.5).
 
 ---
 
@@ -920,22 +918,14 @@ from surogate.dsl import Activation, Tensor
 
 Activation(
     tensor_type,                      # Tensor[...] annotation
-    dtype="fp32",                     # Override dtype
-    aliases=["alt_name"],             # Alternative names
-    save=True,                        # Save for backward
-    recompute=True,                   # Recompute in backward
-    recompute_from=["a", "b"],        # Tensors to recompute from
-    recompute_op="rmsnorm",           # Operation to recompute with
-    recompute_attrs={...},            # Operation attributes
-    recompute_policy="fft_only",      # When to recompute
-    recompute_group="attn_fwd",       # Group multiple slots into one recompute op
-    recompute_outputs=["att", "lse"], # Named outputs produced by recompute op
-    lora_targets=["q", "k", "v"],     # Which LoRA adapters touch this slot (metadata)
-    shares_with="other_slot",         # Share memory with another slot
-    share_policy="when_recomputed",   # Cross-layer sharing policy
-    when="use_qk_norm",               # Condition for optional slots
-    scope="block",                    # "block", "global", "gradient", "global_gradient"
-    description="...",                # Documentation
+    dtype=”fp32”,                     # Override dtype
+    aliases=[“alt_name”],             # Alternative names
+    save=True,                        # Save for backward pass
+    shares_with=”other_slot”,         # Share memory with another slot
+    share_policy=”when_recomputed”,   # Cross-layer sharing and recompute policy
+    when=”use_qk_norm”,               # Condition for optional slots
+    scope=”block”,                    # “block”, “global”, “gradient”, “global_gradient”
+    description=”...”,                # Documentation
 )
 ```
 
@@ -977,17 +967,20 @@ Gradient(
 | `temporary`  | Stack-allocated, freed after use       |
 | `shared`     | Shares memory with another slot        |
 
-**Note**: in v0.1.0, `Activation(...)`/`Gradient(...)` declarations do not provide an explicit way to request `temporary`; the compiler currently derives `memory_hint` from `save`, `recompute`, and `shares_with`. `temporary` is reserved for future use.
+**Note**: `memory_hint` is derived automatically from `save`, `share_policy`, and `shares_with`. `temporary` is reserved for future use.
 
 ### 10.5 Share Policies
 
-| Policy            | Description                                    |
-| ----------------- | ---------------------------------------------- |
-| `per_layer`       | Always allocate per-layer (no sharing)         |
-| `when_recomputed` | Share when slot will be recomputed in backward |
-| `always_share`    | Always share across layers                     |
-| `fft_share`       | Share only in FFT mode (not LoRA)              |
-| `lora_share`      | Share only in LoRA mode (not FFT)              |
+`share_policy` is the single source of truth for both cross-layer buffer sharing and recompute behavior. The C++ runtime derives `recompute_in_backward` and `recompute_policy` from it:
+
+| Policy             | Sharing behavior                                    | Recompute behavior        |
+| ------------------ | --------------------------------------------------- | ------------------------- |
+| `per_layer`        | Never share — always allocate per-layer             | Not recomputed            |
+| `when_recomputed`  | Share when recompute is enabled (default)           | Always recomputed         |
+| `always_recompute` | Share whenever recompute is globally enabled        | Always recomputed         |
+| `always_share`     | Always share across layers                          | Not recomputed            |
+| `fft_share`        | Share only in full fine-tuning mode (not LoRA)      | Recomputed in FFT only    |
+| `lora_share`       | Share only in LoRA mode (not FFT)                   | Recomputed in LoRA only   |
 
 ### 10.6 Example
 
@@ -998,18 +991,20 @@ class TransformerBlock:
     ln1 = Activation(
         Tensor["B", "T", "C"],
         aliases=["ln1_flat"],
-        recompute=True,
-        recompute_from=["res_ffn", "ln1_rstd", "@param:ln1_weight"],
-        recompute_op="rmsnorm_apply_saved",
-        recompute_policy="fft_only",
+        share_policy="when_recomputed",
     )
-    ln1_rstd = Activation(Tensor["B", "T"], dtype="fp32", save=True)
-    qkv = Activation(Tensor["B", "T", "QKV"], aliases=["qkv_flat", "qkv_biased"])
-    lse = Activation(Tensor["B", "Hq", "T"], dtype="fp32", save=True)
+    ln1_rstd = Activation(Tensor["B", "T"], dtype="fp32", save=True,
+                          share_policy="per_layer")
+    qkv = Activation(Tensor["B", "T", "QKV"], aliases=["qkv_flat", "qkv_biased"],
+                      share_policy="when_recomputed")
+    att = Activation(Tensor["B", "T", "AttnDim"], aliases=["att_flat"], save=True,
+                     share_policy="always_recompute")
+    lse = Activation(Tensor["B", "Hq", "T"], dtype="fp32", save=True,
+                     share_policy="always_recompute")
 
     # Conditional slots
     q_rstd = Activation(Tensor["B", "T", "Hq"], dtype="fp32", save=True,
-                        when="use_qk_norm")
+                        when="use_qk_norm", share_policy="per_layer")
 
     # Gradient slots
     d_ln1 = Gradient(Tensor["B", "T", "C"], gradient_of="ln1")

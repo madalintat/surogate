@@ -124,7 +124,7 @@ enum class ActivationMemoryHint : std::uint8_t {
 /// the recompute strategy and training mode (FFT vs LoRA).
 enum class SharePolicy : std::uint8_t {
     PerLayer,          ///< Always allocate per-layer (no sharing)
-    WhenRecomputed,    ///< Share when slot will be recomputed in backward (default)
+    WhenRecomputed,    ///< Share when slot will be recomputed in backward
     AlwaysShare,       ///< Always share across layers (use with caution)
     FFTShare,          ///< Share only in FFT mode (not LoRA)
     LoRAShare,         ///< Share only in LoRA mode (not FFT)
@@ -141,15 +141,7 @@ struct ActivationSlotIR {
     ActivationMemoryHint memory_hint = ActivationMemoryHint::Persistent;
     std::string shares_with;                   ///< If memory_hint == Shared, slot to share with
     bool save_for_backward = false;            ///< Add to forward save list
-    bool recompute_in_backward = false;        ///< Can be recomputed instead of saved
-    std::vector<std::string> recompute_from;   ///< Dependencies for recompute
-    std::string recompute_op;                  ///< Recompute op type (dispatch key)
-    AttrMap recompute_attrs;                   ///< Recompute op attributes
-    std::string recompute_policy;              ///< "always", "lora_only", "never"
-    std::string recompute_group;               ///< Group ID for multi-output ops
-    std::vector<std::string> recompute_outputs;///< Explicit recompute outputs
-    std::vector<std::string> lora_targets;     ///< LoRA targets for matmul recompute
-    SharePolicy share_policy = SharePolicy::WhenRecomputed;  ///< Cross-layer sharing policy
+    SharePolicy share_policy = SharePolicy::PerLayer;  ///< Cross-layer sharing policy (default: no sharing)
     std::string gradient_of;                   ///< For gradient slots: corresponding forward activation
     std::string alias_of;                      ///< Optional alias target (reuse existing buffer)
     std::string condition;                     ///< Condition expression (e.g., "use_qk_norm")

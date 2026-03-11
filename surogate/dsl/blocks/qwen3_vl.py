@@ -7,7 +7,6 @@ from ..decorators import block, forward, Param, Activation, Gradient
 from ..graph_builder import graph
 from ..dim import Dim, B, T
 
-
 @block
 class Qwen3VLBlock:
     """Qwen3-VL text transformer block with QK-Norm + MRoPE."""
@@ -68,10 +67,6 @@ class Qwen3VLBlock:
     ln1 = Activation(
         Tensor["B", "T", "C"],
         aliases=["ln1_flat"],
-        recompute=True,
-        recompute_from=["res_ffn", "ln1_rstd", "@param:ln1_weight"],
-        recompute_op="rmsnorm_apply_saved",
-        recompute_policy="always",
         share_policy="when_recomputed",
     )
     ln1_rstd = Activation(
@@ -85,12 +80,6 @@ class Qwen3VLBlock:
         Tensor["B", "T", "QKV"],
         aliases=["qkv_flat", "qkv_biased"],
         save=True,
-        recompute=True,
-        recompute_from=["ln1", "@param:qkv_weight", "?@param:qkv_bias"],
-        recompute_op="matmul",
-        recompute_attrs={"matmul_op": "qkv", "transpose": "NT"},
-        recompute_policy="always",
-        lora_targets=["q", "k", "v"],
         share_policy="when_recomputed",
     )
 
@@ -98,16 +87,6 @@ class Qwen3VLBlock:
     qkv_norm = Activation(
         Tensor["B", "T", "QKV"],
         save=True,
-        recompute=True,
-        recompute_group="qk_norm",
-        recompute_outputs=["qkv_norm", "q_rstd", "k_rstd"],
-        recompute_from=[
-            "qkv",
-            "@param:q_norm_weight",
-            "@param:k_norm_weight",
-        ],
-        recompute_op="qkv_qk_norm",
-        recompute_policy="always",
         share_policy="when_recomputed",
         description="QKV after QK-Norm",
     )
@@ -116,9 +95,6 @@ class Qwen3VLBlock:
         Tensor["B", "T", "Hq"],
         dtype="fp32",
         save=True,
-        recompute=True,
-        recompute_group="qk_norm",
-        recompute_policy="always",
         share_policy="when_recomputed",
         description="Q head RMSNorm rstd",
     )
@@ -126,9 +102,6 @@ class Qwen3VLBlock:
         Tensor["B", "T", "Hkv"],
         dtype="fp32",
         save=True,
-        recompute=True,
-        recompute_group="qk_norm",
-        recompute_policy="always",
         share_policy="when_recomputed",
         description="K head RMSNorm rstd",
     )
@@ -137,11 +110,6 @@ class Qwen3VLBlock:
     qkv_rope = Activation(
         Tensor["B", "T", "QKV"],
         save=True,
-        recompute=True,
-        recompute_from=["qkv_norm", "@global:freq_cis", "@input:position_ids"],
-        recompute_op="mrope",
-        recompute_attrs={"rotary_dim": "D", "mrope_section": "mrope_section"},
-        recompute_policy="always",
         share_policy="when_recomputed",
         description="QKV after QK-Norm + MRoPE",
     )
@@ -151,13 +119,6 @@ class Qwen3VLBlock:
         Tensor["B", "T", "AttnDim"],
         aliases=["att_flat", "attn"],
         save=True,
-        recompute=True,
-        recompute_group="attn_fwd",
-        recompute_outputs=["att", "lse"],
-        recompute_from=["qkv_rope"],
-        recompute_op="flash_attention",
-        recompute_attrs={"attn_impl": "cudnn"},
-        recompute_policy="fft_only",
         share_policy="always_recompute",
         description="Attention output (pre out-proj)",
     )
@@ -165,21 +126,12 @@ class Qwen3VLBlock:
         Tensor["B", "Hq", "T"],
         dtype="fp32",
         save=True,
-        recompute=True,
-        recompute_group="attn_fwd",
-        recompute_policy="fft_only",
         share_policy="always_recompute",
         description="Log-sum-exp from flash attention",
     )
     att_out = Activation(
         Tensor["B", "T", "C"],
         aliases=["att_out_flat"],
-        recompute=True,
-        recompute_from=["att", "@param:out_weight"],
-        recompute_op="matmul",
-        recompute_attrs={"matmul_op": "attn_out", "transpose": "NT"},
-        recompute_policy="always",
-        lora_targets=["o"],
         share_policy="when_recomputed",
         description="After output projection",
     )
@@ -188,12 +140,6 @@ class Qwen3VLBlock:
     res_att = Activation(
         Tensor["B", "T", "C"],
         aliases=["residual_att"],
-        recompute=True,
-        recompute_group="ln2_fused",
-        recompute_outputs=["res_att", "ln2"],
-        recompute_from=["res_ffn", "att_out", "ln2_rstd", "@param:ln2_weight"],
-        recompute_op="fused_residual_rmsnorm_apply_saved",
-        recompute_policy="always",
         share_policy="when_recomputed",
         description="Residual + attention",
     )
@@ -202,9 +148,6 @@ class Qwen3VLBlock:
     ln2 = Activation(
         Tensor["B", "T", "C"],
         aliases=["ln2_flat"],
-        recompute=True,
-        recompute_group="ln2_fused",
-        recompute_policy="always",
         share_policy="when_recomputed",
     )
     ln2_rstd = Activation(
@@ -217,34 +160,17 @@ class Qwen3VLBlock:
     mlp_up = Activation(
         Tensor["B", "T", "MUp"],
         aliases=["mlp_up_flat"],
-        recompute=True,
-        recompute_from=["ln2", "@param:mlp_up_weight"],
-        recompute_op="matmul",
-        recompute_attrs={"matmul_op": "mlp_up", "transpose": "NT"},
-        recompute_policy="always",
-        lora_targets=["up", "gate"],
         share_policy="when_recomputed",
     )
     swiglu = Activation(
         Tensor["B", "T", "M"],
         aliases=["swiglu_flat"],
-        recompute=True,
-        recompute_from=["mlp_up"],
-        recompute_op="swiglu",
-        recompute_attrs={"activation": "swiglu"},
-        recompute_policy="always",
         share_policy="when_recomputed",
         description="SwiGLU activation output",
     )
     mlp_down = Activation(
         Tensor["B", "T", "C"],
         aliases=["mlp_down_flat"],
-        recompute=True,
-        recompute_from=["swiglu", "@param:mlp_down_weight"],
-        recompute_op="matmul",
-        recompute_attrs={"matmul_op": "mlp_down", "transpose": "NT"},
-        recompute_policy="always",
-        lora_targets=["down"],
         share_policy="when_recomputed",
         description="MLP down projection output",
     )

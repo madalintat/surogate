@@ -796,37 +796,6 @@ void CompiledExecutor::dispatch_matmul_backward(const CompiledOp& op, const modu
                         fprintf(stderr, "[LORA-Q35] layer=%d field=%s proj=%d BT=%d in=%d out=%d rank=%d accum=%d\n",
                                 layer, field.c_str(), proj_type, BT, in_features, out_features, rank, (int)lora_accum);
                     }
-                    if (std::getenv("SUROGATE_DEBUG_LORA_GRADS")) {
-                        // Log tensor resolution info
-                        fprintf(stderr, "[LORA-Q35-RESOLVE] layer=%d field=%s a.name='%s' a.slot=%d a.tid=%d d_out.name='%s' d_out.slot=%d d_out.tid=%d\n",
-                                layer, field.c_str(),
-                                op.inputs[1].name.c_str(), static_cast<int>(op.inputs[1].slot), op.inputs[1].tensor_id,
-                                op.inputs[0].name.c_str(), static_cast<int>(op.inputs[0].slot), op.inputs[0].tensor_id);
-                        // Check if activation and gradient data are non-zero
-                        CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
-                        uint16_t a_vals[4] = {}, d_vals[4] = {}, la_vals[4] = {}, lb_vals[4] = {};
-                        long a_count = a_flat.nelem() < 4 ? a_flat.nelem() : 4;
-                        long d_count = d_out_flat.nelem() < 4 ? d_out_flat.nelem() : 4;
-                        cudaMemcpy(a_vals, a_flat.Data, a_count * sizeof(uint16_t), cudaMemcpyDeviceToHost);
-                        cudaMemcpy(d_vals, d_out_flat.Data, d_count * sizeof(uint16_t), cudaMemcpyDeviceToHost);
-                        cudaMemcpy(la_vals, lora_layer->value().A.Data, 4 * sizeof(uint16_t), cudaMemcpyDeviceToHost);
-                        cudaMemcpy(lb_vals, lora_layer->value().B.Data, 4 * sizeof(uint16_t), cudaMemcpyDeviceToHost);
-                        bool a_nonzero = false, d_nonzero = false, la_nz = false, lb_nz = false;
-                        for (int i = 0; i < 4; ++i) {
-                            if (a_vals[i]) a_nonzero = true;
-                            if (d_vals[i]) d_nonzero = true;
-                            if (la_vals[i]) la_nz = true;
-                            if (lb_vals[i]) lb_nz = true;
-                        }
-                        fprintf(stderr, "[LORA-Q35-DATA] layer=%d field=%s a_ptr=%p(%s) d_out_ptr=%p(%s) loraA=%p(%s) loraB=%p(%s) stack_a=%d stack_d=%d\n",
-                                layer, field.c_str(),
-                                (void*)a_flat.Data, a_nonzero ? "NON-ZERO" : "ZERO",
-                                (void*)d_out_flat.Data, d_nonzero ? "NON-ZERO" : "ZERO",
-                                (void*)lora_layer->value().A.Data, la_nz ? "NON-ZERO" : "ZERO",
-                                (void*)lora_layer->value().B.Data, lb_nz ? "NON-ZERO" : "ZERO",
-                                (int)mRunState.Stack.owns(a_flat.Data),
-                                (int)mRunState.Stack.owns(d_out_flat.Data));
-                    }
                     modules::detail::backward_lora_layer(
                         grad_layer->value().A, grad_layer->value().B,
                         *dA_use,
@@ -838,16 +807,6 @@ void CompiledExecutor::dispatch_matmul_backward(const CompiledOp& op, const modu
                         mLoRARunState->intermediate, mLoRARunState->slice,
                         BT, in_features, out_features, rank, lora_accum,
                         mRunState.CublasLtHandle, mRunState.CuBlasWorkspace, mRunState.MainStream);
-                    if (std::getenv("SUROGATE_DEBUG_LORA_GRADS") && layer == 0 && proj_type == 0) {
-                        CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
-                        uint16_t ga_vals[4] = {}, gb_vals[4] = {};
-                        cudaMemcpy(ga_vals, grad_layer->value().A.Data, 4 * sizeof(uint16_t), cudaMemcpyDeviceToHost);
-                        cudaMemcpy(gb_vals, grad_layer->value().B.Data, 4 * sizeof(uint16_t), cudaMemcpyDeviceToHost);
-                        bool ga_nz = false, gb_nz = false;
-                        for (int i = 0; i < 4; ++i) { if (ga_vals[i]) ga_nz = true; if (gb_vals[i]) gb_nz = true; }
-                        fprintf(stderr, "[LORA-Q35-POST] layer=0 proj=q gradA=%s gradB=%s\n",
-                                ga_nz ? "NON-ZERO" : "ZERO", gb_nz ? "NON-ZERO" : "ZERO");
-                    }
                 }
             }
         }

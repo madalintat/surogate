@@ -148,15 +148,29 @@ void TensorSlotRegistry::init_from_layout(const ActivationLayoutIR& layout) {
         entry.shape = slot_ir.shape;
         entry.dtype = slot_ir.dtype;
         entry.save_for_backward = slot_ir.save_for_backward;
-        entry.recompute_in_backward = slot_ir.recompute_in_backward;
-        entry.recompute_from = slot_ir.recompute_from;
-        entry.recompute_op = slot_ir.recompute_op;
-        entry.recompute_attrs = slot_ir.recompute_attrs;
-        entry.recompute_policy = slot_ir.recompute_policy;
-        entry.recompute_group = slot_ir.recompute_group;
-        entry.recompute_outputs = slot_ir.recompute_outputs;
-        entry.lora_targets = slot_ir.lora_targets;
         entry.share_policy = slot_ir.share_policy;
+
+        // Derive recompute behavior from share_policy (single source of truth)
+        switch (entry.share_policy) {
+            case SharePolicy::PerLayer:
+            case SharePolicy::AlwaysShare:
+                entry.recompute_in_backward = false;
+                entry.recompute_policy = "never";
+                break;
+            case SharePolicy::WhenRecomputed:
+            case SharePolicy::AlwaysRecompute:
+                entry.recompute_in_backward = true;
+                entry.recompute_policy = "always";
+                break;
+            case SharePolicy::FFTShare:
+                entry.recompute_in_backward = true;
+                entry.recompute_policy = "fft_only";
+                break;
+            case SharePolicy::LoRAShare:
+                entry.recompute_in_backward = true;
+                entry.recompute_policy = "lora_only";
+                break;
+        }
         entry.memory_hint = slot_ir.memory_hint;
         entry.shares_with = slot_ir.shares_with;
         entry.alias_of = slot_ir.alias_of;
@@ -186,7 +200,7 @@ void TensorSlotRegistry::init_from_layout(const ActivationLayoutIR& layout) {
         }
 
         // Build recompute list
-        if (slot_ir.recompute_in_backward) {
+        if (entry.recompute_in_backward) {
             mRecomputeList.push_back(slot_ir.name);
         }
     }
@@ -312,7 +326,7 @@ SharePolicy TensorSlotRegistry::get_share_policy(const std::string& name) const 
     if (entry) {
         return entry->share_policy;
     }
-    return SharePolicy::WhenRecomputed;  // Default
+    return SharePolicy::PerLayer;  // Default
 }
 
 bool TensorSlotRegistry::should_share(const std::string& name, bool lora_only_mode, bool recompute_enabled) const {
