@@ -290,6 +290,15 @@ struct TensorMeta {
 };
 
 // ============================================================================
+// MLP Tile Group (for long-context tiled execution)
+// ============================================================================
+
+struct MlpTileGroup {
+    std::size_t start_op_idx;  // first op in MLP sequence (view before up-proj matmul)
+    std::size_t end_op_idx;    // last op in MLP sequence (view after down-proj matmul)
+};
+
+// ============================================================================
 // Compiled Graph
 // ============================================================================
 
@@ -324,6 +333,10 @@ struct CompiledGraph {
         auto it = tensor_name_to_id.find(name);
         return (it != tensor_name_to_id.end()) ? it->second : -1;
     }
+
+    // MLP tile groups for long-context tiled execution.
+    // When non-empty, the executor processes these op ranges in T-chunks.
+    std::vector<MlpTileGroup> mlp_tile_groups;
 
     // Statistics
     std::size_t total_ops = 0;

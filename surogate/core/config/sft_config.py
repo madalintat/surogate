@@ -308,6 +308,7 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
     fp4_backend: Optional[Literal['cutlass', 'cudnn']] = 'cutlass'
     skip_quant_first_layers: Optional[int] = 0
     skip_quant_last_layers: Optional[int] = 0
+    long_context: Optional[bool] = False
 
     gpus: Optional[int] = 1
     use_cuda_graphs: Optional[bool] = True
@@ -430,6 +431,7 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
         self.fp4_backend = cfg.get('fp4_backend', self.fp4_backend)
         self.skip_quant_first_layers = cfg['skip_quant_first_layers'] if 'skip_quant_first_layers' in cfg else self.skip_quant_first_layers
         self.skip_quant_last_layers = cfg['skip_quant_last_layers'] if 'skip_quant_last_layers' in cfg else self.skip_quant_last_layers
+        self.long_context = cfg.get('long_context', self.long_context)
 
         self.gpus = cfg.get('gpus', self.gpus)
         self.use_cuda_graphs = cfg.get('use_cuda_graphs', self.use_cuda_graphs)
@@ -717,6 +719,10 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
             self.use_cuda_graphs = False
             logger.info("[sample_packing]: disabling CUDA graphs (packed sequences use Flash Attention varlen which bypasses graph replay).")
 
+        if self.long_context and self.use_cuda_graphs:
+            self.use_cuda_graphs = False
+            logger.info("[long_context]: disabling CUDA graphs (tiled MLP execution is incompatible with graph capture).")
+
         if self.debug_time_breakdown and self.use_cuda_graphs:
             self.use_cuda_graphs = False
             logger.info("[debug_time_breakdown]: disabling CUDA graphs for accurate per-phase timing.")
@@ -747,6 +753,7 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
             fp4_backend=self.fp4_backend,
             skip_quant_first_layers=self.skip_quant_first_layers,
             skip_quant_last_layers=self.skip_quant_last_layers,
+            long_context=self.long_context,
         )
         self.runtime_config.use_zero_copy = self.use_zero_copy
         self.runtime_config.use_write_combined = self.use_write_combined

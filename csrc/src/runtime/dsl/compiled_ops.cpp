@@ -2162,6 +2162,13 @@ void CompiledExecutor::replay_layer_forward(int layer_idx, long B, long T,
     }
 
     // Replay the layer's forward ops
+    // Build tile group lookup for replay (same as execute_forward)
+    std::unordered_map<std::size_t, const MlpTileGroup*> replay_tile_groups;
+    for (const auto& tg : fwd_graph.mlp_tile_groups) {
+        if (tg.start_op_idx >= start && tg.end_op_idx <= end) {
+            replay_tile_groups[tg.start_op_idx] = &tg;
+        }
+    }
     for (std::size_t idx = start; idx <= end && idx < fwd_graph.ops.size(); ++idx) {
         const auto& op = fwd_graph.ops[idx];
 
@@ -2169,6 +2176,16 @@ void CompiledExecutor::replay_layer_forward(int layer_idx, long B, long T,
         if (op.type == CompiledOpType::CrossEntropyLoss ||
             op.type == CompiledOpType::FusedLMHeadLoss) {
             continue;
+        }
+
+        // Check if this op starts a tiled MLP group
+        if (!replay_tile_groups.empty()) {
+            auto tg_it = replay_tile_groups.find(idx);
+            if (tg_it != replay_tile_groups.end()) {
+                execute_tiled_mlp(fwd_graph, *tg_it->second, B, T, hook);
+                idx = tg_it->second->end_op_idx;
+                continue;
+            }
         }
 
         try {
@@ -2342,6 +2359,131 @@ void CompiledExecutor::replay_layer_forward(int layer_idx, long B, long T,
         }
         if (debug_replay) fprintf(stderr, "[REPLAY] layer=%d saved stats: live=%d null=%d\n", layer_idx, live_count, null_count);
     }
+}
+
+
+// ============================================================================
+// Tiled MLP execution for long-context mode
+// ============================================================================
+// Executes an MLP tile group (view→matmul→view→swiglu→view→matmul→view) in
+// chunks along the flattened B*T dimension. Reduces peak MLP activation memory
+// from O(B*T * intermediate) to O(chunk_size * intermediate).
+//
+// Operates in flat 2D space to avoid shape mismatches with compiled view ops:
+//   chunk_input[chunk, C] → matmul → up[chunk, MUp] → swiglu → act[chunk, M]
+//   → matmul → down[chunk, C] → write into full_output
+void CompiledExecutor::execute_tiled_mlp(const CompiledGraph& graph,
+                                         const MlpTileGroup& group,
+                                         long B, long T,
+                                         const modules::ForwardHook* hook) {
+    // The first op is a view: [B,T,C] → [B*T,C]. Get the 3D input.
+    const auto& first_view_op = graph.ops[group.start_op_idx];
+    Tensor full_input_3d = resolve_tensor(first_view_op.inputs[0]);
+    const long BT = B * T;
+    const long C = full_input_3d.Sizes[full_input_3d.Rank - 1];
+    Tensor full_input = (full_input_3d.Rank == 3) ? view_tensor(full_input_3d, {BT, C}) : full_input_3d;
+
+    // Find up-weight and down-weight from the matmul ops in the group
+    Tensor up_weight{};
+    Tensor down_weight{};
+    const CompiledOp* up_matmul_op = nullptr;
+    const CompiledOp* down_matmul_op = nullptr;
+    for (std::size_t idx = group.start_op_idx; idx <= group.end_op_idx; ++idx) {
+        const auto& op = graph.ops[idx];
+        if (op.type != CompiledOpType::Matmul && op.type != CompiledOpType::MatmulBias) continue;
+        for (const auto& inp : op.inputs) {
+            if (inp.name.size() >= 14 &&
+                inp.name.compare(inp.name.size() - 14, 14, "mlp_up_weight") == 0) {
+                up_weight = resolve_tensor(inp);
+                up_matmul_op = &op;
+            }
+            if (inp.name.size() >= 16 &&
+                inp.name.compare(inp.name.size() - 16, 16, "mlp_down_weight") == 0) {
+                down_weight = resolve_tensor(inp);
+                down_matmul_op = &op;
+            }
+        }
+    }
+    if (!up_weight.Data || !down_weight.Data || !up_matmul_op || !down_matmul_op) {
+        throw std::runtime_error("execute_tiled_mlp: could not find MLP weights in tile group");
+    }
+
+    const long MUp = up_weight.Sizes[0];   // [MUp, C] with NT transpose
+    const long M = MUp / 2;                // SwiGLU halves the dimension
+    const ETensorDType dtype = full_input.DType;
+
+    // Pre-allocate full output [B*T, C]
+    Tensor full_output = mRunState.temp_alloc(dtype, {BT, C});
+
+    // Chunk size: min(B*T, C) — Unsloth's "arctic" strategy
+    const long chunk_size = std::min(BT, C);
+    const long num_chunks = (BT + chunk_size - 1) / chunk_size;
+
+    for (long chunk_idx = 0; chunk_idx < num_chunks; ++chunk_idx) {
+        const long offset = chunk_idx * chunk_size;
+        const long N = std::min(chunk_size, BT - offset);
+        const std::size_t byte_offset = static_cast<std::size_t>(offset) * static_cast<std::size_t>(C) * static_cast<std::size_t>(get_dtype_size(dtype));
+
+        // Narrow input: [N, C]
+        Tensor chunk_in = full_input;
+        chunk_in.Data = static_cast<std::byte*>(full_input.Data) + byte_offset;
+        chunk_in.Sizes[0] = N;
+
+        // Save stack checkpoint for chunk intermediates
+        auto ckpt = mRunState.Stack.checkpoint();
+        auto temp_mark = mTemps.size();
+
+        // 1) Up-proj matmul: [N, C] × [MUp, C]^T → [N, MUp]
+        Tensor up_out = mRunState.temp_alloc(dtype, {N, MUp});
+        mTemps.push_back(up_out);
+        {
+            int mm_M = 0, mm_N = 0, mm_K = 0;
+            matmul_dims(chunk_in, up_weight, up_matmul_op->attrs.transpose, mm_M, mm_N, mm_K);
+            matmul(up_out, up_weight, chunk_in, std::nullopt, nullptr, nullptr,
+                   mRunState.CublasLtHandle, mRunState.CuBlasWorkspace,
+                   mm_N, mm_M, mm_K, swap_transpose(up_matmul_op->attrs.transpose),
+                   false, mRunState.MainStream);
+        }
+
+        // 2) SwiGLU: [N, MUp] → [N, M] (operate in 2D, swiglu_forward handles it as B=1, T=N)
+        Tensor act_out = mRunState.temp_alloc(dtype, {N, M});
+        mTemps.push_back(act_out);
+        swiglu_forward(act_out, up_out, nullptr, 1, static_cast<int>(N), static_cast<int>(M),
+                       mRunState.MainStream);
+
+        // 3) Down-proj matmul: [N, M] × [C, M]^T → [N, C]
+        //    Write directly into the full_output at the correct offset
+        Tensor chunk_out = full_output;
+        chunk_out.Data = static_cast<std::byte*>(full_output.Data) + byte_offset;
+        chunk_out.Sizes[0] = N;
+        {
+            int mm_M = 0, mm_N = 0, mm_K = 0;
+            matmul_dims(act_out, down_weight, down_matmul_op->attrs.transpose, mm_M, mm_N, mm_K);
+            matmul(chunk_out, down_weight, act_out, std::nullopt, nullptr, nullptr,
+                   mRunState.CublasLtHandle, mRunState.CuBlasWorkspace,
+                   mm_N, mm_M, mm_K, swap_transpose(down_matmul_op->attrs.transpose),
+                   false, mRunState.MainStream);
+        }
+
+        // Restore stack — free chunk intermediates (up_out, act_out)
+        mRunState.Stack.restore(ckpt);
+        if (mTemps.size() > temp_mark) {
+            mTemps.resize(temp_mark);
+        }
+    }
+
+    // Store results under the tensor IDs that subsequent ops expect:
+    // - down_matmul output [B*T, C]
+    store_tensor(down_matmul_op->outputs[0], full_output);
+    mTemps.push_back(full_output);
+    // - last view output [B, T, C]
+    const auto& last_view_op = graph.ops[group.end_op_idx];
+    Tensor full_output_3d = view_tensor(full_output, {B, T, C});
+    store_tensor(last_view_op.outputs[0], full_output_3d);
+    // - first view output [B*T, C] (for any references to ln_flat)
+    store_tensor(first_view_op.outputs[0], full_input);
+    // - intermediate tensor IDs (mlp_up, swiglu, etc.) are not needed
+    //   since they only live within the tile group
 }
 
 
@@ -2663,6 +2805,144 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
     const bool op_trace = op_trace_env && std::string(op_trace_env) != "0";
     const int debug_nonfinite_mode = env_int("SUROGATE_DEBUG_CHECK_NONFINITE", 0);
     const bool debug_nonfinite_forward = (debug_nonfinite_mode & 0x1) != 0;
+    const char* watch_tensor_env = std::getenv("SUROGATE_DEBUG_WATCH_TENSOR");
+    const std::string watch_tensor_name = watch_tensor_env ? std::string(watch_tensor_env) : std::string();
+    const bool watch_tensor_enabled = !watch_tensor_name.empty();
+    const float watch_amax_delta = env_float("SUROGATE_DEBUG_WATCH_AMAX_DELTA", 1.0f);
+    const float watch_alarm_amax = env_float("SUROGATE_DEBUG_WATCH_ALARM_AMAX", 1e6f);
+    const bool watch_abort_on_alarm = env_int("SUROGATE_DEBUG_WATCH_ABORT", 0) != 0;
+    int watch_tensor_id = -1;
+    if (watch_tensor_enabled && mCurrentGraph) {
+        const int tid = mCurrentGraph->find_tensor_id(watch_tensor_name);
+        if (tid >= 0 && static_cast<std::size_t>(tid) < mTensors.size()) {
+            watch_tensor_id = tid;
+        }
+    }
+    if (watch_tensor_enabled && watch_tensor_id < 0) {
+        for (const auto& scan_op : graph.ops) {
+            bool found = false;
+            for (const auto& ref : scan_op.inputs) {
+                if (ref.name == watch_tensor_name && ref.tensor_id >= 0 &&
+                    static_cast<std::size_t>(ref.tensor_id) < mTensors.size()) {
+                    watch_tensor_id = ref.tensor_id;
+                    found = true;
+                    break;
+                }
+            }
+            if (found) {
+                break;
+            }
+            for (const auto& ref : scan_op.outputs) {
+                if (ref.name == watch_tensor_name && ref.tensor_id >= 0 &&
+                    static_cast<std::size_t>(ref.tensor_id) < mTensors.size()) {
+                    watch_tensor_id = ref.tensor_id;
+                    found = true;
+                    break;
+                }
+            }
+            if (found) {
+                break;
+            }
+        }
+    }
+    if (watch_tensor_enabled) {
+        int watch_input_refs = 0;
+        int watch_output_refs = 0;
+        for (const auto& scan_op : graph.ops) {
+            for (const auto& ref : scan_op.inputs) {
+                if (ref.name == watch_tensor_name) {
+                    watch_input_refs++;
+                }
+            }
+            for (const auto& ref : scan_op.outputs) {
+                if (ref.name == watch_tensor_name) {
+                    watch_output_refs++;
+                }
+            }
+        }
+        std::cerr << "[WATCH_META] tensor='" << watch_tensor_name
+                  << "' tensor_id=" << watch_tensor_id
+                  << " input_refs=" << watch_input_refs
+                  << " output_refs=" << watch_output_refs
+                  << std::endl;
+    }
+    auto try_bind_watch_tensor_id_from_ref = [&](const TensorRef& ref) {
+        if (watch_tensor_id >= 0) {
+            return;
+        }
+        if (ref.name != watch_tensor_name) {
+            return;
+        }
+        if (ref.tensor_id < 0) {
+            return;
+        }
+        if (static_cast<std::size_t>(ref.tensor_id) >= mTensors.size()) {
+            return;
+        }
+        watch_tensor_id = ref.tensor_id;
+    };
+    auto try_get_watch_tensor = [&](const CompiledOp* op_ctx = nullptr) -> const Tensor* {
+        if (!watch_tensor_enabled) {
+            return nullptr;
+        }
+        if (op_ctx) {
+            for (const auto& ref : op_ctx->inputs) {
+                try_bind_watch_tensor_id_from_ref(ref);
+            }
+            for (const auto& ref : op_ctx->outputs) {
+                try_bind_watch_tensor_id_from_ref(ref);
+            }
+        }
+        if (watch_tensor_id >= 0 &&
+            static_cast<std::size_t>(watch_tensor_id) < mTensors.size() &&
+            mTensors[static_cast<std::size_t>(watch_tensor_id)].Data) {
+            return &mTensors[static_cast<std::size_t>(watch_tensor_id)];
+        }
+        if (mWeights.has(watch_tensor_name)) {
+            Tensor& w = mWeights.get(watch_tensor_name);
+            if (w.Data) {
+                return &w;
+            }
+        }
+        if (const Tensor* direct = try_get_tensor(watch_tensor_name)) {
+            return direct;
+        }
+        return try_get_tensor_fuzzy(watch_tensor_name);
+    };
+    auto watch_non_finite_count = [&](const Tensor& t) -> int {
+        if (t.DType != ETensorDType::BF16 && t.DType != ETensorDType::FP32) {
+            return -1;
+        }
+        Tensor non_finite_count = mRunState.temp_alloc(ETensorDType::INT32, {1});
+        CUDA_CHECK(cudaMemsetAsync(non_finite_count.Data, 0, sizeof(int), mRunState.MainStream));
+        count_non_finite(non_finite_count, t, mRunState.MainStream);
+        int host_count = 0;
+        CUDA_CHECK(cudaMemcpyAsync(&host_count,
+                                   non_finite_count.get<int>(),
+                                   sizeof(int),
+                                   cudaMemcpyDeviceToHost,
+                                   mRunState.MainStream));
+        CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
+        mRunState.temp_free(non_finite_count);
+        return host_count;
+    };
+    auto watch_absmax = [&](const Tensor& t) -> float {
+        if (t.DType != ETensorDType::BF16 && t.DType != ETensorDType::FP32) {
+            return -1.0f;
+        }
+        Tensor amax = mRunState.temp_alloc(ETensorDType::FP32, {1});
+        CUDA_CHECK(cudaMemsetAsync(amax.Data, 0, sizeof(float), mRunState.MainStream));
+        global_amax(amax.get<float>(), t, static_cast<std::size_t>(t.nelem()), mRunState.DeviceProp, mRunState.MainStream);
+        float host_amax = 0.0f;
+        CUDA_CHECK(cudaMemcpyAsync(&host_amax,
+                                   amax.get<float>(),
+                                   sizeof(float),
+                                   cudaMemcpyDeviceToHost,
+                                   mRunState.MainStream));
+        CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
+        mRunState.temp_free(amax);
+        return host_amax;
+    };
     auto check_nonfinite_refs = [&](const CompiledOp& op, const std::vector<TensorRef>& refs) {
         if (!debug_nonfinite_forward) {
             return;
@@ -2708,12 +2988,68 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
             }
         }
     };
+    // Build tile group lookup for long-context tiled MLP execution
+    std::unordered_map<std::size_t, const MlpTileGroup*> tile_group_starts;
+    for (const auto& tg : graph.mlp_tile_groups) {
+        tile_group_starts[tg.start_op_idx] = &tg;
+    }
     for (std::size_t idx = 0; idx < graph.ops.size(); ++idx) {
         if (!full && !graph.required_mask.empty() && !graph.required_mask[idx]) {
             continue;
         }
 
+        // Check if this op starts a tiled MLP group
+        if (!tile_group_starts.empty()) {
+            auto tg_it = tile_group_starts.find(idx);
+            if (tg_it != tile_group_starts.end()) {
+                const auto& tg = *tg_it->second;
+                // Handle layer start if the first op has one
+                const auto& first_op = graph.ops[tg.start_op_idx];
+                if (first_op.layer_start >= 0) {
+                    if (first_op.layer_start < num_layers &&
+                        !layer_active[static_cast<std::size_t>(first_op.layer_start)]) {
+                        layer_checkpoints[static_cast<std::size_t>(first_op.layer_start)] = mRunState.Stack.checkpoint();
+                        layer_temp_marks[static_cast<std::size_t>(first_op.layer_start)] = mTemps.size();
+                        layer_active[static_cast<std::size_t>(first_op.layer_start)] = 1;
+                    }
+                    handle_layer_start(first_op.layer_start);
+                }
+                execute_tiled_mlp(graph, tg, mB, mT, hook);
+                // Handle layer end if the last op has one
+                const auto& last_op = graph.ops[tg.end_op_idx];
+                if (last_op.layer_end >= 0) {
+                    if (last_op.layer_end < num_layers &&
+                        layer_active[static_cast<std::size_t>(last_op.layer_end)]) {
+                        if (mDebugDumpLayerFn) mDebugDumpLayerFn(last_op.layer_end);
+                        persist_saved_layer_tensors(last_op.layer_end);
+                        mRunState.Stack.restore(layer_checkpoints[static_cast<std::size_t>(last_op.layer_end)]);
+                        if (mTemps.size() > layer_temp_marks[static_cast<std::size_t>(last_op.layer_end)]) {
+                            mTemps.resize(layer_temp_marks[static_cast<std::size_t>(last_op.layer_end)]);
+                        }
+                        prune_stack_tensors();
+                        layer_active[static_cast<std::size_t>(last_op.layer_end)] = 0;
+                    }
+                    handle_layer_end(last_op.layer_end);
+                }
+                idx = tg.end_op_idx;  // skip past the tile group (loop will ++idx)
+                continue;
+            }
+        }
+
         const auto& op = graph.ops[idx];
+
+        bool watch_pre_valid = false;
+        int watch_pre_nf = -1;
+        float watch_pre_amax = -1.0f;
+        if (watch_tensor_enabled) {
+            if (const Tensor* wt = try_get_watch_tensor(&op)) {
+                if (wt->Data && (wt->DType == ETensorDType::BF16 || wt->DType == ETensorDType::FP32)) {
+                    watch_pre_nf = watch_non_finite_count(*wt);
+                    watch_pre_amax = watch_absmax(*wt);
+                    watch_pre_valid = true;
+                }
+            }
+        }
 
         if (op_trace) {
             std::cerr << "[OP " << idx << "] " << op_type_to_string(op.type)
@@ -2887,6 +3223,62 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
                     throw std::runtime_error("CompiledExecutor: unsupported forward op type");
             }
             check_nonfinite_refs(op, op.outputs);
+            if (watch_tensor_enabled) {
+                bool watch_post_valid = false;
+                int watch_post_nf = -1;
+                float watch_post_amax = -1.0f;
+                if (const Tensor* wt = try_get_watch_tensor(&op)) {
+                    if (wt->Data && (wt->DType == ETensorDType::BF16 || wt->DType == ETensorDType::FP32)) {
+                        watch_post_nf = watch_non_finite_count(*wt);
+                        watch_post_amax = watch_absmax(*wt);
+                        watch_post_valid = true;
+                    }
+                }
+
+                const bool became_invalid = watch_pre_valid && !watch_post_valid;
+                const bool became_valid = !watch_pre_valid && watch_post_valid;
+                const bool nf_changed = watch_pre_valid && watch_post_valid && watch_pre_nf != watch_post_nf;
+                const bool amax_changed = watch_pre_valid && watch_post_valid &&
+                                          std::fabs(watch_post_amax - watch_pre_amax) > watch_amax_delta;
+                const bool alarm = watch_post_valid &&
+                    (watch_post_nf > 0 || !std::isfinite(watch_post_amax) || watch_post_amax >= watch_alarm_amax);
+
+                if (became_invalid || became_valid || nf_changed || amax_changed || alarm) {
+                    std::ostringstream in_list;
+                    for (std::size_t ri = 0; ri < op.inputs.size(); ++ri) {
+                        if (ri > 0) in_list << ",";
+                        in_list << op.inputs[ri].name << "#" << op.inputs[ri].tensor_id;
+                    }
+                    std::ostringstream out_list;
+                    for (std::size_t ro = 0; ro < op.outputs.size(); ++ro) {
+                        if (ro > 0) out_list << ",";
+                        out_list << op.outputs[ro].name << "#" << op.outputs[ro].tensor_id;
+                    }
+                    std::cerr << "[WATCH] tensor='" << watch_tensor_name
+                              << "' op_idx=" << idx
+                              << " op_id=" << op.op_id
+                              << " type=" << op_type_to_string(op.type)
+                              << " pre_valid=" << (watch_pre_valid ? 1 : 0)
+                              << " post_valid=" << (watch_post_valid ? 1 : 0)
+                              << " pre_nf=" << watch_pre_nf
+                              << " post_nf=" << watch_post_nf
+                              << " pre_amax=" << watch_pre_amax
+                              << " post_amax=" << watch_post_amax
+                              << " inputs=[" << in_list.str() << "]"
+                              << " outputs=[" << out_list.str() << "]"
+                              << std::endl;
+                }
+                if (alarm && watch_abort_on_alarm) {
+                    std::ostringstream oss_watch;
+                    oss_watch << "Watch tensor '" << watch_tensor_name
+                              << "' alarm after op idx=" << idx
+                              << " id=" << op.op_id
+                              << " type=" << op_type_to_string(op.type)
+                              << " nf=" << watch_post_nf
+                              << " amax=" << watch_post_amax;
+                    throw std::runtime_error(oss_watch.str());
+                }
+            }
             // After each op, check for sticky CUDA errors (debug mode)
             if (op_trace) {
                 auto post_err = cudaGetLastError();

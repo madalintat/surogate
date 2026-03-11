@@ -307,7 +307,7 @@ NB_MODULE(_surogate, m) {
             bool use_cuda_graphs, bool trigger_timing_events,
             bool offload_master, bool offload_quants, bool offload_optimizer, bool offload_grads, bool use_zero_copy,
             bool use_write_combined, bool shard_weights, bool persistent_quants, bool shard_gradients, bool use_all_to_all_reduce,
-            bool init_projections_to_zero, bool debug_memory_breakdown, int lmhead_chunks, int attn_bwd_chunks,
+            bool init_projections_to_zero, bool debug_memory_breakdown, int lmhead_chunks, int attn_bwd_chunks, bool long_context,
             const std::string matmul_type, const std::string gradient_type, const std::string master_dtype,
             const std::string& recipe, const std::string& matmul_backend, bool use_fused_rope, bool doc_masking,
             int fp8_amax_history, const std::string& fp4_backend,
@@ -336,6 +336,7 @@ NB_MODULE(_surogate, m) {
                 .OffloadResidual = offload_residual,
                 .LMHeadChunks = lmhead_chunks,
                 .AttBwdChunks = attn_bwd_chunks,
+                .LongContext = long_context,
                 .UseCudaGraphs = use_cuda_graphs,
                 .TriggerTimingEvents = trigger_timing_events,
                 .OffloadMaster = offload_master,
@@ -379,6 +380,7 @@ NB_MODULE(_surogate, m) {
              nb::arg("debug_memory_breakdown") = false,
              nb::arg("lmhead_chunks") = 1,
              nb::arg("attn_bwd_chunks") = 1,
+             nb::arg("long_context") = false,
              nb::arg("matmul_type") = "",
              nb::arg("gradient_type") = "",
              nb::arg("master_dtype") = "",
@@ -418,6 +420,7 @@ NB_MODULE(_surogate, m) {
         .def_rw("offload_residual", &RuntimeOptions::OffloadResidual, "Offload residual stream buffers.")
         .def_rw("lmhead_chunks", &RuntimeOptions::LMHeadChunks, "Split LM head computation into this many chunks.")
         .def_rw("attn_bwd_chunks", &RuntimeOptions::AttBwdChunks, "Split attention backward into this many chunks.")
+        .def_rw("long_context", &RuntimeOptions::LongContext, "Enable tiled MLP execution for long context training (reduces memory at long seq_len).")
         .def_rw("use_cuda_graphs", &RuntimeOptions::UseCudaGraphs, "Enable CUDA graphs for steady-state execution.")
         .def_rw("trigger_timing_events", &RuntimeOptions::TriggerTimingEvents, "Log additional timing information.")
         .def_rw("offload_master", &RuntimeOptions::OffloadMaster, "Offload FP32 master weights (optimizer state).")

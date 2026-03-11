@@ -48,6 +48,7 @@ struct RuntimeOptions {
     bool OffloadResidual = false;
     int LMHeadChunks = 1;
     int AttBwdChunks = 1;
+    bool LongContext = false;
     bool UseCudaGraphs = false;
     bool TriggerTimingEvents = false;
 

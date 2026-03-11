@@ -3060,6 +3060,64 @@ CompiledGraph GraphCompiler::compile(const Graph& graph, long B, long T) {
         }
     }
 
+    // ========================================================================
+    // Detect MLP tile groups for long-context tiled execution
+    // ========================================================================
+    if (mOptions.LongContext) {
+        const auto& ops = result.ops;
+        for (std::size_t i = 0; i < ops.size(); ++i) {
+            // Look for matmul ops with mlp_up_weight
+            if (ops[i].type != CompiledOpType::Matmul &&
+                ops[i].type != CompiledOpType::MatmulBias) continue;
+
+            bool is_up = false;
+            for (const auto& inp : ops[i].inputs) {
+                if (inp.name.size() >= 14 &&
+                    inp.name.compare(inp.name.size() - 14, 14, "mlp_up_weight") == 0) {
+                    is_up = true;
+                    break;
+                }
+            }
+            if (!is_up) continue;
+
+            // Found up-proj matmul at index i.
+            // The view op before it is the group start.
+            if (i == 0) continue;
+            std::size_t start = i - 1;
+            if (ops[start].type != CompiledOpType::View) continue;
+
+            // Walk forward to find mlp_down_weight matmul
+            std::size_t down_idx = 0;
+            bool found_down = false;
+            for (std::size_t j = i + 1; j < ops.size() && j <= i + 5; ++j) {
+                if (ops[j].type != CompiledOpType::Matmul &&
+                    ops[j].type != CompiledOpType::MatmulBias) continue;
+                for (const auto& inp : ops[j].inputs) {
+                    if (inp.name.size() >= 16 &&
+                        inp.name.compare(inp.name.size() - 16, 16, "mlp_down_weight") == 0) {
+                        down_idx = j;
+                        found_down = true;
+                        break;
+                    }
+                }
+                if (found_down) break;
+            }
+            if (!found_down) continue;
+
+            // The view op after the down matmul is the group end
+            std::size_t end = down_idx + 1;
+            if (end >= ops.size() || ops[end].type != CompiledOpType::View) {
+                end = down_idx;  // fallback: end at the matmul itself
+            }
+
+            result.mlp_tile_groups.push_back(MlpTileGroup{start, end});
+        }
+        if (!result.mlp_tile_groups.empty()) {
+            std::fprintf(stderr, "[long_context] Detected %zu MLP tile groups for tiled execution\n",
+                         result.mlp_tile_groups.size());
+        }
+    }
+
     return result;
 }
 

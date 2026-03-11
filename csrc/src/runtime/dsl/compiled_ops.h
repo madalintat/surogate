@@ -198,6 +198,13 @@ public:
         const std::vector<std::string>& save_list,
         const CompiledGraph* capture_graph = nullptr);
 private:
+    // Execute an MLP tile group in chunks along the sequence dimension.
+    // Used when long_context mode is enabled to reduce peak MLP activation memory.
+    void execute_tiled_mlp(const CompiledGraph& graph,
+                           const MlpTileGroup& group,
+                           long B, long T,
+                           const modules::ForwardHook* hook);
+
     // Save MoE layer tensors to persistent storage at layer boundaries
     void save_moe_layer_tensors(int layer_idx);
 
