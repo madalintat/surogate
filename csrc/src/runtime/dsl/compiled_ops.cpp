@@ -567,8 +567,22 @@ void CompiledExecutor::save_moe_layer_tensors(int layer_idx) {
 
     if (!mCurrentGraph) return;
 
-    // Build layer prefix pattern (e.g., "blocks[5].")
-    std::string layer_prefix = "blocks[" + std::to_string(layer_idx) + "].";
+    // Build layer prefix pattern (e.g., "blocks[5]." or "layer5.")
+    // Check the first block tensor name to determine naming convention
+    std::string layer_prefix;
+    for (const auto& [n, _] : mCurrentGraph->tensor_name_to_id) {
+        if (n.rfind("layer", 0) == 0 && n.size() > 5 && std::isdigit(n[5])) {
+            layer_prefix = "layer" + std::to_string(layer_idx) + ".";
+            break;
+        }
+        if (n.rfind("blocks[", 0) == 0) {
+            layer_prefix = "blocks[" + std::to_string(layer_idx) + "].";
+            break;
+        }
+    }
+    if (layer_prefix.empty()) {
+        layer_prefix = "blocks[" + std::to_string(layer_idx) + "].";
+    }
 
     // Iterate through compile-time tensor name map looking for MoE tensors from this layer
     for (const auto& [name, tid] : mCurrentGraph->tensor_name_to_id) {
@@ -1809,7 +1823,12 @@ Tensor& CompiledExecutor::ensure_output_tensor(const TensorRef& ref) {
                 const std::string alias_field = slot_entry->alias_of;
                 std::string alias_name = alias_field;
                 if (layer_idx >= 0) {
-                    alias_name = "blocks[" + std::to_string(layer_idx) + "]." + alias_field;
+                    // Reconstruct using the same naming convention as the source tensor
+                    if (parse_name.rfind("layer", 0) == 0) {
+                        alias_name = "layer" + std::to_string(layer_idx) + "." + alias_field;
+                    } else {
+                        alias_name = "blocks[" + std::to_string(layer_idx) + "]." + alias_field;
+                    }
                 }
                 if (auto alias_entry = mSlotRegistry->lookup(alias_field)) {
                     TensorRef alias_ref;
@@ -1948,6 +1967,11 @@ void CompiledExecutor::replay_layer_forward(int layer_idx, long B, long T,
         }
         mHasDeferredReplayCheckpoint = false;
     }
+    // Free persistent copies from previous replay (backward has consumed them)
+    for (void* ptr : mReplayCopiedBuffers) {
+        cudaFreeAsync(ptr, mRunState.MainStream);
+    }
+    mReplayCopiedBuffers.clear();
 
     // Save current execution state
     const CompiledGraph* saved_graph = mCurrentGraph;
@@ -2279,11 +2303,61 @@ void CompiledExecutor::replay_layer_forward(int layer_idx, long B, long T,
     mInReplay = false;
     mReplayLayerIdx = -1;
 
-    // Defer stack restore — backward ops will read from stack pointers in mSaved.
-    // The stack checkpoint will be restored before the next replay or at end of backward.
-    mHasDeferredReplayCheckpoint = true;
-    mDeferredReplayCheckpoint = replay_checkpoint;
-    mDeferredReplayTempMark = replay_temp_mark;
+    // Eagerly restore the stack checkpoint by first copying any stack-resident
+    // saved tensors to persistent GPU memory. This frees the replay's stack
+    // allocation before backward ops start allocating their temps, preventing
+    // stack OOM on memory-hungry backward ops (e.g., gated delta rule).
+    if (mSaved) {
+        for (auto& [name, tensor] : *mSaved) {
+            if (!tensor.Data) continue;
+            if (!mRunState.Stack.owns(tensor.Data)) continue;
+            // This tensor lives on the stack — copy to persistent memory
+            const std::size_t bytes = tensor.bytes();
+            if (bytes == 0) continue;
+            void* persistent = nullptr;
+            CUDA_CHECK(cudaMallocAsync(&persistent, bytes, mRunState.MainStream));
+            CUDA_CHECK(cudaMemcpyAsync(persistent, tensor.Data, bytes,
+                                       cudaMemcpyDeviceToDevice, mRunState.MainStream));
+            tensor.Data = static_cast<std::byte*>(persistent);
+            mReplayCopiedBuffers.push_back(persistent);
+        }
+    }
+    // Now safe to restore — stack-resident data has been copied
+    mRunState.Stack.restore(replay_checkpoint);
+    if (mTemps.size() > replay_temp_mark) {
+        mTemps.resize(replay_temp_mark);
+    }
+    mHasDeferredReplayCheckpoint = false;
+
+    // Debug: dump saved tensor states after replay
+    static const bool debug_lora_grads = std::getenv("SUROGATE_DEBUG_LORA_GRADS") != nullptr;
+    if ((debug_replay || debug_lora_grads) && mSaved) {
+        CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
+        int null_count = 0, live_count = 0;
+        for (const auto& [sname, stensor] : *mSaved) {
+            int lyr = -1; std::string fld;
+            if (parse_block_param(sname, lyr, fld) && lyr == layer_idx) {
+                if (stensor.Data) {
+                    live_count++;
+                    if (debug_lora_grads && (fld == "ln1_flat" || fld == "full_att_flat")) {
+                        uint16_t vals[4] = {};
+                        long count = stensor.nelem() < 4 ? stensor.nelem() : 4;
+                        cudaMemcpy(vals, stensor.Data, count * sizeof(uint16_t), cudaMemcpyDeviceToHost);
+                        bool nz = false;
+                        for (int i = 0; i < 4; ++i) if (vals[i]) nz = true;
+                        fprintf(stderr, "[REPLAY-DATA] layer=%d %s ptr=%p %s stack=%d\n",
+                                layer_idx, sname.c_str(), (void*)stensor.Data,
+                                nz ? "NON-ZERO" : "ZERO",
+                                (int)mRunState.Stack.owns(stensor.Data));
+                    }
+                } else {
+                    null_count++;
+                    if (debug_replay) fprintf(stderr, "[REPLAY] layer=%d saved NULL: %s\n", layer_idx, sname.c_str());
+                }
+            }
+        }
+        if (debug_replay) fprintf(stderr, "[REPLAY] layer=%d saved stats: live=%d null=%d\n", layer_idx, live_count, null_count);
+    }
 }
 
 
@@ -3859,6 +3933,12 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
         }
         mHasDeferredReplayCheckpoint = false;
     }
+
+    // Free persistent copies from last replay
+    for (void* ptr : mReplayCopiedBuffers) {
+        cudaFreeAsync(ptr, mRunState.MainStream);
+    }
+    mReplayCopiedBuffers.clear();
 
     // Final cleanup - pass -1 to allow full pruning (backward complete)
     mRunState.Stack.restore(initial_checkpoint);

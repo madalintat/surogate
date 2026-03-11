@@ -67,7 +67,7 @@ std::byte* DeviceMemoryStack::allocate(std::size_t amount, const char* name) {
         fprintf(stderr, "[Stack OOM] Allocation summary by name:\n");
         std::unordered_map<std::string, std::pair<size_t, size_t>> name_stats;  // name -> (count, total_bytes)
         for (const auto& rec : mAlloc) {
-            auto& stats = name_stats[rec.Name];
+            auto& stats = name_stats[rec.Name ? rec.Name : "<null>"];
             stats.first++;
             stats.second += rec.Amount;
         }

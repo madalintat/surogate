@@ -393,6 +393,7 @@ private:
     bool mHasDeferredReplayCheckpoint = false;
     DeviceMemoryStack::Checkpoint mDeferredReplayCheckpoint{};
     std::size_t mDeferredReplayTempMark = 0;
+    std::vector<void*> mReplayCopiedBuffers;  // persistent copies of stack-resident saved tensors
 
     // Temporary tensor storage (for stack-allocated tensors)
     std::vector<Tensor> mTemps;

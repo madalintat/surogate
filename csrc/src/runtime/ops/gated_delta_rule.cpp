@@ -343,12 +343,19 @@ void CompiledExecutor::dispatch_chunk_gated_delta_rule_backward(const CompiledOp
         return &mTemps.back();
     };
 
+    if (debug_replay) fprintf(stderr, "[GDR_BWD] allocating outputs B=%ld T=%ld H=%ld K=%ld V=%ld\n", B, T, H, K, V);
     Tensor* d_q = ensure_or_temp(0, q.DType, {B, T, H, K});
+    if (debug_replay) fprintf(stderr, "[GDR_BWD] d_q done\n");
     Tensor* d_k = ensure_or_temp(1, k.DType, {B, T, H, K});
+    if (debug_replay) fprintf(stderr, "[GDR_BWD] d_k done\n");
     Tensor* d_v = ensure_or_temp(2, v.DType, {B, T, H, V});
+    if (debug_replay) fprintf(stderr, "[GDR_BWD] d_v done\n");
     Tensor* d_g = ensure_or_temp(3, g_input.DType, {B, T, H});
+    if (debug_replay) fprintf(stderr, "[GDR_BWD] d_g done\n");
     Tensor* d_beta = ensure_or_temp(4, beta.DType, {B, T, H});
+    if (debug_replay) fprintf(stderr, "[GDR_BWD] d_beta done\n");
     Tensor* d_initial = ensure_or_temp(5, ETensorDType::FP32, {B, H, K, V});
+    if (debug_replay) fprintf(stderr, "[GDR_BWD] d_initial done, about to launch kernels\n");
 
     float scale = op.attrs.delta_rule_scale;
     if (!(scale > 0.0f)) {
@@ -365,6 +372,7 @@ void CompiledExecutor::dispatch_chunk_gated_delta_rule_backward(const CompiledOp
     cudaStream_t stream = mRunState.MainStream;
 
     // Optional L2 normalization recompute (mirrors forward)
+    if (debug_replay) fprintf(stderr, "[GDR_BWD] use_l2norm=%d\n", op.attrs.use_qk_l2norm_in_kernel);
     const bool use_l2norm = op.attrs.use_qk_l2norm_in_kernel;
     void* q_eff = q.Data;
     void* k_eff = k.Data;
@@ -373,6 +381,7 @@ void CompiledExecutor::dispatch_chunk_gated_delta_rule_backward(const CompiledOp
     Tensor q_norm_bwd, k_norm_bwd, q_rstd_bwd, k_rstd_bwd;
     Tensor dq_norm_buf, dk_norm_buf;
     if (use_l2norm) {
+        if (debug_replay) fprintf(stderr, "[GDR_BWD] l2norm: allocating temps...\n");
         q_norm_bwd = mRunState.temp_alloc(q.DType, {B, T, H, K});
         mTemps.push_back(q_norm_bwd);
         q_rstd_bwd = mRunState.temp_alloc(ETensorDType::FP32, {B, T, H});
@@ -381,6 +390,7 @@ void CompiledExecutor::dispatch_chunk_gated_delta_rule_backward(const CompiledOp
         mTemps.push_back(k_norm_bwd);
         k_rstd_bwd = mRunState.temp_alloc(ETensorDType::FP32, {B, T, H});
         mTemps.push_back(k_rstd_bwd);
+        if (debug_replay) fprintf(stderr, "[GDR_BWD] l2norm: launching q_norm kernel...\n");
         {
             void* x = q.Data; void* y = q_norm_bwd.Data; void* r = q_rstd_bwd.Data;
             int32_t T_val = static_cast<int32_t>(T);
@@ -388,6 +398,7 @@ void CompiledExecutor::dispatch_chunk_gated_delta_rule_backward(const CompiledOp
             mGdrKernels.l2norm_fwd_q({static_cast<unsigned>(NT), static_cast<unsigned>(BH), 1},
                                      args, 4, stream);
         }
+        if (debug_replay) fprintf(stderr, "[GDR_BWD] l2norm: launching k_norm kernel...\n");
         {
             void* x = k.Data; void* y = k_norm_bwd.Data; void* r = k_rstd_bwd.Data;
             int32_t T_val = static_cast<int32_t>(T);
@@ -395,18 +406,29 @@ void CompiledExecutor::dispatch_chunk_gated_delta_rule_backward(const CompiledOp
             mGdrKernels.l2norm_fwd_q({static_cast<unsigned>(NT), static_cast<unsigned>(BH), 1},
                                      args, 4, stream);
         }
+        if (debug_replay) fprintf(stderr, "[GDR_BWD] l2norm: done, allocating dq/dk norm buffers...\n");
         q_eff = q_norm_bwd.Data;
         k_eff = k_norm_bwd.Data;
         // Backward pipeline writes dq_norm/dk_norm to temp buffers
-        dq_norm_buf = mRunState.temp_alloc(q.DType, {B, T, H, K});
-        mTemps.push_back(dq_norm_buf);
-        dk_norm_buf = mRunState.temp_alloc(k.DType, {B, T, H, K});
-        mTemps.push_back(dk_norm_buf);
+        try {
+            if (debug_replay) fprintf(stderr, "[GDR_BWD] l2norm: temp_alloc dq_norm q.DType=%d\n", static_cast<int>(q.DType));
+            dq_norm_buf = mRunState.temp_alloc(q.DType, {B, T, H, K});
+            if (debug_replay) fprintf(stderr, "[GDR_BWD] l2norm: dq_norm_buf.Data=%p\n", dq_norm_buf.Data);
+            mTemps.push_back(dq_norm_buf);
+            dk_norm_buf = mRunState.temp_alloc(k.DType, {B, T, H, K});
+            if (debug_replay) fprintf(stderr, "[GDR_BWD] l2norm: dk_norm_buf.Data=%p\n", dk_norm_buf.Data);
+            mTemps.push_back(dk_norm_buf);
+        } catch (const std::exception& e) {
+            fprintf(stderr, "[GDR_BWD] l2norm temp_alloc FAILED: %s\n", e.what());
+            throw;
+        }
         dq_data = dq_norm_buf.Data;
         dk_data = dk_norm_buf.Data;
+        if (debug_replay) fprintf(stderr, "[GDR_BWD] l2norm path complete\n");
     }
 
     // ---- Recompute forward intermediates ----
+    if (debug_replay) fprintf(stderr, "[GDR_BWD] recomputing forward intermediates...\n");
     // g_cum
     Tensor g_cum = mRunState.temp_alloc(ETensorDType::FP32, {B, T, H});
     mTemps.push_back(g_cum);
@@ -475,6 +497,7 @@ void CompiledExecutor::dispatch_chunk_gated_delta_rule_backward(const CompiledOp
     }
 
     // ---- Backward pipeline ----
+    if (debug_replay) fprintf(stderr, "[GDR_BWD] starting backward pipeline...\n");
 
     // bwd_dv_local
     {

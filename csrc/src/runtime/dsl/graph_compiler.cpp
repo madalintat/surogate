@@ -2054,7 +2054,7 @@ void GraphCompiler::build_tensor_metadata(CompiledGraph& graph) {
             meta.flags |= TensorMeta::kMoeGather;
         }
 
-        // Check "d_blocks[N]." pattern
+        // Check "d_blocks[N]." or "d_layerN." pattern (gradient block tensors)
         if (name.rfind("d_blocks[", 0) == 0) {
             meta.flags |= TensorMeta::kDBlocks;
             auto bracket_pos = name.find('[');
@@ -2067,7 +2067,19 @@ void GraphCompiler::build_tensor_metadata(CompiledGraph& graph) {
                 }
             }
         }
-        // Check "blocks[N]." pattern (non-gradient)
+        else if (name.rfind("d_layer", 0) == 0) {
+            // "d_layer{N}.xxx" — gradient of cross-layer connector
+            meta.flags |= TensorMeta::kDBlocks;
+            auto dot_pos = name.find('.', 7);  // skip "d_layer"
+            if (dot_pos != std::string::npos && dot_pos > 7) {
+                try {
+                    meta.block_layer_idx = std::stoi(name.substr(7, dot_pos - 7));
+                } catch (...) {
+                    meta.block_layer_idx = -1;
+                }
+            }
+        }
+        // Check "blocks[N]." or "layerN." pattern (non-gradient block tensors)
         else if (name.rfind("blocks[", 0) == 0) {
             meta.flags |= TensorMeta::kBlocks;
             auto bracket_pos = name.find('[');
@@ -2075,6 +2087,18 @@ void GraphCompiler::build_tensor_metadata(CompiledGraph& graph) {
             if (bracket_pos != std::string::npos && close_pos != std::string::npos && close_pos > bracket_pos) {
                 try {
                     meta.block_layer_idx = std::stoi(name.substr(bracket_pos + 1, close_pos - bracket_pos - 1));
+                } catch (...) {
+                    meta.block_layer_idx = -1;
+                }
+            }
+        }
+        else if (name.rfind("layer", 0) == 0 && name.size() > 5 && std::isdigit(name[5])) {
+            // "layer{N}.xxx" — cross-layer connector with parseable layer index
+            meta.flags |= TensorMeta::kBlocks;
+            auto dot_pos = name.find('.', 5);  // skip "layer"
+            if (dot_pos != std::string::npos && dot_pos > 5) {
+                try {
+                    meta.block_layer_idx = std::stoi(name.substr(5, dot_pos - 5));
                 } catch (...) {
                     meta.block_layer_idx = -1;
                 }

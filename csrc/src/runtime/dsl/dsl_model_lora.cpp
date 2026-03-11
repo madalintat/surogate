@@ -360,6 +360,40 @@ void DslModel::calculate_lora_gradient_norm(NCCLCommunicator& comm, float grad_c
 
     internal::wait_event_if_not_capturing(stream, rs.BackwardDone);
 
+    // Debug: check if LoRA gradient buffers contain non-zero data
+    static const bool debug_lora_grads = std::getenv("SUROGATE_DEBUG_LORA_GRADS") != nullptr;
+    if (debug_lora_grads) {
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        for (int l = 0; l < mModelConfig.NumLayers; ++l) {
+            bool unused = false;
+            auto& g = mLoRAGrads->get_block_full(l, stream, comm, unused);
+            auto check_grad = [&](const char* name, const auto& layer) {
+                if (!layer.has_value()) return;
+                auto& A = layer->A;
+                auto& B = layer->B;
+                if (A.Data && A.nelem() > 0) {
+                    long count = A.nelem() < 8 ? A.nelem() : 8;
+                    std::vector<uint16_t> host(static_cast<size_t>(count));
+                    CUDA_CHECK(cudaMemcpy(host.data(), A.Data, host.size() * sizeof(uint16_t), cudaMemcpyDeviceToHost));
+                    bool all_zero = true;
+                    for (auto v : host) if (v != 0) { all_zero = false; break; }
+                    if (l == 0 || l == 23 || !all_zero) {
+                        fprintf(stderr, "[LORA-GRAD] layer=%d %s.A nelem=%ld first8=[%04x,%04x,%04x,%04x,%04x,%04x,%04x,%04x] %s\n",
+                                l, name, A.nelem(), host.size()>0?host[0]:0, host.size()>1?host[1]:0,
+                                host.size()>2?host[2]:0, host.size()>3?host[3]:0,
+                                host.size()>4?host[4]:0, host.size()>5?host[5]:0,
+                                host.size()>6?host[6]:0, host.size()>7?host[7]:0,
+                                all_zero ? "ZERO" : "NON-ZERO");
+                    }
+                }
+            };
+            check_grad("attn_q", g.attention.q);
+            check_grad("attn_o", g.attention.o);
+            check_grad("mlp_down", g.mlp.down);
+            check_grad("mlp_up", g.mlp.up);
+        }
+    }
+
     Tensor& buf = lrs.norm_buffer;
     fill_zero(buf, stream);
 

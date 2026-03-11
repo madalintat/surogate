@@ -390,6 +390,11 @@ void DslModel::backward(Tensor inputs, Tensor targets, NCCLCommunicator& comm, i
 
     auto hook = [this, &comm](int layer_idx, bool accumulate, cudaStream_t stream, modules::BackwardHookPoint point, void* context) {
         (void)context;
+        static const bool debug_lora_grads = std::getenv("SUROGATE_DEBUG_LORA_GRADS") != nullptr;
+        if (debug_lora_grads) {
+            fprintf(stderr, "[HOOK-ENTRY] layer=%d point=%d(%s) accum=%d\n",
+                    layer_idx, static_cast<int>(point), modules::hook_point_name(point), (int)accumulate);
+        }
         const auto& cfg = mModelConfig;
         auto& rs = *mRunState;
         const int B = (int)rs.B;
@@ -1091,9 +1096,11 @@ void DslModel::step_with_custom_loss(Tensor inputs, Tensor position_ids, Tensor 
 
     mLoRAGrads->start_micro_step(main_stream, micro_step, grad_accum_steps);
 
+    static const bool debug_lora_grads = std::getenv("SUROGATE_DEBUG_LORA_GRADS") != nullptr;
     modules::BackwardHook hook = [this, &comm](int layer_idx, bool accumulate, cudaStream_t stream,
                                modules::BackwardHookPoint point, void* context) {
         (void)context;
+        static const bool debug_lora_grads = std::getenv("SUROGATE_DEBUG_LORA_GRADS") != nullptr;
         const auto& cfg = mModelConfig;
         auto& rs = *mRunState;
         const int B = (int)rs.B;
@@ -1120,13 +1127,25 @@ void DslModel::step_with_custom_loss(Tensor inputs, Tensor position_ids, Tensor 
 
         switch (point) {
             case modules::BackwardHookPoint::AfterMLPDownBackward: {
-                if (!lora_block.mlp.down.has_value()) break;
+                if (!lora_block.mlp.down.has_value()) {
+                    if (debug_lora_grads) fprintf(stderr, "[HOOK-SKIP] layer=%d MLPDown: no lora_block.mlp.down\n", layer_idx);
+                    break;
+                }
                 bool lora_accum = false;
                 auto& lora_grads = mLoRAGrads->get_block_full(layer_idx, stream, comm, lora_accum);
                 lora_accum = lora_accum || accumulate;
-                if (!lora_grads.mlp.down.has_value()) break;
+                if (!lora_grads.mlp.down.has_value()) {
+                    if (debug_lora_grads) fprintf(stderr, "[HOOK-SKIP] layer=%d MLPDown: no lora_grads.mlp.down\n", layer_idx);
+                    break;
+                }
                 auto& a = rs.simplified_acts(layer_idx);
                 auto& da = rs.simplified_grads(layer_idx);
+                if (debug_lora_grads) {
+                    fprintf(stderr, "[HOOK-RUN] layer=%d MLPDown: dA.Data=%p dB.Data=%p dx(d_swiglu).Data=%p dL_dy(d_res_ffn).Data=%p x(swiglu).Data=%p A.Data=%p B.Data=%p accum=%d\n",
+                            layer_idx, (void*)lora_grads.mlp.down->A.Data, (void*)lora_grads.mlp.down->B.Data,
+                            (void*)da.d_swiglu.Data, (void*)da.d_res_ffn.Data, (void*)a.swiglu.Data,
+                            (void*)lora_block.mlp.down->A.Data, (void*)lora_block.mlp.down->B.Data, (int)lora_accum);
+                }
                 modules::detail::backward_lora_layer(
                     lora_grads.mlp.down->A, lora_grads.mlp.down->B,
                     da.d_swiglu, da.d_res_ffn, 0, a.swiglu,

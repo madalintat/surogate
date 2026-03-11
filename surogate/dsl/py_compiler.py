@@ -1196,17 +1196,19 @@ def _compile_merged_activation_layout(
         gradient_slots.extend(model_layout.gradient_slots)
         alias_map.update(model_layout.alias_map)
 
-    # 2. Find block spec and compile its activation slots
-    # Look for the 'blocks' param (or similar array param that references a block type)
-    block_spec = None
+    # 2. Find block specs and compile their activation slots.
+    # Models with HybridStackedBlocks (e.g., Qwen3.5) may have multiple block array
+    # params (attention + linear). Merge activation slots from ALL block types,
+    # deduplicating by slot name so common slots (ln1, ln2, mlp_up, etc.) appear once.
+    seen_slot_names: set = set()
+    seen_grad_names: set = set()
     for param_name, param_spec in spec.params.items():
-        if param_spec.kind == ParamKind.ARRAY and param_spec.element_type:
-            # This is an array of blocks - get the block spec
-            block_spec = get_block_spec(param_spec.element_type)
-            if block_spec is not None:
-                break
+        if param_spec.kind != ParamKind.ARRAY or not param_spec.element_type:
+            continue
+        block_spec = get_block_spec(param_spec.element_type)
+        if block_spec is None or not block_spec.activations:
+            continue
 
-    if block_spec and block_spec.activations:
         # Build dim_map for the block if we have its python_class
         block_dim_map: Dict[str, str] = {}
         if block_spec.python_class:
@@ -1224,23 +1226,31 @@ def _compile_merged_activation_layout(
             block_spec.activations, config, block_dim_map or dim_map
         )
 
-        # Add block slots with scope="block"
-        # The slot_index continues from where model slots ended
+        # Add block slots with scope="block", deduplicating by name
         block_slot_start = len(slots)
-        for i, slot in enumerate(block_layout.slots):
-            # Ensure block slots have scope="block"
+        added = 0
+        for slot in block_layout.slots:
+            if slot.name in seen_slot_names:
+                continue
+            seen_slot_names.add(slot.name)
             if slot.scope in ("block", ""):
                 slot.scope = "block"
-            slot.slot_index = block_slot_start + i
+            slot.slot_index = block_slot_start + added
             slots.append(slot)
+            added += 1
 
-        # Add block gradient slots
+        # Add block gradient slots, deduplicating
         block_grad_start = len(gradient_slots)
-        for i, slot in enumerate(block_layout.gradient_slots):
+        added = 0
+        for slot in block_layout.gradient_slots:
+            if slot.name in seen_grad_names:
+                continue
+            seen_grad_names.add(slot.name)
             if slot.scope in ("gradient", ""):
                 slot.scope = "gradient"
-            slot.slot_index = block_grad_start + i
+            slot.slot_index = block_grad_start + added
             gradient_slots.append(slot)
+            added += 1
 
         # Merge alias maps
         alias_map.update(block_layout.alias_map)

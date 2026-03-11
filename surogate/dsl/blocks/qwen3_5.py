@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 from ..tensor_type import Tensor
-from ..decorators import block, forward, Param
+from ..decorators import block, forward, Param, Activation, Gradient
 from ..graph_builder import graph
-from ..dim import B, T
+from ..dim import Dim, B, T
 
 
 def _resolve_rotary_dim(head_size: int, partial_rotary_factor: float) -> int:
@@ -46,17 +46,17 @@ class Qwen3_5AttentionBlock:
             mrope_section = (11, 11, 10)
         self.mrope_section = list(mrope_section)
 
-        self.C = d_model
-        self.Hq = num_query_heads
-        self.Hkv = num_kv_heads
-        self.D = head_size
-        self.M = d_ff
-        self.MaxSeq = max_seq
+        self.C = Dim("C")
+        self.Hq = Dim("Hq")
+        self.Hkv = Dim("Hkv")
+        self.D = Dim("D")
+        self.M = Dim("M")
+        self.MaxSeq = Dim("MaxSeq")
         self.AttnDim = self.Hq * self.D
         self.QProjDim = 2 * self.AttnDim
         self.KVDim = self.Hkv * self.D
         self.MUp = 2 * self.M
-        self.RotaryDim = _resolve_rotary_dim(self.D, self.partial_rotary_factor)
+        self.RotaryDim = _resolve_rotary_dim(head_size, partial_rotary_factor)
 
     # Norm / MLP
     ln1_weight = Param(Tensor["C"], quantizable=False)
@@ -76,6 +76,141 @@ class Qwen3_5AttentionBlock:
     q_norm_weight = Param(Tensor["D"], quantizable=False)
     k_norm_weight = Param(Tensor["D"], quantizable=False)
     rope_freqs = Param(Tensor["MaxSeq", "RotaryDim // 2", 2, "fp32"], frozen=True, quantizable=False)
+
+    # =========================================================================
+    # Activation slots (forward pass intermediate tensors)
+    # =========================================================================
+
+    # Pre-attention normalization
+    ln1 = Activation(
+        Tensor["B", "T", "C"],
+        aliases=["ln1_flat"],
+        recompute=True,
+        recompute_from=["res_ffn", "ln1_rstd", "@param:ln1_weight"],
+        recompute_op="rmsnorm_apply_saved",
+        recompute_policy="always",
+        share_policy="when_recomputed",
+    )
+    ln1_rstd = Activation(
+        Tensor["B", "T"], dtype="fp32", save=True,
+        share_policy="per_layer",
+    )
+
+    # Attention output (flash_attention)
+    att = Activation(
+        Tensor["B", "T", "AttnDim"],
+        aliases=["att_flat"],
+        save=True,
+        recompute=True,
+        recompute_group="attn_fwd",
+        recompute_outputs=["att", "lse"],
+        recompute_from=["qkv_rope"],
+        recompute_op="flash_attention",
+        recompute_attrs={"attn_impl": "cudnn"},
+        recompute_policy="fft_only",
+        share_policy="always_recompute",
+    )
+    lse = Activation(
+        Tensor["B", "Hq", "T"],
+        dtype="fp32",
+        save=True,
+        recompute=True,
+        recompute_group="attn_fwd",
+        recompute_policy="fft_only",
+        share_policy="always_recompute",
+    )
+    att_out = Activation(
+        Tensor["B", "T", "C"],
+        aliases=["att_out_flat"],
+        recompute=True,
+        recompute_from=["att", "@param:full_out_weight"],
+        recompute_op="matmul",
+        recompute_attrs={"matmul_op": "attn_out", "transpose": "NT"},
+        recompute_policy="always",
+        lora_targets=["o"],
+        share_policy="when_recomputed",
+    )
+
+    # First residual
+    res_att = Activation(
+        Tensor["B", "T", "C"],
+        aliases=["residual_att"],
+        recompute=True,
+        recompute_group="ln2_fused",
+        recompute_outputs=["res_att", "ln2"],
+        recompute_from=["res_ffn", "att_out", "ln2_rstd", "@param:ln2_weight"],
+        recompute_op="fused_residual_rmsnorm_apply_saved",
+        recompute_policy="always",
+        share_policy="when_recomputed",
+    )
+
+    # Pre-MLP normalization
+    ln2 = Activation(
+        Tensor["B", "T", "C"],
+        aliases=["ln2_flat"],
+        recompute=True,
+        recompute_group="ln2_fused",
+        recompute_policy="always",
+        share_policy="when_recomputed",
+    )
+    ln2_rstd = Activation(
+        Tensor["B", "T"], dtype="fp32", save=True,
+        share_policy="per_layer",
+    )
+
+    # MLP
+    mlp_up = Activation(
+        Tensor["B", "T", "MUp"],
+        aliases=["mlp_up_flat"],
+        recompute=True,
+        recompute_from=["ln2", "@param:mlp_up_weight"],
+        recompute_op="matmul",
+        recompute_attrs={"matmul_op": "mlp_up", "transpose": "NT"},
+        recompute_policy="always",
+        lora_targets=["up", "gate"],
+        share_policy="when_recomputed",
+    )
+    swiglu = Activation(
+        Tensor["B", "T", "M"],
+        aliases=["swiglu_flat"],
+        recompute=True,
+        recompute_from=["mlp_up"],
+        recompute_op="swiglu",
+        recompute_attrs={"activation": "swiglu"},
+        recompute_policy="always",
+        share_policy="when_recomputed",
+    )
+    mlp_down = Activation(
+        Tensor["B", "T", "C"],
+        aliases=["mlp_down_flat"],
+        recompute=True,
+        recompute_from=["swiglu", "@param:mlp_down_weight"],
+        recompute_op="matmul",
+        recompute_attrs={"matmul_op": "mlp_down", "transpose": "NT"},
+        recompute_policy="always",
+        lora_targets=["down"],
+        share_policy="when_recomputed",
+    )
+
+    # Second residual (block output)
+    res_ffn = Activation(
+        Tensor["B", "T", "C"],
+        aliases=["residual_ffn"],
+        share_policy="per_layer",
+    )
+
+    # =========================================================================
+    # Gradient slots
+    # =========================================================================
+
+    d_ln1 = Gradient(Tensor["B", "T", "C"], gradient_of="ln1")
+    d_att = Gradient(Tensor["B", "T", "AttnDim"], gradient_of="att")
+    d_ln2 = Gradient(Tensor["B", "T", "C"], gradient_of="ln2")
+    d_mlp_up = Gradient(Tensor["B", "T", "MUp"], gradient_of="mlp_up")
+    d_swiglu = Gradient(Tensor["B", "T", "M"], gradient_of="swiglu")
+    d_mlp_down = Gradient(Tensor["B", "T", "C"], gradient_of="mlp_down")
+    d_res_att = Gradient(Tensor["B", "T", "C"], gradient_of="res_att")
+    d_res_ffn = Gradient(Tensor["B", "T", "C"], gradient_of="res_ffn")
 
     @forward
     def forward(
@@ -128,7 +263,7 @@ class Qwen3_5AttentionBlock:
                 v_proj = g.matmul(ln1_flat, "full_v_proj_weight", transpose="NT", out_name="full_v_proj")
 
             q_proj_4d = g.view(q_proj, shape=[B, T, self.Hq, 2 * self.D], out_name="full_q_proj_4d")
-            q, gate_4d = g.split(q_proj_4d, split_size=[self.D, self.D], dim=3)
+            q, gate_4d = g.split(q_proj_4d, split_size=[self.head_size, self.head_size], dim=3)
             q = g.view(q, shape=[B, T, self.Hq, self.D], out_name="full_q")
             gate_4d = g.view(gate_4d, shape=[B, T, self.Hq, self.D], out_name="full_gate")
             k = g.view(k_proj, shape=[B, T, self.Hkv, self.D], out_name="full_k")
@@ -151,12 +286,12 @@ class Qwen3_5AttentionBlock:
                 mrope_section=self.mrope_section,
                 out_name="qkv_rope",
             )
-            attn_out, _ = g.flash_attention(qkv_rope, causal=True, out_name="full_att", lse_name="full_lse")
+            attn_out, _ = g.flash_attention(qkv_rope, causal=True, out_name="att", lse_name="lse")
 
-            attn_4d = g.view(attn_out, shape=[B, T, self.Hq, self.D], out_name="full_att_4d")
+            attn_4d = g.view(attn_out, shape=[B, T, self.Hq, self.D], out_name="att_4d")
             gate_sigmoid = g.sigmoid(gate_4d)
             gated_attn_4d = g.mul(attn_4d, gate_sigmoid)
-            gated_attn_flat = g.view(gated_attn_4d, shape=[B * T, self.AttnDim], out_name="full_att_flat")
+            gated_attn_flat = g.view(gated_attn_4d, shape=[B * T, self.AttnDim], out_name="att_flat")
 
             if self.use_qkv_bias:
                 attn_out_flat = g.matmul_bias(
@@ -164,16 +299,16 @@ class Qwen3_5AttentionBlock:
                     "full_out_weight",
                     "full_out_bias",
                     transpose="NT",
-                    out_name="full_att_out_flat",
+                    out_name="att_out_flat",
                 )
             else:
                 attn_out_flat = g.matmul(
                     gated_attn_flat,
                     "full_out_weight",
                     transpose="NT",
-                    out_name="full_att_out_flat",
+                    out_name="att_out_flat",
                 )
-            attn_out_proj = g.view(attn_out_flat, shape=[B, T, self.C], out_name="full_att_out")
+            attn_out_proj = g.view(attn_out_flat, shape=[B, T, self.C], out_name="att_out")
 
             ln2_weight_eff = g.add("ln2_weight", ones_c, out_name="ln2_weight_eff")
             res_att, ln2_out, _ = g.fused_residual_rmsnorm(
@@ -228,8 +363,8 @@ class Qwen3_5LinearBlock:
                 "Qwen3_5LinearBlock requires linear_num_value_heads to be divisible by linear_num_key_heads"
             )
 
-        self.C = d_model
-        self.M = d_ff
+        self.C = Dim("C")
+        self.M = Dim("M")
         self.MUp = 2 * self.M
         self.Hk = self.linear_num_key_heads
         self.Hv = self.linear_num_value_heads
@@ -257,6 +392,104 @@ class Qwen3_5LinearBlock:
     lin_dt_bias = Param(Tensor["Hv", "fp32"], quantizable=False)
     lin_norm_weight = Param(Tensor["Vd"], quantizable=False)
     lin_out_weight = Param(Tensor["C", "ValueDim"])
+
+    # =========================================================================
+    # Activation slots (shared MLP part — same names as AttentionBlock)
+    # =========================================================================
+
+    ln1 = Activation(
+        Tensor["B", "T", "C"],
+        aliases=["ln1_flat"],
+        recompute=True,
+        recompute_from=["res_ffn", "ln1_rstd", "@param:ln1_weight"],
+        recompute_op="rmsnorm_apply_saved",
+        recompute_policy="always",
+        share_policy="when_recomputed",
+    )
+    ln1_rstd = Activation(
+        Tensor["B", "T"], dtype="fp32", save=True,
+        share_policy="per_layer",
+    )
+
+    # First residual
+    res_att = Activation(
+        Tensor["B", "T", "C"],
+        aliases=["residual_att"],
+        recompute=True,
+        recompute_group="ln2_fused",
+        recompute_outputs=["res_att", "ln2"],
+        recompute_from=["res_ffn", "lin_att_out", "ln2_rstd", "@param:ln2_weight"],
+        recompute_op="fused_residual_rmsnorm_apply_saved",
+        recompute_policy="always",
+        share_policy="when_recomputed",
+    )
+
+    # Pre-MLP normalization
+    ln2 = Activation(
+        Tensor["B", "T", "C"],
+        aliases=["ln2_flat"],
+        recompute=True,
+        recompute_group="ln2_fused",
+        recompute_policy="always",
+        share_policy="when_recomputed",
+    )
+    ln2_rstd = Activation(
+        Tensor["B", "T"], dtype="fp32", save=True,
+        share_policy="per_layer",
+    )
+
+    # MLP
+    mlp_up = Activation(
+        Tensor["B", "T", "MUp"],
+        aliases=["mlp_up_flat"],
+        recompute=True,
+        recompute_from=["ln2", "@param:mlp_up_weight"],
+        recompute_op="matmul",
+        recompute_attrs={"matmul_op": "mlp_up", "transpose": "NT"},
+        recompute_policy="always",
+        lora_targets=["up", "gate"],
+        share_policy="when_recomputed",
+    )
+    swiglu = Activation(
+        Tensor["B", "T", "M"],
+        aliases=["swiglu_flat"],
+        recompute=True,
+        recompute_from=["mlp_up"],
+        recompute_op="swiglu",
+        recompute_attrs={"activation": "swiglu"},
+        recompute_policy="always",
+        share_policy="when_recomputed",
+    )
+    mlp_down = Activation(
+        Tensor["B", "T", "C"],
+        aliases=["mlp_down_flat"],
+        recompute=True,
+        recompute_from=["swiglu", "@param:mlp_down_weight"],
+        recompute_op="matmul",
+        recompute_attrs={"matmul_op": "mlp_down", "transpose": "NT"},
+        recompute_policy="always",
+        lora_targets=["down"],
+        share_policy="when_recomputed",
+    )
+
+    # Second residual (block output)
+    res_ffn = Activation(
+        Tensor["B", "T", "C"],
+        aliases=["residual_ffn"],
+        share_policy="per_layer",
+    )
+
+    # =========================================================================
+    # Gradient slots
+    # =========================================================================
+
+    d_ln1 = Gradient(Tensor["B", "T", "C"], gradient_of="ln1")
+    d_ln2 = Gradient(Tensor["B", "T", "C"], gradient_of="ln2")
+    d_mlp_up = Gradient(Tensor["B", "T", "MUp"], gradient_of="mlp_up")
+    d_swiglu = Gradient(Tensor["B", "T", "M"], gradient_of="swiglu")
+    d_mlp_down = Gradient(Tensor["B", "T", "C"], gradient_of="mlp_down")
+    d_res_att = Gradient(Tensor["B", "T", "C"], gradient_of="res_att")
+    d_res_ffn = Gradient(Tensor["B", "T", "C"], gradient_of="res_ffn")
 
     @forward
     def forward(
