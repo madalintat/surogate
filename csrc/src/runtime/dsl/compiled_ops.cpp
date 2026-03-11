@@ -977,10 +977,14 @@ void CompiledExecutor::prepare_saved_buffers_for_capture(
             continue;
         }
 
+        // LoRA hook activations (att, swiglu) need persistence for backward LoRA
+        // gradient computation — BUT only when forward replay is NOT active.
+        // When replay regenerates these tensors, no persistent buffer is needed.
+        const bool force_lora_hook = !forward_replay_active && is_lora_hook_activation(name);
         const bool force_persist_name =
             (name == "xF_flat" || name == "xF" || name == "ln_final" ||
              name == "ln_final_rstd" || name == "residual_final" || name == "final_residual" ||
-             is_lora_hook_activation(name));
+             force_lora_hook);
         const bool is_moe_tensor = (name.find("moe_") != std::string::npos ||
                                     name.find("scatter_indices") != std::string::npos ||
                                     name.find("routing_weights") != std::string::npos ||
@@ -1248,10 +1252,14 @@ void CompiledExecutor::save_tensors(const std::vector<std::string>& save_list, b
     };
 
     for (const auto& name : save_list) {
+        // LoRA hook activations (att, swiglu) need persistence for backward LoRA
+        // gradient computation — BUT only when forward replay is NOT active.
+        // When replay regenerates these tensors, no persistent buffer is needed.
+        const bool force_lora_hook = !forward_replay_active && is_lora_hook_activation(name);
         const bool force_persist_name =
             (name == "xF_flat" || name == "xF" || name == "ln_final" ||
              name == "ln_final_rstd" || name == "residual_final" || name == "final_residual" ||
-             is_lora_hook_activation(name));
+             force_lora_hook);
         // Skip tensors already saved directly by dispatch (e.g. mamba_gated_rmsnorm saves rstd/normed),
         // unless we are forcing a persistent copy to replace metadata-only entries.
         auto saved_it = mSaved->find(name);

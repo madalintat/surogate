@@ -713,6 +713,10 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
             self.use_cuda_graphs = False
             logger.info("[offload_master]: disabling CUDA graphs (cross-stream weight prefetch is incompatible with graph capture).")
 
+        if self.sample_packing and self.use_cuda_graphs:
+            self.use_cuda_graphs = False
+            logger.info("[sample_packing]: disabling CUDA graphs (packed sequences use Flash Attention varlen which bypasses graph replay).")
+
         if self.debug_time_breakdown and self.use_cuda_graphs:
             self.use_cuda_graphs = False
             logger.info("[debug_time_breakdown]: disabling CUDA graphs for accurate per-phase timing.")
