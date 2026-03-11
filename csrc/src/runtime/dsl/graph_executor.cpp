@@ -617,7 +617,9 @@ void GraphExecutor::init_compiled_execution() {
     mCompiledExecutor->set_recompute_fn(
         [this](int layer_idx, long B, long T, bool /*use_graph*/) {
             if (mCompiledForward) {
-                mCompiledExecutor->replay_layer_forward(layer_idx, B, T, *mCompiledForward, nullptr);
+                mCompiledExecutor->replay_layer_forward(
+                    layer_idx, B, T, *mCompiledForward,
+                    mHasReplayForwardHook ? &mReplayForwardHook : nullptr);
             }
         });
     mCompiledExecutor->set_fp8_cache(&mFP8WeightCache);
@@ -730,6 +732,15 @@ const std::unordered_map<std::string, size_t>& GraphExecutor::saved_buffers_size
 
 void GraphExecutor::execute_forward(long B, long T, NCCLCommunicator& comm, bool full,
                                     const modules::ForwardHook* hook) {
+    // Store forward hook for replay (LoRA deltas must be applied during recompute)
+    if (hook && *hook) {
+        mReplayForwardHook = *hook;
+        mHasReplayForwardHook = true;
+    } else {
+        mReplayForwardHook = {};
+        mHasReplayForwardHook = false;
+    }
+
     compile_graphs(B, T);
 
     if (!mCompiledForward || !mCompiledExecutor) {

@@ -342,23 +342,23 @@ void CompiledExecutor::dispatch_matmul(const CompiledOp& op, const modules::Forw
 
     // Hook invocation
     if (hook && *hook && op.attrs.forward_hook_point.has_value()) {
-        // In stack/recompute mode, some activation slots are represented as shape-only
-        // tensors with Data=nullptr. Bind them to the just-produced matmul output so
-        // forward hooks (LoRA) can safely write into the live buffer.
+        // Bind activation slots to the just-produced matmul output so forward hooks
+        // (LoRA) write into the live buffer. During replay, acts may already point to
+        // the original forward's buffer — force-update so LoRA targets the replay tensor.
         if (op.attrs.layer_idx >= 0 && op.attrs.layer_idx < mConfig.NumLayers) {
             auto& acts = mRunState.simplified_acts(op.attrs.layer_idx);
             switch (*op.attrs.forward_hook_point) {
                 case modules::ForwardHookPoint::AfterQKVProjection:
-                    if (!acts.qkv.Data) acts.qkv.Data = out.Data;
+                    acts.qkv.Data = out.Data;
                     break;
                 case modules::ForwardHookPoint::AfterAttnOutProjection:
-                    if (!acts.att_out.Data) acts.att_out.Data = out.Data;
+                    acts.att_out.Data = out.Data;
                     break;
                 case modules::ForwardHookPoint::AfterMLPUpProjection:
-                    if (!acts.mlp_up.Data) acts.mlp_up.Data = out.Data;
+                    acts.mlp_up.Data = out.Data;
                     break;
                 case modules::ForwardHookPoint::AfterMLPDownProjection:
-                    if (!acts.mlp_down.Data) acts.mlp_down.Data = out.Data;
+                    acts.mlp_down.Data = out.Data;
                     break;
                 default:
                     break;

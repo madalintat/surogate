@@ -390,7 +390,7 @@ class NemotronHAttentionBlock:
         Tensor["B", "T", "QKV"],
         aliases=["qkv_flat"],
         save=True,
-        share_policy="when_recomputed",
+        share_policy="per_layer",
     )
     qkv_rope = Activation(
         Tensor["B", "T", "QKV"],

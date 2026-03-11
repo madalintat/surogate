@@ -98,7 +98,7 @@ void CompiledExecutor::dispatch_fused_residual_rmsnorm(const CompiledOp& op) {
     // per-layer residual from ResidualManager as the residual input, with a zero "input"
     // so the kernel computes: residual_out = stored_res + 0 = stored_res, y = rmsnorm(stored_res).
     // This applies to both standard LN1 (dense models) and hybrid norm (Nemotron-H).
-    if (mInReplay && !is_ln2_fwd && !is_hybrid_norm && fwd_layer_idx >= 0) {
+    if (mInReplay && !is_ln2_fwd && fwd_layer_idx >= 0) {
         Tensor& stored_res_ffn = mRunState.get_residual(fwd_layer_idx, mRunState.MainStream);
         if (stored_res_ffn.Data) {
             // Use stored residual as residual_in, zero out input

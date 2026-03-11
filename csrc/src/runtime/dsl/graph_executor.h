@@ -247,6 +247,10 @@ private:
     // Hook context (opaque pointer passed to hook callbacks)
     void* mHookContext = nullptr;
 
+    // Forward hook stored for replay (LoRA deltas must be applied during recompute)
+    modules::ForwardHook mReplayForwardHook;
+    bool mHasReplayForwardHook = false;
+
     // Optional weight manager for streaming/sharding (owned by DslModel)
     DslWeightManager* mWeightManager = nullptr;
 

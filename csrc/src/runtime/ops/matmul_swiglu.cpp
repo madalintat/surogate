@@ -86,6 +86,13 @@ void CompiledExecutor::dispatch_matmul_swiglu(const CompiledOp& op, const module
 
     // Hook invocation (AfterMLPUpProjection should observe the projection output before activation).
     if (hook && *hook && op.attrs.forward_hook_point.has_value()) {
+        // Bind activation slot so forward hooks (LoRA) write into the live buffer.
+        // During replay, acts may already point to the original forward's buffer —
+        // force-update so LoRA targets the replay tensor.
+        if (op.attrs.layer_idx >= 0 && op.attrs.layer_idx < mConfig.NumLayers) {
+            auto& acts = mRunState.simplified_acts(op.attrs.layer_idx);
+            acts.mlp_up.Data = up_out.Data;
+        }
         (*hook)(op.attrs.layer_idx, mRunState.MainStream, *op.attrs.forward_hook_point, mHookContext);
     }
 
