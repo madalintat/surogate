@@ -336,6 +336,8 @@ struct CompiledGraph {
 
     // MLP tile groups for long-context tiled execution.
     // When non-empty, the executor processes these op ranges in T-chunks.
+    // Forward groups: view → matmul_up → view → swiglu → view → matmul_down → view
+    // Backward groups: view_bwd → matmul_bwd(down) → ... → matmul_bwd(up) → view_bwd
     std::vector<MlpTileGroup> mlp_tile_groups;
 
     // Statistics

@@ -205,6 +205,13 @@ private:
                            long B, long T,
                            const modules::ForwardHook* hook);
 
+    // Execute tiled MLP backward: combined forward recompute + backward per chunk.
+    // Recomputes MLP intermediates per-chunk to avoid full-size [B*T, 2M] / [B*T, M] tensors.
+    void execute_tiled_mlp_backward(const CompiledGraph& bwd_graph,
+                                    const MlpTileGroup& group,
+                                    long B, long T,
+                                    const modules::BackwardHook* hook);
+
     // Save MoE layer tensors to persistent storage at layer boundaries
     void save_moe_layer_tensors(int layer_idx);
 

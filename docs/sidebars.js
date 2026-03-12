@@ -67,6 +67,7 @@ module.exports = {
         'guides/multi-gpu',
         'guides/multi-node',
         'guides/offloading',
+        'guides/long-context',
         'guides/memory',
         'guides/debugging',
         'guides/rl-environments',

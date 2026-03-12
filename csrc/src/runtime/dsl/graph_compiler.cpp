@@ -3072,8 +3072,8 @@ CompiledGraph GraphCompiler::compile(const Graph& graph, long B, long T) {
 
             bool is_up = false;
             for (const auto& inp : ops[i].inputs) {
-                if (inp.name.size() >= 14 &&
-                    inp.name.compare(inp.name.size() - 14, 14, "mlp_up_weight") == 0) {
+                if (inp.name.size() >= 13 &&
+                    inp.name.compare(inp.name.size() - 13, 13, "mlp_up_weight") == 0) {
                     is_up = true;
                     break;
                 }
@@ -3093,8 +3093,8 @@ CompiledGraph GraphCompiler::compile(const Graph& graph, long B, long T) {
                 if (ops[j].type != CompiledOpType::Matmul &&
                     ops[j].type != CompiledOpType::MatmulBias) continue;
                 for (const auto& inp : ops[j].inputs) {
-                    if (inp.name.size() >= 16 &&
-                        inp.name.compare(inp.name.size() - 16, 16, "mlp_down_weight") == 0) {
+                    if (inp.name.size() >= 15 &&
+                        inp.name.compare(inp.name.size() - 15, 15, "mlp_down_weight") == 0) {
                         down_idx = j;
                         found_down = true;
                         break;
@@ -3112,6 +3112,54 @@ CompiledGraph GraphCompiler::compile(const Graph& graph, long B, long T) {
 
             result.mlp_tile_groups.push_back(MlpTileGroup{start, end});
         }
+        // Also detect backward MLP tile groups (MatmulBackward ops).
+        // In the backward graph, the down-proj backward comes BEFORE the up-proj backward (reversed).
+        // Backward sequence: view_bwd → matmul_bwd(down) → view_bwd → swiglu_bwd → view_bwd → matmul_bwd(up) → view_bwd
+        for (std::size_t i = 0; i < ops.size(); ++i) {
+            if (ops[i].type != CompiledOpType::MatmulBackward) continue;
+
+            bool is_down = false;
+            for (const auto& inp : ops[i].inputs) {
+                if (inp.name.size() >= 15 &&
+                    inp.name.compare(inp.name.size() - 15, 15, "mlp_down_weight") == 0) {
+                    is_down = true;
+                    break;
+                }
+            }
+            if (!is_down) continue;
+
+            // Found down-proj matmul_backward at index i.
+            // The view_backward before it is the group start.
+            if (i == 0) continue;
+            std::size_t start = i - 1;
+            if (ops[start].type != CompiledOpType::ViewBackward) start = i;
+
+            // Walk forward to find mlp_up_weight matmul_backward
+            std::size_t up_idx = 0;
+            bool found_up = false;
+            for (std::size_t j = i + 1; j < ops.size() && j <= i + 6; ++j) {
+                if (ops[j].type != CompiledOpType::MatmulBackward) continue;
+                for (const auto& inp : ops[j].inputs) {
+                    if (inp.name.size() >= 13 &&
+                        inp.name.compare(inp.name.size() - 13, 13, "mlp_up_weight") == 0) {
+                        up_idx = j;
+                        found_up = true;
+                        break;
+                    }
+                }
+                if (found_up) break;
+            }
+            if (!found_up) continue;
+
+            // The view_backward after the up matmul_backward is the group end
+            std::size_t end = up_idx + 1;
+            if (end >= ops.size() || ops[end].type != CompiledOpType::ViewBackward) {
+                end = up_idx;
+            }
+
+            result.mlp_tile_groups.push_back(MlpTileGroup{start, end});
+        }
+
         if (!result.mlp_tile_groups.empty()) {
             std::fprintf(stderr, "[long_context] Detected %zu MLP tile groups for tiled execution\n",
                          result.mlp_tile_groups.size());

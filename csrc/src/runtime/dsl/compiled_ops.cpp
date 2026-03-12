@@ -2161,8 +2161,9 @@ void CompiledExecutor::replay_layer_forward(int layer_idx, long B, long T,
         }
     }
 
-    // Replay the layer's forward ops
-    // Build tile group lookup for replay (same as execute_forward)
+    // Replay the layer's forward ops.
+    // Tile MLP during replay to avoid allocating full-size intermediates (swiglu_flat,
+    // mlp_up). The tiled backward will recompute these per-chunk during backward execution.
     std::unordered_map<std::size_t, const MlpTileGroup*> replay_tile_groups;
     for (const auto& tg : fwd_graph.mlp_tile_groups) {
         if (tg.start_op_idx >= start && tg.end_op_idx <= end) {
@@ -2178,7 +2179,8 @@ void CompiledExecutor::replay_layer_forward(int layer_idx, long B, long T,
             continue;
         }
 
-        // Check if this op starts a tiled MLP group
+        // Tile MLP during replay — produces correct output without full intermediates.
+        // The backward tiled execution will recompute intermediates per-chunk.
         if (!replay_tile_groups.empty()) {
             auto tg_it = replay_tile_groups.find(idx);
             if (tg_it != replay_tile_groups.end()) {
@@ -2392,13 +2394,13 @@ void CompiledExecutor::execute_tiled_mlp(const CompiledGraph& graph,
         const auto& op = graph.ops[idx];
         if (op.type != CompiledOpType::Matmul && op.type != CompiledOpType::MatmulBias) continue;
         for (const auto& inp : op.inputs) {
-            if (inp.name.size() >= 14 &&
-                inp.name.compare(inp.name.size() - 14, 14, "mlp_up_weight") == 0) {
+            if (inp.name.size() >= 13 &&
+                inp.name.compare(inp.name.size() - 13, 13, "mlp_up_weight") == 0) {
                 up_weight = resolve_tensor(inp);
                 up_matmul_op = &op;
             }
-            if (inp.name.size() >= 16 &&
-                inp.name.compare(inp.name.size() - 16, 16, "mlp_down_weight") == 0) {
+            if (inp.name.size() >= 15 &&
+                inp.name.compare(inp.name.size() - 15, 15, "mlp_down_weight") == 0) {
                 down_weight = resolve_tensor(inp);
                 down_matmul_op = &op;
             }
@@ -2484,6 +2486,272 @@ void CompiledExecutor::execute_tiled_mlp(const CompiledGraph& graph,
     store_tensor(first_view_op.outputs[0], full_input);
     // - intermediate tensor IDs (mlp_up, swiglu, etc.) are not needed
     //   since they only live within the tile group
+}
+
+// ============================================================================
+// Tiled MLP Backward: combined forward recompute + backward per chunk
+// ============================================================================
+//
+// Instead of running the full backward ops (which need full-size intermediates
+// from replay), we recompute the forward MLP per-chunk and immediately compute
+// gradients, then free intermediates. This reduces memory from O(B*T * intermediate)
+// to O(chunk_size * intermediate) during backward.
+//
+// Backward MLP group structure (reverse order):
+//   view_bwd → matmul_bwd(down) → view_bwd → swiglu_bwd → view_bwd → matmul_bwd(up) → view_bwd
+//
+// We replace all ops in the group with per-chunk:
+//   1. Forward recompute: up_out = ln2_chunk @ up_weight^T, act_out = swiglu(up_out)
+//   2. Backward down-proj: d_act = d_out_chunk @ down_weight, d_down_weight += act_out^T @ d_out_chunk
+//   3. Backward swiglu: d_up = swiglu_backward(d_act, up_out)
+//   4. Backward up-proj: d_ln2_chunk = d_up @ up_weight, d_up_weight += ln2_chunk^T @ d_up
+void CompiledExecutor::execute_tiled_mlp_backward(const CompiledGraph& bwd_graph,
+                                                   const MlpTileGroup& group,
+                                                   long B, long T,
+                                                   const modules::BackwardHook* hook) {
+    const long BT = B * T;
+
+    // Find the matmul_backward ops and extract weight/gradient references
+    const CompiledOp* down_bwd_op = nullptr;
+    const CompiledOp* up_bwd_op = nullptr;
+    for (std::size_t idx = group.start_op_idx; idx <= group.end_op_idx; ++idx) {
+        const auto& op = bwd_graph.ops[idx];
+        if (op.type != CompiledOpType::MatmulBackward) continue;
+        for (const auto& inp : op.inputs) {
+            if (inp.name.size() >= 15 &&
+                inp.name.compare(inp.name.size() - 15, 15, "mlp_down_weight") == 0) {
+                down_bwd_op = &op;
+            }
+            if (inp.name.size() >= 13 &&
+                inp.name.compare(inp.name.size() - 13, 13, "mlp_up_weight") == 0) {
+                up_bwd_op = &op;
+            }
+        }
+    }
+    if (!down_bwd_op || !up_bwd_op) {
+        throw std::runtime_error("execute_tiled_mlp_backward: could not find MLP backward ops");
+    }
+
+    // Resolve inputs from backward ops:
+    // down_bwd inputs: [d_out (d_mlp_down_flat), activation(swiglu_flat), down_weight]
+    // up_bwd inputs: [d_mlp_up_flat, activation(ln2_flat), up_weight]
+    //
+    // The group may or may not start/end with ViewBackward ops. The actual structure is:
+    //   [ViewBackward?] MatmulBackward(down) [View] SwiGLUBackward [View] MatmulBackward(up) [ViewBackward?]
+    // We skip all ops in the group and compute everything from raw kernel calls.
+
+    // If the group starts with a ViewBackward, dispatch it to produce the flat gradient
+    const auto& first_op = bwd_graph.ops[group.start_op_idx];
+    if (first_op.type == CompiledOpType::ViewBackward) {
+        dispatch_view_backward(first_op);
+    }
+
+    // Get the incoming gradient (d_out for down-proj backward) — already available from prior ops
+    Tensor d_mlp_out_flat = resolve_tensor(down_bwd_op->inputs[0]);
+
+    // Get ln2_flat from the up-proj backward's activation input (input[1])
+    Tensor ln2_flat = resolve_tensor(up_bwd_op->inputs[1]);
+    // Get weights
+    Tensor up_weight = resolve_tensor(up_bwd_op->inputs[2]);
+    Tensor down_weight = resolve_tensor(down_bwd_op->inputs[2]);
+
+    const long C = ln2_flat.Sizes[ln2_flat.Rank - 1];
+    const long MUp = up_weight.Sizes[0];  // [MUp, C] with NT
+    const long M = MUp / 2;               // SwiGLU halves
+    const ETensorDType dtype = ln2_flat.DType;
+    const EMMTranspose fwd_mode = down_bwd_op->attrs.transpose;  // NT for standard matmul
+    const int layer_idx = down_bwd_op->attrs.layer_idx;
+
+    // Allocate full d_ln2_flat [B*T, C] output
+    Tensor d_ln2_flat = mRunState.temp_alloc(dtype, {BT, C});
+    fill_zero(d_ln2_flat, mRunState.MainStream);
+    mTemps.push_back(d_ln2_flat);
+
+    // Resolve weight gradient tensors (pre-allocated by gradient store)
+    // down_bwd outputs: [d_swiglu_flat, d_down_weight]
+    // up_bwd outputs: [d_ln2_flat, d_up_weight]
+    // Check if weight gradients should be computed (frozen in LoRA)
+    auto get_weight_grad = [&](const CompiledOp& op, int out_idx) -> Tensor* {
+        if (static_cast<int>(op.outputs.size()) <= out_idx) return nullptr;
+        const std::string& dB_name = op.outputs[out_idx].name;
+        if (dB_name.empty()) return nullptr;
+        std::string weight_name = dB_name;
+        if (weight_name.rfind("d_", 0) == 0) weight_name = weight_name.substr(2);
+        bool accum = false;
+        return mGrads.get_param_grad(weight_name, accum);
+    };
+    Tensor* d_down_weight_ptr = get_weight_grad(*down_bwd_op, 1);
+    Tensor* d_up_weight_ptr = get_weight_grad(*up_bwd_op, 1);
+
+    // Determine accumulation: first chunk uses existing flag, subsequent chunks always accumulate
+    const std::string& dB_down_name = down_bwd_op->outputs.size() > 1 ? down_bwd_op->outputs[1].name : "";
+    const std::string& dB_up_name = up_bwd_op->outputs.size() > 1 ? up_bwd_op->outputs[1].name : "";
+    bool base_accumulate_down = mAccumulateTensors.count(dB_down_name) > 0;
+    bool base_accumulate_up = mAccumulateTensors.count(dB_up_name) > 0;
+
+    // Compute backward transpose modes for NT forward
+    EMMTranspose mode_dA = EMMTranspose::NN;  // dA = d_out @ B (NN for NT forward)
+    EMMTranspose mode_dB_rm = EMMTranspose::TN;  // dB = d_out^T @ A (TN for NT forward)
+
+    // Chunk size: min(B*T, C) — same as forward
+    const long chunk_size = std::min(BT, C);
+    const long num_chunks = (BT + chunk_size - 1) / chunk_size;
+
+    for (long chunk_idx = 0; chunk_idx < num_chunks; ++chunk_idx) {
+        const long offset = chunk_idx * chunk_size;
+        const long N = std::min(chunk_size, BT - offset);
+
+        auto ckpt = mRunState.Stack.checkpoint();
+
+        // Narrow input tensors to chunk
+        auto narrow = [&](const Tensor& full, long cols) -> Tensor {
+            Tensor chunk = full;
+            const std::size_t byte_off = static_cast<std::size_t>(offset) * static_cast<std::size_t>(cols) *
+                                         static_cast<std::size_t>(get_dtype_size(dtype));
+            chunk.Data = static_cast<std::byte*>(full.Data) + byte_off;
+            chunk.Sizes[0] = N;
+            return chunk;
+        };
+
+        Tensor ln2_chunk = narrow(ln2_flat, C);
+        Tensor d_out_chunk = narrow(d_mlp_out_flat, C);
+        Tensor d_ln2_chunk = narrow(d_ln2_flat, C);
+
+        // ---- Forward recompute for this chunk ----
+        // 1) Up-proj: up_out = ln2_chunk @ up_weight^T → [N, MUp]
+        Tensor up_out = mRunState.temp_alloc(dtype, {N, MUp});
+        {
+            int mm_M = 0, mm_N = 0, mm_K = 0;
+            matmul_dims(ln2_chunk, up_weight, fwd_mode, mm_M, mm_N, mm_K);
+            matmul(up_out, up_weight, ln2_chunk, std::nullopt, nullptr, nullptr,
+                   mRunState.CublasLtHandle, mRunState.CuBlasWorkspace,
+                   mm_N, mm_M, mm_K, swap_transpose(fwd_mode), false, mRunState.MainStream);
+        }
+
+        // 2) SwiGLU: act_out = swiglu(up_out) → [N, M]
+        Tensor act_out = mRunState.temp_alloc(dtype, {N, M});
+        swiglu_forward(act_out, up_out, nullptr, 1, static_cast<int>(N), static_cast<int>(M),
+                       mRunState.MainStream);
+
+        // ---- Backward for this chunk ----
+        // 3) Down-proj backward: dA = d_out_chunk @ down_weight (activation grad)
+        Tensor d_act = mRunState.temp_alloc(dtype, {N, M});
+        {
+            int mm_M = 0, mm_N = 0, mm_K = 0;
+            matmul_dims(d_out_chunk, down_weight, mode_dA, mm_M, mm_N, mm_K);
+            matmul(d_act, down_weight, d_out_chunk, std::nullopt, nullptr, nullptr,
+                   mRunState.CublasLtHandle, mRunState.CuBlasWorkspace,
+                   mm_N, mm_M, mm_K, swap_transpose(mode_dA), false, mRunState.MainStream);
+        }
+        // dB = d_out_chunk^T @ act_out (weight grad, accumulated)
+        if (d_down_weight_ptr && d_down_weight_ptr->Data) {
+            bool accum = base_accumulate_down || (chunk_idx > 0);
+            int mm_M = 0, mm_N = 0, mm_K = 0;
+            matmul_dims(d_out_chunk, act_out, mode_dB_rm, mm_M, mm_N, mm_K);
+            matmul(*d_down_weight_ptr, act_out, d_out_chunk, std::nullopt, nullptr, nullptr,
+                   mRunState.CublasLtHandle, mRunState.CuBlasWorkspace,
+                   mm_N, mm_M, mm_K, swap_transpose(mode_dB_rm), accum, mRunState.MainStream);
+        }
+
+        // LoRA backward hook for down-proj
+        if (hook && *hook && down_bwd_op->attrs.backward_hook_point.has_value() && layer_idx >= 0) {
+            bool lora_accum = base_accumulate_down || (chunk_idx > 0);
+            auto& grads = mRunState.simplified_grads(layer_idx);
+            auto& acts = mRunState.simplified_acts(layer_idx);
+            // Save full-size tensor state
+            auto prev_d_swiglu = grads.d_swiglu;
+            auto prev_d_res_ffn = grads.d_res_ffn;
+            auto prev_a_swiglu = acts.swiglu;
+            auto prev_a_mlp_up = acts.mlp_up;
+            // Set chunk-sized tensors with correct shapes
+            // d_swiglu: the activation gradient [N, M]
+            grads.d_swiglu = d_act;
+            // d_res_ffn: the incoming gradient d_out [N, C]
+            grads.d_res_ffn = d_out_chunk;
+            // acts.swiglu: the forward activation [N, M]
+            acts.swiglu = act_out;
+            // acts.mlp_up: the pre-activation [N, MUp] (needed for swiglu recompute)
+            acts.mlp_up = up_out;
+            (*hook)(layer_idx, lora_accum, mRunState.MainStream,
+                    *down_bwd_op->attrs.backward_hook_point, mHookContext);
+            // Restore full-size tensors
+            grads.d_swiglu = prev_d_swiglu;
+            grads.d_res_ffn = prev_d_res_ffn;
+            acts.swiglu = prev_a_swiglu;
+            acts.mlp_up = prev_a_mlp_up;
+        }
+
+        // 4) SwiGLU backward: d_up = swiglu_backward(d_act, up_out) → [N, MUp]
+        Tensor d_up = mRunState.temp_alloc(dtype, {N, MUp});
+        swiglu_backward(d_up, d_act, up_out, nullptr,
+                        1, static_cast<int>(N), static_cast<int>(M), mRunState.MainStream);
+
+        // 5) Up-proj backward: dA = d_up @ up_weight (activation grad → d_ln2_chunk)
+        {
+            int mm_M = 0, mm_N = 0, mm_K = 0;
+            matmul_dims(d_up, up_weight, mode_dA, mm_M, mm_N, mm_K);
+            matmul(d_ln2_chunk, up_weight, d_up, std::nullopt, nullptr, nullptr,
+                   mRunState.CublasLtHandle, mRunState.CuBlasWorkspace,
+                   mm_N, mm_M, mm_K, swap_transpose(mode_dA), false, mRunState.MainStream);
+        }
+        // dB = d_up^T @ ln2_chunk (weight grad, accumulated)
+        if (d_up_weight_ptr && d_up_weight_ptr->Data) {
+            bool accum = base_accumulate_up || (chunk_idx > 0);
+            int mm_M = 0, mm_N = 0, mm_K = 0;
+            matmul_dims(d_up, ln2_chunk, mode_dB_rm, mm_M, mm_N, mm_K);
+            matmul(*d_up_weight_ptr, ln2_chunk, d_up, std::nullopt, nullptr, nullptr,
+                   mRunState.CublasLtHandle, mRunState.CuBlasWorkspace,
+                   mm_N, mm_M, mm_K, swap_transpose(mode_dB_rm), accum, mRunState.MainStream);
+        }
+
+        // LoRA backward hook for up-proj
+        if (hook && *hook && up_bwd_op->attrs.backward_hook_point.has_value() && layer_idx >= 0) {
+            bool lora_accum = base_accumulate_up || (chunk_idx > 0);
+            auto& grads = mRunState.simplified_grads(layer_idx);
+            auto& acts = mRunState.simplified_acts(layer_idx);
+            // Save full-size tensor state
+            auto prev_d_ln2 = grads.d_ln2;
+            auto prev_d_mlp_up = grads.d_mlp_up;
+            auto prev_a_ln2 = acts.ln2;
+            // Set chunk-sized tensors with correct shapes
+            grads.d_ln2 = d_ln2_chunk;
+            grads.d_mlp_up = d_up;
+            acts.ln2 = ln2_chunk;
+            (*hook)(layer_idx, lora_accum, mRunState.MainStream,
+                    *up_bwd_op->attrs.backward_hook_point, mHookContext);
+            // Restore full-size tensors
+            grads.d_ln2 = prev_d_ln2;
+            grads.d_mlp_up = prev_d_mlp_up;
+            acts.ln2 = prev_a_ln2;
+        }
+
+        // Free chunk intermediates
+        mRunState.Stack.restore(ckpt);
+    }
+
+    // Store outputs at tensor IDs the subsequent ops expect.
+    // If the group ends with a ViewBackward, simulate its reshape.
+    // Otherwise store directly at the up-proj backward output.
+    const auto& last_op = bwd_graph.ops[group.end_op_idx];
+    if (last_op.type == CompiledOpType::ViewBackward) {
+        // The ViewBackward reshapes d_ln2_flat [B*T,C] → d_ln2 [B,T,C]
+        Tensor d_ln2_3d = view_tensor(d_ln2_flat, {B, T, C});
+        store_tensor(last_op.outputs[0], d_ln2_3d);
+    }
+    // Always store the flat version at the up-proj backward output ID
+    store_tensor(up_bwd_op->outputs[0], d_ln2_flat);
+
+    // Store weight gradients at backward op output tensor IDs
+    if (d_down_weight_ptr && d_down_weight_ptr->Data && down_bwd_op->outputs.size() > 1) {
+        store_tensor(down_bwd_op->outputs[1], *d_down_weight_ptr);
+    }
+    if (d_up_weight_ptr && d_up_weight_ptr->Data && up_bwd_op->outputs.size() > 1) {
+        store_tensor(up_bwd_op->outputs[1], *d_up_weight_ptr);
+    }
+
+    // Also store the intermediate gradient tensor IDs that other backward ops might reference
+    // d_swiglu_flat (down_bwd output[0]) and d_mlp_up_flat (from swiglu backward) are NOT needed
+    // outside the tiled group — they're consumed within the MLP backward sequence.
 }
 
 
@@ -3889,12 +4157,56 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
         }
     }
 
+    // Build backward tile group lookup for long-context tiled MLP execution.
+    // Only include groups that contain MatmulBackward ops (not forward groups).
+    std::unordered_map<std::size_t, const MlpTileGroup*> bwd_tile_group_starts;
+    for (const auto& tg : graph.mlp_tile_groups) {
+        for (std::size_t i = tg.start_op_idx; i <= tg.end_op_idx && i < graph.ops.size(); ++i) {
+            if (graph.ops[i].type == CompiledOpType::MatmulBackward) {
+                bwd_tile_group_starts[tg.start_op_idx] = &tg;
+                break;
+            }
+        }
+    }
+    
     for (std::size_t idx = 0; idx < graph.ops.size(); ++idx) {
         const auto& op = graph.ops[idx];
         const int op_layer_any = op_layer_idx_any(op);
         if (skip_logits_grad && is_logits_grad_op(op)) {
             continue;
         }
+
+        // Check if this op starts a backward tiled MLP group
+        if (!bwd_tile_group_starts.empty()) {
+            auto tg_it = bwd_tile_group_starts.find(idx);
+            if (tg_it != bwd_tile_group_starts.end()) {
+                const auto& tg = *tg_it->second;
+                // Handle layer start/recompute if the first op has one
+                const auto& first_op = graph.ops[tg.start_op_idx];
+                if (first_op.layer_start >= 0) {
+                    handle_layer_start(first_op.layer_start);
+                    if (mRecomputeEnabled && mRecomputeFn) {
+                        const int layer_idx = first_op.layer_start;
+                        if (layer_idx >= 0 && layer_idx != mLastRecomputeLayer) {
+                            if (layer_idx < num_layers && !layer_seen_any[static_cast<std::size_t>(layer_idx)]) {
+                                clear_shared_grads(layer_idx);
+                                layer_seen_any[static_cast<std::size_t>(layer_idx)] = true;
+                            }
+                            mRecomputeFn(layer_idx, mB, mT, mRecomputeUseGraphs);
+                            mLastRecomputeLayer = layer_idx;
+                        }
+                    }
+                }
+                execute_tiled_mlp_backward(graph, tg, mB, mT, hook);
+                // Prune tensors for all ops in the group
+                for (std::size_t gi = tg.start_op_idx; gi <= tg.end_op_idx; ++gi) {
+                    prune_by_last_use(gi);
+                }
+                idx = tg.end_op_idx;
+                continue;
+            }
+        }
+
         if (op_profile) {
             CUDA_CHECK(cudaEventRecord(op_profile_start, mRunState.MainStream));
         }

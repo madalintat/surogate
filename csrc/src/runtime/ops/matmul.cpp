@@ -54,6 +54,9 @@ void CompiledExecutor::dispatch_matmul(const CompiledOp& op, const modules::Forw
     Tensor& out = ensure_output_tensor(op.outputs[0]);
     const std::string& weight_name = op.inputs[1].name;
 
+    const bool is_shared_weight = (weight_name.find("shared_expert_up") != std::string::npos) ||
+                                  (weight_name.find("shared_expert_down") != std::string::npos);
+
     std::optional<Tensor> bias;
     if (op.type == CompiledOpType::MatmulBias && op.inputs.size() > 2) {
         bias = resolve_tensor(op.inputs[2]);
@@ -134,7 +137,7 @@ void CompiledExecutor::dispatch_matmul(const CompiledOp& op, const modules::Forw
     modules::MatmulContext ctx{};
     modules::MatmulContext* ctx_ptr = nullptr;
     try {
-        if (mRecipe && op.attrs.transpose == EMMTranspose::NT && a.Sizes[0] == mB * mT) {
+        if (mRecipe && op.attrs.transpose == EMMTranspose::NT && a.Sizes[0] == mB * mT && !is_shared_weight) {
             if (op.attrs.allow_quant && op.attrs.matmul_op.has_value()) {
                 ctx.out = &out;
                 ctx.inp = &a;
@@ -240,12 +243,33 @@ void CompiledExecutor::dispatch_matmul(const CompiledOp& op, const modules::Forw
                             + static_cast<unsigned int>(proj_type) * 100000u
                             + static_cast<unsigned int>(mLoRARunState->micro_step) * 10000u;
 
-                        modules::detail::apply_lora_contribution(
-                            out_flat, 0, a_flat, lora_layer.value(),
-                            mLoRARunState->intermediate, mLoRARunState->slice,
-                            scaling, dropout, dropout_seed, training,
-                            BT, in_features, out_features, rank,
-                            mRunState.CublasLtHandle, mRunState.CuBlasWorkspace, mRunState.MainStream);
+                        const auto& lora = lora_layer.value();
+                        const bool lora_shape_ok =
+                            (lora.A.Rank >= 2 && lora.B.Rank >= 2 &&
+                             static_cast<int>(lora.A.Sizes[0]) == rank &&
+                             static_cast<int>(lora.A.Sizes[1]) == in_features &&
+                             static_cast<int>(lora.B.Sizes[0]) == out_features &&
+                             static_cast<int>(lora.B.Sizes[1]) == rank);
+                        if (!lora_shape_ok) {
+                            static int warn_count = 0;
+                            if (warn_count < 16) {
+                                ++warn_count;
+                                std::fprintf(stderr,
+                                             "[LORA-SHARED] skip forward due to shape mismatch: layer=%d field=%s "
+                                             "runtime(in=%d,out=%d,rank=%d) A=[%ld,%ld] B=[%ld,%ld]\n",
+                                             shared_layer, field.c_str(),
+                                             in_features, out_features, rank,
+                                             lora.A.Sizes[0], lora.A.Sizes[1],
+                                             lora.B.Sizes[0], lora.B.Sizes[1]);
+                            }
+                        } else {
+                            modules::detail::apply_lora_contribution(
+                                out_flat, 0, a_flat, lora,
+                                mLoRARunState->intermediate, mLoRARunState->slice,
+                                scaling, dropout, dropout_seed, training,
+                                BT, in_features, out_features, rank,
+                                mRunState.CublasLtHandle, mRunState.CuBlasWorkspace, mRunState.MainStream);
+                        }
                     }
                 }
             }
@@ -341,7 +365,10 @@ void CompiledExecutor::dispatch_matmul(const CompiledOp& op, const modules::Forw
     }
 
     // Hook invocation
-    if (hook && *hook && op.attrs.forward_hook_point.has_value()) {
+    // Shared-expert matmuls have a dedicated LoRA path above using exact tensor
+    // shapes. Skip the generic MLP hook path here to avoid double-applying LoRA
+    // (and wrong-shape writes on hybrid MoE blocks such as Nemotron-H).
+    if (hook && *hook && op.attrs.forward_hook_point.has_value() && !is_shared_weight) {
         // Bind activation slots to the just-produced matmul output so forward hooks
         // (LoRA) write into the live buffer. During replay, acts may already point to
         // the original forward's buffer — force-update so LoRA targets the replay tensor.
@@ -366,6 +393,7 @@ void CompiledExecutor::dispatch_matmul(const CompiledOp& op, const modules::Forw
         }
         (*hook)(op.attrs.layer_idx, mRunState.MainStream, *op.attrs.forward_hook_point, mHookContext);
     }
+
 }
 
 void CompiledExecutor::dispatch_matmul_backward(const CompiledOp& op, const modules::BackwardHook* hook) {
@@ -709,17 +737,48 @@ void CompiledExecutor::dispatch_matmul_backward(const CompiledOp& op, const modu
                                 + static_cast<unsigned int>(proj_type) * 100000u
                                 + static_cast<unsigned int>(mLoRARunState->micro_step) * 10000u;
 
-                            modules::detail::backward_lora_layer(
-                                grad_layer->value().A, grad_layer->value().B,
-                                *dA_use,
-                                d_out_flat, 0,
-                                a_flat,
-                                lora_layer->A, lora_layer->B,
-                                scaling,
-                                dropout, dropout_seed, training,
-                                mLoRARunState->intermediate, mLoRARunState->slice,
-                                BT, in_features, out_features, rank, lora_accum,
-                                mRunState.CublasLtHandle, mRunState.CuBlasWorkspace, mRunState.MainStream);
+                            const auto& lora = lora_layer.value();
+                            auto& grads = grad_layer->value();
+                            const bool lora_shape_ok =
+                                (lora.A.Rank >= 2 && lora.B.Rank >= 2 &&
+                                 static_cast<int>(lora.A.Sizes[0]) == rank &&
+                                 static_cast<int>(lora.A.Sizes[1]) == in_features &&
+                                 static_cast<int>(lora.B.Sizes[0]) == out_features &&
+                                 static_cast<int>(lora.B.Sizes[1]) == rank);
+                            const bool grad_shape_ok =
+                                (grads.A.Rank >= 2 && grads.B.Rank >= 2 &&
+                                 static_cast<int>(grads.A.Sizes[0]) == rank &&
+                                 static_cast<int>(grads.A.Sizes[1]) == in_features &&
+                                 static_cast<int>(grads.B.Sizes[0]) == out_features &&
+                                 static_cast<int>(grads.B.Sizes[1]) == rank);
+                            if (!lora_shape_ok || !grad_shape_ok) {
+                                static int warn_count = 0;
+                                if (warn_count < 16) {
+                                    ++warn_count;
+                                    std::fprintf(stderr,
+                                                 "[LORA-SHARED] skip backward due to shape mismatch: layer=%d field=%s "
+                                                 "runtime(in=%d,out=%d,rank=%d) "
+                                                 "A=[%ld,%ld] B=[%ld,%ld] dA=[%ld,%ld] dB=[%ld,%ld]\n",
+                                                 shared_layer, field.c_str(),
+                                                 in_features, out_features, rank,
+                                                 lora.A.Sizes[0], lora.A.Sizes[1],
+                                                 lora.B.Sizes[0], lora.B.Sizes[1],
+                                                 grads.A.Sizes[0], grads.A.Sizes[1],
+                                                 grads.B.Sizes[0], grads.B.Sizes[1]);
+                                }
+                            } else {
+                                modules::detail::backward_lora_layer(
+                                    grads.A, grads.B,
+                                    *dA_use,
+                                    d_out_flat, 0,
+                                    a_flat,
+                                    lora.A, lora.B,
+                                    scaling,
+                                    dropout, dropout_seed, training,
+                                    mLoRARunState->intermediate, mLoRARunState->slice,
+                                    BT, in_features, out_features, rank, lora_accum,
+                                    mRunState.CublasLtHandle, mRunState.CuBlasWorkspace, mRunState.MainStream);
+                            }
                             }
                         }
                     }
@@ -932,12 +991,7 @@ void CompiledExecutor::dispatch_matmul_backward(const CompiledOp& op, const modu
                 }
             }
         }
-        if (std::getenv("SUROGATE_DEBUG_LORA_HOOK")) {
-            fprintf(stderr, "[LORA-HOOK] layer=%d hook_point=%d accum=%d matmul_op=%d d_out.Data=%p a.Data=%p\n",
-                    layer_idx, static_cast<int>(*op.attrs.backward_hook_point), (int)do_accumulate,
-                    op.attrs.matmul_op.has_value() ? static_cast<int>(*op.attrs.matmul_op) : -1,
-                    (void*)d_out.Data, (void*)a.Data);
-        }
+        
         (*hook)(layer_idx, do_accumulate, mRunState.MainStream, *op.attrs.backward_hook_point, mHookContext);
 
         if (op.attrs.matmul_op.has_value() && layer_idx >= 0) {

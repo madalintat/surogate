@@ -12,6 +12,7 @@ This guide collects the main knobs that affect GPU memory use.
 
 - Recomputation (`recompute`)
 - Chunking (`lmhead_chunks`, `attn_bwd_chunks`)
+- [Tiled MLP for long context](long-context.md) (`long_context`)
 - Offloading (`offload_*`)
 - Quantization / QLoRA (`qlora_*`)
 

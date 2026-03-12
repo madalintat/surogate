@@ -107,8 +107,11 @@ public:
             return true;
         }
 
-        // Evict LRU group(s) if needed
-        evict_if_needed(group_id);
+        // Evict LRU group(s) if needed on the caller stream so eviction is
+        // ordered after any in-flight compute that may still read those
+        // buffers. Using a separate stream can race and free/live-migrate
+        // quantized storage while kernels are still running.
+        evict_if_needed(group_id, stream);
 
         // Transfer from CPU to GPU
         allocate_gpu_buffers(group);
@@ -168,8 +171,20 @@ public:
             return;  // Already loaded or being loaded
         }
 
-        // Evict if needed before starting prefetch
-        evict_if_needed(group_id);
+        // Do not evict on the prefetch stream. Cross-stream eviction can race
+        // with compute kernels using resident groups.
+        if (mConfig.max_resident_groups > 0) {
+            int loading = 0;
+            for (const auto& [gid, g] : mGroups) {
+                (void)gid;
+                if (g.state == GroupState::LOADING) {
+                    loading++;
+                }
+            }
+            if ((mNumResident + loading) >= mConfig.max_resident_groups) {
+                return;
+            }
+        }
 
         // Allocate GPU buffers and start async transfer on prefetch stream
         allocate_gpu_buffers(group);
@@ -324,7 +339,7 @@ private:
     }
 
     /// Evict enough groups to make room for one more, if needed.
-    void evict_if_needed(int incoming_group_id) {
+    void evict_if_needed(int incoming_group_id, cudaStream_t stream) {
         if (mConfig.max_resident_groups == 0) {
             return;  // Unlimited
         }
@@ -335,11 +350,7 @@ private:
                 break;  // Nothing to evict
             }
 
-            // Create a synchronous stream for eviction
-            cudaStream_t evict_stream = nullptr;
-            CUDA_CHECK(cudaStreamCreateWithFlags(&evict_stream, cudaStreamNonBlocking));
-            unload_group(lru_id, evict_stream);
-            CUDA_CHECK(cudaStreamDestroy(evict_stream));
+            unload_group(lru_id, stream);
         }
     }
 
