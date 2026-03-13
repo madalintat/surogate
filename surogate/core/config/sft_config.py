@@ -557,7 +557,7 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
             for chunks in (8, 4, 2):
                 if total_tokens % chunks == 0:
                     self.lmhead_chunks = chunks
-                    logger.info(f"Auto-setting lmhead_chunks={chunks} (LoRA+recompute memory optimization)")
+                    logger.info(f"Auto-setting lmhead_chunks={chunks}")
                     break
 
         self._validate_chunking_config()

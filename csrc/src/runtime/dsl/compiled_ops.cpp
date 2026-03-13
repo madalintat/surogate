@@ -2597,6 +2597,56 @@ void CompiledExecutor::execute_tiled_mlp_backward(const CompiledGraph& bwd_graph
     const long chunk_size = std::min(BT, C);
     const long num_chunks = (BT + chunk_size - 1) / chunk_size;
 
+    // Tiled backward invokes LoRA hooks with chunk-sized tensors. The hook logic
+    // reads rs.B/rs.T to derive BT, so temporarily switch to (1, chunk_tokens)
+    // around hook invocation to avoid over-reading chunk buffers.
+    auto invoke_chunk_lora_hook = [&](const std::optional<modules::BackwardHookPoint>& point,
+                                      bool accumulate,
+                                      long chunk_tokens,
+                                      bool force_chunk_ln2_input) {
+        if (!(hook && *hook) || !point.has_value() || layer_idx < 0) {
+            return;
+        }
+
+        const long prev_B = mRunState.B;
+        const long prev_T = mRunState.T;
+        Tensor prev_recompute_ln{};
+        Tensor prev_recompute_rstd{};
+        bool patched_recompute_ln = false;
+
+        // Up-proj LoRA hook can recompute LN2 from full residual when recompute is
+        // enabled. For tiled execution we must use the chunk LN2 tensor we just set.
+        if (force_chunk_ln2_input && mLoRARunState && mLoRARunState->recompute_ln.Data) {
+            prev_recompute_ln = mLoRARunState->recompute_ln;
+            prev_recompute_rstd = mLoRARunState->recompute_rstd;
+            mLoRARunState->recompute_ln.Data = nullptr;
+            mLoRARunState->recompute_rstd.Data = nullptr;
+            patched_recompute_ln = true;
+        }
+
+        mRunState.B = 1;
+        mRunState.T = chunk_tokens;
+
+        try {
+            (*hook)(layer_idx, accumulate, mRunState.MainStream, *point, mHookContext);
+        } catch (...) {
+            mRunState.B = prev_B;
+            mRunState.T = prev_T;
+            if (patched_recompute_ln) {
+                mLoRARunState->recompute_ln = prev_recompute_ln;
+                mLoRARunState->recompute_rstd = prev_recompute_rstd;
+            }
+            throw;
+        }
+
+        mRunState.B = prev_B;
+        mRunState.T = prev_T;
+        if (patched_recompute_ln) {
+            mLoRARunState->recompute_ln = prev_recompute_ln;
+            mLoRARunState->recompute_rstd = prev_recompute_rstd;
+        }
+    };
+
     for (long chunk_idx = 0; chunk_idx < num_chunks; ++chunk_idx) {
         const long offset = chunk_idx * chunk_size;
         const long N = std::min(chunk_size, BT - offset);
@@ -2672,8 +2722,10 @@ void CompiledExecutor::execute_tiled_mlp_backward(const CompiledGraph& bwd_graph
             acts.swiglu = act_out;
             // acts.mlp_up: the pre-activation [N, MUp] (needed for swiglu recompute)
             acts.mlp_up = up_out;
-            (*hook)(layer_idx, lora_accum, mRunState.MainStream,
-                    *down_bwd_op->attrs.backward_hook_point, mHookContext);
+            invoke_chunk_lora_hook(down_bwd_op->attrs.backward_hook_point,
+                                   lora_accum,
+                                   N,
+                                   false);
             // Restore full-size tensors
             grads.d_swiglu = prev_d_swiglu;
             grads.d_res_ffn = prev_d_res_ffn;
@@ -2717,8 +2769,10 @@ void CompiledExecutor::execute_tiled_mlp_backward(const CompiledGraph& bwd_graph
             grads.d_ln2 = d_ln2_chunk;
             grads.d_mlp_up = d_up;
             acts.ln2 = ln2_chunk;
-            (*hook)(layer_idx, lora_accum, mRunState.MainStream,
-                    *up_bwd_op->attrs.backward_hook_point, mHookContext);
+            invoke_chunk_lora_hook(up_bwd_op->attrs.backward_hook_point,
+                                   lora_accum,
+                                   N,
+                                   true);
             // Restore full-size tensors
             grads.d_ln2 = prev_d_ln2;
             grads.d_mlp_up = prev_d_mlp_up;
