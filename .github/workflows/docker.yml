@@ -29,15 +29,9 @@ jobs:
     strategy:
       matrix:
         include:
-          - cuda_major: "12"
-            wheel_tag: "cu128"
-            cuda_runtime_image: "nvidia/cuda:12.8.1-runtime-ubuntu24.04"
-          - cuda_major: "12"
-            wheel_tag: "cu129"
-            cuda_runtime_image: "nvidia/cuda:12.9.1-runtime-ubuntu24.04"
-          - cuda_major: "13"
-            wheel_tag: "cu13"
-            cuda_runtime_image: "nvidia/cuda:13.1.1-runtime-ubuntu24.04"
+          - wheel_tag: "cu128"
+          - wheel_tag: "cu129"
+          - wheel_tag: "cu13"
 
     steps:
       - name: Check if this CUDA version should be built
@@ -107,8 +101,6 @@ jobs:
           context: .
           push: true
           build-args: |
-            CUDA_RUNTIME_IMAGE=${{ matrix.cuda_runtime_image }}
-            CUDA_MAJOR=${{ matrix.cuda_major }}
             PACKAGE_VERSION=${{ steps.version.outputs.version }}
             WHEEL_TAG=${{ matrix.wheel_tag }}
           tags: |

@@ -5,3 +5,12 @@ assets/
 .venv/
 .idea/
 .vscode/
+docs/
+dist/
+.github/
+.claude/
+.cache/
+.aim/
+study/
+.pytest_cache/
+tests/

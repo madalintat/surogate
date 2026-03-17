@@ -2,14 +2,11 @@
 # High-performance LLM pre-training/fine-tuning framework
 #
 # Build Args:
-#   CUDA_RUNTIME_IMAGE: CUDA runtime image (e.g., nvidia/cuda:12.9.1-runtime-ubuntu24.04)
-#   CUDA_MAJOR: CUDA major version for package dependencies (e.g., 12, 13)
 #   PACKAGE_VERSION: Surogate package version (e.g., 0.1.1)
 #   WHEEL_TAG: Wheel CUDA tag (e.g., cu129, cu13)
 #
 # Build:
 #   docker build \
-#     --build-arg CUDA_MAJOR=13 \
 #     --build-arg PACKAGE_VERSION=0.1.1 \
 #     --build-arg WHEEL_TAG=cu13 \
 #     -t ghcr.io/invergent-ai/surogate:0.1.1-cu13 .
@@ -23,7 +20,6 @@
 
 FROM ubuntu:noble-20260210.1
 LABEL org.opencontainers.image.source=https://github.com/invergent-ai/surogate
-ARG CUDA_MAJOR=13
 ARG PACKAGE_VERSION=0.1.1
 ARG WHEEL_TAG=cu13
 ARG WHEEL_URL=https://github.com/invergent-ai/surogate/releases/download/v${PACKAGE_VERSION}/surogate-${PACKAGE_VERSION}+${WHEEL_TAG}-cp312-abi3-manylinux_2_39_x86_64.whl
@@ -61,6 +57,8 @@ ENV PATH="/home/surogate/.venv/bin:$PATH" \
 
 # Install wheel from URL
 RUN uv pip install ${WHEEL_URL}
+RUN uv pip install -U vllm --pre --extra-index-url https://wheels.vllm.ai/nightly --index-strategy unsafe-best-match --torch-backend=${WHEEL_TAG}
+RUN uv pip install "transformers==5.3.0"
 
 # Default entrypoint
 ENTRYPOINT [".venv/bin/surogate"]
