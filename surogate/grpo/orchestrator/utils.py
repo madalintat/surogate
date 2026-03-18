@@ -43,7 +43,8 @@ def get_sampling_args(sampling_config: GRPOSamplingConfig, temperature: float) -
     sampling_args = dict(sampling_config.__dict__)
     sampling_args.pop("temp_scheduler", None)
     sampling_args["temperature"] = temperature
-    sampling_args["top_p"] = 1.0
+    if sampling_args.get("top_p") is None:
+        sampling_args["top_p"] = 1.0
     sampling_args["logprobs"] = True
     # Convert extra_body to plain dicts (DictDefault/addict breaks Pydantic serialization)
     import json

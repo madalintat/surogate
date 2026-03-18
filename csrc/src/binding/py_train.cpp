@@ -823,9 +823,10 @@ std::pair<float, float> MultiGPUPyTrainer::train_step_graphed(const std::int32_t
         if (!dsl_model) {
             throw std::runtime_error("train_step_graphed: only supported for DSL models");
         }
-        if (config.type != optimizers::OptimizerType::ADAMW_8BIT &&
+        if (config.type != optimizers::OptimizerType::ADAMW &&
+            config.type != optimizers::OptimizerType::ADAMW_8BIT &&
             config.type != optimizers::OptimizerType::NORMUON) {
-            throw std::runtime_error("train_step_graphed: only supports AdamW 8-bit or NorMuon optimizer");
+            throw std::runtime_error("train_step_graphed: only supports AdamW, AdamW 8-bit or NorMuon optimizer");
         }
 
         // CUDA graph capture path (both AdamW and NorMuon support graph capture)

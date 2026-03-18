@@ -1,28 +1,23 @@
 # GRPO RL Training Example
 
-model: "./reverse-text"
+model: "./reverse-text-qwen3-2"
 output_dir: ./outputs
-gpus: 1
 
 per_device_train_batch_size: 1
 sequence_len: 2048
 
 # max_steps = orchestrator steps (must match orch.yaml max_steps)
-max_steps: 50
+max_steps: 20
 logging_steps: 1
 
-learning_rate: 2e-4
+learning_rate: 1e-4
 lr_scheduler_type: constant
 warmup_steps: 0
 max_grad_norm: 1.0
 weight_decay: 0.01
+optimizer: adamw
 
-loss:
-  ipo_mask_low: 0.5
-  ipo_mask_high: 0.5
-  kl_tau: 0.01
-
-recipe: fp8-hybrid
+recipe: bf16
 
 lora: true
 lora_rank: 16
@@ -39,3 +34,4 @@ lora_target_modules:
 # Checkpointing
 save_steps: 100
 checkpoint_dir: ./outputs/checkpoints
+

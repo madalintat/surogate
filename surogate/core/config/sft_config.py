@@ -137,8 +137,9 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
             Number of GPUs to use for training. Default is the first available GPU. Use 0 for all available GPUs.
         use_cuda_graphs (Optional[bool], defaults to True):
             Enable or disable CUDA graphs for performance.
-        optimizer (Optional[Literal['adamw_8bit', 'normuon']], defaults to 'adamw_8bit'):
+        optimizer (Optional[Literal['adamw', 'adamw_8bit', 'normuon']], defaults to 'adamw_8bit'):
             Optimizer type to use for training. Supports:
+            - 'adamw': Full-precision AdamW with FP32 optimizer states
             - 'adamw_8bit': 8-bit blockwise quantized AdamW (default)
             - 'normuon': NorMuon optimizer with orthogonalized momentum for 2D weights
               (uses AdamW for embeddings, norms, and lm_head; NorMuon for attention/MLP weights)
@@ -312,7 +313,7 @@ class SFTConfig(ModelConfig, TrainDatasetConfig, ChatTemplateConfig):
 
     gpus: Optional[int] = 1
     use_cuda_graphs: Optional[bool] = True
-    optimizer: Optional[Literal['adamw_8bit', 'normuon']] = 'adamw_8bit'
+    optimizer: Optional[Literal['adamw', 'adamw_8bit', 'normuon']] = 'adamw_8bit'
     learning_rate: Optional[float] = 2e-4
     lr_scheduler_type: Optional[Literal['constant', 'linear', 'cosine', 'wsd']] = 'linear'
     cooldown_steps: Optional[int] = 0

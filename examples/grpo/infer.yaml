@@ -1,8 +1,6 @@
-model: "./reverse-text"
+model: "./reverse-text-qwen3-2"
 enable_lora: true
 max_lora_rank: 32
 max_model_len: 2048
 gpu_memory_utilization: 0.3
-enforce_eager: false
-enable_prefix_caching: true
 port: 8007

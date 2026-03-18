@@ -227,9 +227,6 @@ void DslModel::update_adamw(NCCLCommunicator& comm, float learning_rate, float b
     constexpr size_t BLOCK_SIZE = optimizers::ADAMW8BIT_BLOCK_SIZE;
     size_t state_offset = 0;
 
-    const float beta1_correction = 1.0f - std::pow(beta_1, static_cast<float>(t));
-    const float beta2_correction = 1.0f - std::pow(beta_2, static_cast<float>(t));
-
     std::unordered_set<void*> seen_grad_ptrs;
 
     for (const auto& name : mGrads->param_names()) {
@@ -270,18 +267,18 @@ void DslModel::update_adamw(NCCLCommunicator& comm, float learning_rate, float b
                     val.template get<float>(),
                     grad_view.template get<float>(),
                     m, v, n,
-                    learning_rate, beta_1, beta_2, beta1_correction, beta2_correction,
+                    learning_rate, beta_1, beta_2, t,
                     epsilon, weight_decay, grad_scale,
-                    stream
+                    nullptr, nullptr, stream
                 );
             } else if (grad_view.DType == ETensorDType::BF16) {
                 optimizers::adamw_update(
                     val.template get<float>(),
                     grad_view.template get<nv_bfloat16>(),
                     m, v, n,
-                    learning_rate, beta_1, beta_2, beta1_correction, beta2_correction,
+                    learning_rate, beta_1, beta_2, t,
                     epsilon, weight_decay, grad_scale,
-                    stream
+                    nullptr, nullptr, stream
                 );
             } else {
                 throw std::runtime_error("DslModel::update_adamw: unsupported grad dtype for " + name);
@@ -292,18 +289,18 @@ void DslModel::update_adamw(NCCLCommunicator& comm, float learning_rate, float b
                     val.template get<nv_bfloat16>(),
                     grad_view.template get<nv_bfloat16>(),
                     m, v, n,
-                    learning_rate, beta_1, beta_2, beta1_correction, beta2_correction,
+                    learning_rate, beta_1, beta_2, t,
                     epsilon, weight_decay, grad_scale,
-                    stream
+                    nullptr, nullptr, stream
                 );
             } else if (grad_view.DType == ETensorDType::FP32) {
                 optimizers::adamw_update(
                     val.template get<nv_bfloat16>(),
                     grad_view.template get<float>(),
                     m, v, n,
-                    learning_rate, beta_1, beta_2, beta1_correction, beta2_correction,
+                    learning_rate, beta_1, beta_2, t,
                     epsilon, weight_decay, grad_scale,
-                    stream
+                    nullptr, nullptr, stream
                 );
             } else {
                 throw std::runtime_error("DslModel::update_adamw: unsupported grad dtype for " + name);
@@ -327,6 +324,163 @@ void DslModel::update_adamw(NCCLCommunicator& comm, float learning_rate, float b
         CUDA_CHECK(cudaEventSynchronize(rs.NormDone));
         if (!std::isfinite(*rs.GradScaleHost)) {
             throw std::runtime_error("DslModel::update_adamw: grad_scale is NaN/Inf");
+        }
+    }
+    record_event_if_not_capturing(rs.OptimizerDone, stream);
+}
+
+void DslModel::update_adamw_graph(NCCLCommunicator& comm, float grad_clip,
+                                  const float* opt_params, const int* opt_step) {
+    if (!mRunState || !mParams || !mGrads) {
+        throw std::logic_error("DslModel::update_adamw_graph called before allocate_run_state()");
+    }
+    if (lora_enabled()) {
+        throw std::logic_error("DslModel::update_adamw_graph: LoRA AdamW graph capture not yet supported");
+    }
+
+    if (!mAdamWState) {
+        mAdamWState = std::make_unique<AdamWState>();
+    }
+
+    auto& rs = *mRunState;
+    cudaStream_t stream = rs.MainStream;
+    wait_event_if_not_capturing(stream, rs.BackwardDone);
+
+    const bool use_weight_manager = (mWeightManager != nullptr);
+    const bool sharded_weights = use_weight_manager && mOptions.ShardWeights && (mNumShards > 1);
+    auto param_is_sharded = [&](const std::string& name) -> bool {
+        return sharded_weights && mWeightManager->is_sharded(name);
+    };
+
+    const bool grads_reduced = comm.world_size() > 1;
+    if (grads_reduced) {
+        if (mGrads->is_reduce_pending()) {
+            wait_event_if_not_capturing(stream, rs.all_reduce_done_event());
+            mGrads->clear_reduce_pending();
+        } else {
+            mGrads->reduce_all(comm, stream);
+        }
+    }
+
+    calculate_gradient_norm(comm, grad_clip, stream, grads_reduced);
+    const float* grad_scale = rs.scratch().norm_buffer.template get<float>() + 1;
+
+    if (!mAdamWState->initialized) {
+        if (stream_is_capturing(stream)) {
+            throw std::runtime_error("DslModel::update_adamw_graph: optimizer state must be initialized before capture");
+        }
+        init_adamw_state(stream);
+    }
+
+    auto& state = *mAdamWState;
+    constexpr size_t BLOCK_SIZE = optimizers::ADAMW8BIT_BLOCK_SIZE;
+    size_t state_offset = 0;
+
+    std::unordered_set<void*> seen_grad_ptrs;
+
+    for (const auto& name : mGrads->param_names()) {
+        Tensor& val = use_weight_manager ? mWeightManager->get_master(name) : mParams->get(name);
+        bool accumulate = false;
+        Tensor* grad = mGrads->get_param_grad(name, accumulate);
+        (void)accumulate;
+        if (!grad) {
+            continue;
+        }
+
+        if (seen_grad_ptrs.count(grad->Data) > 0) {
+            state_offset = (state_offset + BLOCK_SIZE - 1) / BLOCK_SIZE * BLOCK_SIZE;
+            state_offset += val.nelem();
+            continue;
+        }
+        seen_grad_ptrs.insert(grad->Data);
+
+        const bool param_sharded = param_is_sharded(name);
+        Tensor grad_view = param_sharded ? static_cast<Tensor>(shard_view(*grad, mShardIdx, mNumShards)) : *grad;
+        if (param_sharded && grad_view.nelem() != val.nelem()) {
+            throw std::runtime_error("DslModel::update_adamw_graph: sharded grad size mismatch for " + name);
+        }
+
+        state_offset = (state_offset + BLOCK_SIZE - 1) / BLOCK_SIZE * BLOCK_SIZE;
+        const size_t n = val.nelem();
+        if (!val.Data || !grad_view.Data) {
+            state_offset += n;
+            continue;
+        }
+
+        float* m = state.state1.template get<float>() + state_offset;
+        float* v = state.state2.template get<float>() + state_offset;
+
+        const float wd_scale = 1.f;
+
+        if (val.DType == ETensorDType::FP32) {
+            if (grad_view.DType == ETensorDType::FP32) {
+                optimizers::adamw_update(
+                    val.template get<float>(),
+                    grad_view.template get<float>(),
+                    m, v, n,
+                    /*lr=*/0.f, /*beta1=*/0.f, /*beta2=*/0.f, /*step=*/1,
+                    /*eps=*/0.f, wd_scale, grad_scale,
+                    opt_params, opt_step, stream
+                );
+            } else if (grad_view.DType == ETensorDType::BF16) {
+                optimizers::adamw_update(
+                    val.template get<float>(),
+                    grad_view.template get<nv_bfloat16>(),
+                    m, v, n,
+                    /*lr=*/0.f, /*beta1=*/0.f, /*beta2=*/0.f, /*step=*/1,
+                    /*eps=*/0.f, wd_scale, grad_scale,
+                    opt_params, opt_step, stream
+                );
+            } else {
+                throw std::runtime_error("DslModel::update_adamw_graph: unsupported grad dtype for " + name);
+            }
+        } else if (val.DType == ETensorDType::BF16) {
+            if (grad_view.DType == ETensorDType::BF16) {
+                optimizers::adamw_update(
+                    val.template get<nv_bfloat16>(),
+                    grad_view.template get<nv_bfloat16>(),
+                    m, v, n,
+                    /*lr=*/0.f, /*beta1=*/0.f, /*beta2=*/0.f, /*step=*/1,
+                    /*eps=*/0.f, wd_scale, grad_scale,
+                    opt_params, opt_step, stream
+                );
+            } else if (grad_view.DType == ETensorDType::FP32) {
+                optimizers::adamw_update(
+                    val.template get<nv_bfloat16>(),
+                    grad_view.template get<float>(),
+                    m, v, n,
+                    /*lr=*/0.f, /*beta1=*/0.f, /*beta2=*/0.f, /*step=*/1,
+                    /*eps=*/0.f, wd_scale, grad_scale,
+                    opt_params, opt_step, stream
+                );
+            } else {
+                throw std::runtime_error("DslModel::update_adamw_graph: unsupported grad dtype for " + name);
+            }
+        } else {
+            throw std::runtime_error("DslModel::update_adamw_graph: unsupported param dtype for " + name);
+        }
+
+        state_offset += n;
+        if (state_offset > state.total_state_elems) {
+            throw std::runtime_error("DslModel::update_adamw_graph: state buffer overflow");
+        }
+    }
+
+    if (rs.has_fp8_delayed_scaling()) {
+        if (auto* fp8_state = rs.get_fp8_scaling_state()) {
+            delayed_scaling_update(*fp8_state, stream);
+        }
+    }
+
+    if (mWeightManager) {
+        mWeightManager->invalidate();
+        mWeightManager->sync_work_from_master(stream);
+    }
+
+    if (!stream_is_capturing(stream)) {
+        CUDA_CHECK(cudaEventSynchronize(rs.NormDone));
+        if (!std::isfinite(*rs.GradScaleHost)) {
+            throw std::runtime_error("DslModel::update_adamw_graph: grad_scale is NaN/Inf");
         }
     }
     record_event_if_not_capturing(rs.OptimizerDone, stream);
@@ -474,7 +628,9 @@ void DslModel::update_with_config(NCCLCommunicator& comm, const optimizers::Opti
     if (lora_enabled()) {
         switch (config.type) {
             case optimizers::OptimizerType::ADAMW:
-                throw std::logic_error("DslModel::update_with_config: LoRA AdamW not yet supported");
+                update_lora_adamw(comm, config.learning_rate, config.adamw_beta1, config.adamw_beta2,
+                                  step, config.adamw_epsilon, config.weight_decay, config.grad_clip);
+                return;
             case optimizers::OptimizerType::ADAMW_8BIT:
                 update_lora_adamw_8bit(comm, config.learning_rate, config.adamw_beta1, config.adamw_beta2,
                                        step, config.adamw_epsilon, config.weight_decay, config.grad_clip);
@@ -508,7 +664,8 @@ void DslModel::update_with_graph_params(NCCLCommunicator& comm, const optimizers
     if (!opt_params || !opt_step) {
         throw std::logic_error("DslModel::update_with_graph_params: missing optimizer parameter buffers");
     }
-    if (config.type != optimizers::OptimizerType::ADAMW_8BIT &&
+    if (config.type != optimizers::OptimizerType::ADAMW &&
+        config.type != optimizers::OptimizerType::ADAMW_8BIT &&
         config.type != optimizers::OptimizerType::NORMUON) {
         throw std::logic_error("DslModel::update_with_graph_params: unsupported optimizer type");
     }
@@ -516,18 +673,25 @@ void DslModel::update_with_graph_params(NCCLCommunicator& comm, const optimizers
         if (config.type == optimizers::OptimizerType::NORMUON) {
             throw std::logic_error("DslModel::update_with_graph_params: LoRA NorMuon graph capture not yet supported");
         }
+        if (config.type == optimizers::OptimizerType::ADAMW) {
+            update_lora_adamw_graph(comm, config.grad_clip, opt_params, opt_step);
+            return;
+        }
         update_lora_adamw_8bit_graph(comm, config.grad_clip, opt_params, opt_step);
         return;
     }
     if (config.type == optimizers::OptimizerType::NORMUON) {
         update_normuon_graph(comm, config.grad_clip, opt_params, opt_step);
+    } else if (config.type == optimizers::OptimizerType::ADAMW) {
+        update_adamw_graph(comm, config.grad_clip, opt_params, opt_step);
     } else {
         update_adamw_8bit_graph(comm, config.grad_clip, opt_params, opt_step);
     }
 }
 
 void DslModel::prepare_optimizer_state_for_graph(NCCLCommunicator& comm, const optimizers::OptimizerConfig& config) {
-    if (config.type != optimizers::OptimizerType::ADAMW_8BIT &&
+    if (config.type != optimizers::OptimizerType::ADAMW &&
+        config.type != optimizers::OptimizerType::ADAMW_8BIT &&
         config.type != optimizers::OptimizerType::NORMUON) {
         return;
     }
@@ -554,8 +718,36 @@ void DslModel::prepare_optimizer_state_for_graph(NCCLCommunicator& comm, const o
                 did_work = true;
             }
         }
+    } else if (config.type == optimizers::OptimizerType::ADAMW) {
+        // Full-precision AdamW optimizer state initialization
+        if (lora_enabled()) {
+            if (!mLoRAAdamWState) {
+                mLoRAAdamWState = std::make_unique<modules::LoRAAdamWState>();
+            }
+            if (!mLoRARunState->norm_ptrs_initialized) {
+                populate_lora_norm_pointers(comm, stream);
+                did_work = true;
+            }
+            if (!mLoRAAdamWState->initialized) {
+                initialize_lora_adamw_state(comm, stream);
+                did_work = true;
+            }
+            if (!mLoRAAdamWState->grad_ptrs_initialized) {
+                update_lora_adamw_grad_pointers(comm, stream);
+                mLoRAAdamWState->grad_ptrs_initialized = true;
+                did_work = true;
+            }
+        } else {
+            if (!mAdamWState) {
+                mAdamWState = std::make_unique<AdamWState>();
+            }
+            if (!mAdamWState->initialized) {
+                init_adamw_state(stream);
+                did_work = true;
+            }
+        }
     } else {
-        // AdamW optimizer state initialization
+        // AdamW 8-bit optimizer state initialization
         if (lora_enabled()) {
             if (!mLoRAAdamW8BitState) {
                 throw std::logic_error("DslModel::prepare_optimizer_state_for_graph: LoRA optimizer state not allocated");

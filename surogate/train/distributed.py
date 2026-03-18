@@ -625,8 +625,8 @@ class NodeTrainer:
             return result['loss'], result['norm']
 
         use_full_step_graphs = True
-        if use_full_step_graphs and config.optimizer not in ("adamw_8bit", "normuon"):
-            raise RuntimeError("DSL training requires optimizer 'adamw_8bit' or 'normuon' for full-step execution.")
+        if use_full_step_graphs and config.optimizer not in ("adamw", "adamw_8bit", "normuon"):
+            raise RuntimeError("DSL training requires optimizer 'adamw', 'adamw_8bit' or 'normuon' for full-step execution.")
 
         # Allocate token buffers
         micro_steps = config.gradient_accumulation_steps if use_full_step_graphs else 1

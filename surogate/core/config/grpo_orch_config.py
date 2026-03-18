@@ -99,6 +99,7 @@ class GRPOSamplingConfig:
     Args:
         temperature: Constant temperature for sampling. Defaults to 1.0 if neither this nor temp_scheduler is set. Cannot be set together with temp_scheduler.
         temp_scheduler: Temperature schedule over training steps. Set this OR temperature, not both.
+        top_p: Cumulative probability of the top tokens to consider. If 1, all tokens are considered.
         repetition_penalty: Penalty for repeating tokens. Values > 1.0 discourage repetition, values < 1.0 encourage repetition, and 1.0 means no penalty.
         max_tokens: Maximum number of output tokens to generate per turn. If None, will generate until maximum context length or EOS token is hit.
         min_tokens: Minimum number of output tokens to generate per sequence.
@@ -107,6 +108,7 @@ class GRPOSamplingConfig:
     """
     temperature: Optional[float] = None
     temp_scheduler: Optional[GRPOTemperatureSchedulerConfig] = None
+    top_p: Optional[float] = 1.0
     repetition_penalty: Optional[float] = 1.0
     max_tokens: Optional[int] = None
     min_tokens: Optional[int] = 0
@@ -117,6 +119,7 @@ class GRPOSamplingConfig:
         self.temperature = cfg.get("temperature", self.temperature)
         if cfg.get("temp_scheduler") is not None:
             self.temp_scheduler = GRPOTemperatureSchedulerConfig(cfg.get("temp_scheduler"))
+        self.top_p = cfg.get("top_p", self.top_p)
         self.repetition_penalty = cfg.get("repetition_penalty", self.repetition_penalty)
         self.max_tokens = cfg.get("max_tokens", self.max_tokens)
         self.min_tokens = cfg.get("min_tokens", self.min_tokens)
@@ -161,20 +164,26 @@ class GRPOEnvConfig:
             )
 
 @dataclass
-class GRPOEvalEnvConfig:
+class GRPOEvalEnvConfig(GRPOEnvConfig):
     """
-    Configures an environment for evaluation
-    
+    Configures an environment for evaluation.
+
+    Inherits base environment fields (`id`, `args`, `name`, `address`,
+    `extra_env_kwargs`, `max_retries`) and adds eval-specific overrides.
+
     Args:
-        num_examples: Number of examples to evaluate per environment.
-        rollouts_per_example: Number of rollouts to perform per example.
+        num_examples: Number of examples to evaluate for this environment.
+            If None, falls back to eval.num_examples.
+        rollouts_per_example: Number of rollouts per example for this
+            environment. If None, falls back to eval.rollouts_per_example.
         skip_first: Number of initial examples to skip. Defaults to 0.
     """
     num_examples: Optional[int] = None
     rollouts_per_example: Optional[int] = None
     skip_first: Optional[int] = 0
-    
+
     def __init__(self, cfg: DictDefault):
+        super().__init__(cfg)
         self.num_examples = cfg.get("num_examples", self.num_examples)
         self.rollouts_per_example = cfg.get("rollouts_per_example", self.rollouts_per_example)
         self.skip_first = cfg.get("skip_first", self.skip_first)

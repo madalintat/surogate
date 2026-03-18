@@ -257,8 +257,14 @@ private:
     void calculate_gradient_norm(NCCLCommunicator& comm, float grad_clip, cudaStream_t stream, bool grads_reduced);
     void allocate_lora_run_state(NCCLCommunicator& comm, int B, int T);
     void ensure_lora_run_state(NCCLCommunicator& comm, int B, int T);
+    void update_lora_adamw(NCCLCommunicator& comm, float learning_rate, float beta_1, float beta_2,
+                           int t, float epsilon, float weight_decay, float grad_clip);
+    void update_lora_adamw_graph(NCCLCommunicator& comm, float grad_clip,
+                                 const float* opt_params, const int* opt_step);
     void update_lora_adamw_8bit(NCCLCommunicator& comm, float learning_rate, float beta_1, float beta_2,
                                int t, float epsilon, float weight_decay, float grad_clip);
+    void update_adamw_graph(NCCLCommunicator& comm, float grad_clip,
+                            const float* opt_params, const int* opt_step);
     void update_adamw_8bit_graph(NCCLCommunicator& comm, float grad_clip,
                                  const float* opt_params, const int* opt_step);
     void update_normuon_graph(NCCLCommunicator& comm, float grad_clip,
@@ -269,7 +275,9 @@ private:
     void calculate_lora_gradient_norm(NCCLCommunicator& comm, float grad_clip);
     void populate_lora_norm_pointers(NCCLCommunicator& comm, cudaStream_t stream);
     void initialize_lora_multi_tensor_state(NCCLCommunicator& comm, cudaStream_t stream);
+    void initialize_lora_adamw_state(NCCLCommunicator& comm, cudaStream_t stream);
     void update_lora_grad_pointers(NCCLCommunicator& comm, cudaStream_t stream);
+    void update_lora_adamw_grad_pointers(NCCLCommunicator& comm, cudaStream_t stream);
 
     std::unique_ptr<PretrainedConfig> mConfig;
     modules::ModelConfig mModelConfig;
@@ -293,6 +301,7 @@ private:
     std::unique_ptr<modules::ModularLoRAWeightsManager> mLoRAWeights;
     std::unique_ptr<modules::ModularLoRAGradsManager> mLoRAGrads;
     std::unique_ptr<modules::LoRARunState> mLoRARunState;
+    std::unique_ptr<modules::LoRAAdamWState> mLoRAAdamWState;
     std::unique_ptr<modules::LoRAAdamW8BitState> mLoRAAdamW8BitState;
     std::unique_ptr<modules::LoRANorMuonState> mLoRANorMuonState;
     bool mIsMoEModel = false;

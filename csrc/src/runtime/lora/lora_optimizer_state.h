@@ -142,6 +142,24 @@ struct LoRAAdamW8BitState {
     Tensor state_offsets;   // int* - element offset for each tensor in state buffers (GROUP_SIZE-aligned)
 };
 
+// Full-precision AdamW optimizer state for LoRA weights (FP32 m and v)
+struct LoRAAdamWState {
+    bool initialized = false;
+    bool values_restored = false;  // Set when state values loaded from checkpoint
+    bool grad_ptrs_initialized = false;  // Set after grad pointer array is populated
+    size_t total_params = 0;
+    int num_tensors = 0;
+
+    Tensor state1;       // FP32 momentum
+    Tensor state2;       // FP32 variance
+
+    // Multi-tensor optimizer buffers (device memory)
+    Tensor param_ptrs;      // float** or nv_bfloat16** - array of param pointers
+    Tensor grad_ptrs;       // float** or nv_bfloat16** - array of grad pointers
+    Tensor tensor_sizes;    // int* - array of tensor sizes
+    Tensor state_offsets;   // int* - element offset for each tensor in state buffers
+};
+
 // NorMuon optimizer state for LoRA weights
 // Uses 8-bit quantized momentum + FP32 variance buffers
 struct LoRANorMuonState {

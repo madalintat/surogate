@@ -9,6 +9,7 @@ import yaml
 from pathlib import Path
 
 from surogate.grpo.orchestrator.advantage import compute_advantages
+from surogate.grpo.utils.asynyc_utils import safe_cancel
 from surogate.grpo.orchestrator.eval_utils import compute_eval_ckpt_step, get_eval_sampling_args
 from surogate.grpo.orchestrator.event_loop_lag import EventLoopLagMonitor
 from surogate.grpo.orchestrator.patches import monkey_patch_chat_completion_logprobs, monkey_patch_oai_iterable_types
@@ -816,15 +817,17 @@ async def orchestrate(config: GRPOOrchestratorConfig):
         await teacher_inference_pool.stop()
 
     # Cancel event loop lag monitor task
-    event_loop_lag_monitor_task.cancel()
+    await safe_cancel(event_loop_lag_monitor_task)
 
-    # Shutdown env processes
+    # Shutdown env processes. Use SIGKILL to avoid noisy tracebacks from the
+    # verifiers library's signal handler which raises exceptions inside running
+    # coroutines, causing "Task exception was never retrieved" warnings.
+    # Graceful cleanup isn't needed here since the inference pool and scheduler
+    # are already stopped — no more requests are in flight.
     for process in env_processes:
-        process.terminate()
-        process.join(timeout=5)
         if process.is_alive():
             process.kill()
-            process.join(timeout=5)
+        process.join(timeout=5)
             
     logger.success("Orchestrator finished.")
 
