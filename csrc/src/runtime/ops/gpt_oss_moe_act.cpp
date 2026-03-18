@@ -21,7 +21,7 @@ void CompiledExecutor::dispatch_gpt_oss_moe_act(const CompiledOp& op) {
         const long N = inp.Sizes[0];
         const long D = inp.Sizes[1] / 2;
         std::vector<long> out_shape = {N, D};
-        Tensor out = mRunState.temp_alloc(inp.DType, out_shape);
+        Tensor out = mRunState.temp_alloc(inp.DType, out_shape, "gpt_oss_moe_act_out");
         mTemps.push_back(out);
 
         if (inp.DType == ETensorDType::BF16) {
@@ -81,7 +81,7 @@ void CompiledExecutor::dispatch_gpt_oss_moe_act_backward(const CompiledOp& op) {
         }
         d_inp_ptr = &ensure_output_tensor(op.outputs[0]);
         if (static_cast<long>(d_inp_ptr->nelem()) != expected_inp) {
-            d_inp_local = mRunState.temp_alloc(inp.DType, {N, D * 2});
+            d_inp_local = mRunState.temp_alloc(inp.DType, {N, D * 2}, "gpt_oss_moe_act_backward_d_inp");
             mTemps.push_back(d_inp_local);
             store_tensor(op.outputs[0], d_inp_local);
             d_inp_ptr = &mTensors[op.outputs[0].tensor_id];
@@ -108,7 +108,7 @@ void CompiledExecutor::dispatch_gpt_oss_moe_act_backward(const CompiledOp& op) {
     d_inp_ptr = &ensure_output_tensor(op.outputs[0]);
     const long expected_inp = static_cast<long>(N) * D * 2;
     if (static_cast<long>(d_inp_ptr->nelem()) != expected_inp) {
-        d_inp_local = mRunState.temp_alloc(inp.DType, {d_out.Sizes[0], d_out.Sizes[1], D * 2});
+        d_inp_local = mRunState.temp_alloc(inp.DType, {d_out.Sizes[0], d_out.Sizes[1], D * 2}, "gpt_oss_moe_act_backward_d_inp");
         mTemps.push_back(d_inp_local);
         store_tensor(op.outputs[0], d_inp_local);
         d_inp_ptr = &mTensors[op.outputs[0].tensor_id];

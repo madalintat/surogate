@@ -80,9 +80,9 @@ void NVFP4Recipe::forward_matmul(modules::MatmulContext& ctx) const {
 
     auto [inp_scale_rows, inp_scale_cols] = compute_input_scale_shape(BT, C_in);
 
-    Tensor inp_fp4_data = rs.temp_alloc(ETensorDType::BYTE, {static_cast<long>(BT), static_cast<long>(C_in / 2)});
-    Tensor inp_fp4_scales = rs.temp_alloc(ETensorDType::FP8_E4M3, {inp_scale_rows, inp_scale_cols});
-    Tensor inp_global_amax = rs.temp_alloc(ETensorDType::FP32, {1});
+    Tensor inp_fp4_data = rs.temp_alloc(ETensorDType::BYTE, {static_cast<long>(BT), static_cast<long>(C_in / 2)}, "inp_fp4_data");
+    Tensor inp_fp4_scales = rs.temp_alloc(ETensorDType::FP8_E4M3, {inp_scale_rows, inp_scale_cols}, "inp_fp4_scales");
+    Tensor inp_global_amax = rs.temp_alloc(ETensorDType::FP32, {1}, "inp_global_amax");
 
     // Step 2: Quantize input to FP4 with two-level block scaling (auto scale)
     quantize_fp4_block_auto_scale(
@@ -107,9 +107,9 @@ void NVFP4Recipe::forward_matmul(modules::MatmulContext& ctx) const {
 
     auto [w_scale_rows, w_scale_cols] = compute_weight_scale_shape(C_out, C_in);
 
-    Tensor weight_fp4_data = rs.temp_alloc(ETensorDType::BYTE, {static_cast<long>(C_out), static_cast<long>(C_in / 2)});
-    Tensor weight_fp4_scales = rs.temp_alloc(ETensorDType::FP8_E4M3, {w_scale_rows, w_scale_cols});
-    Tensor weight_global_amax = rs.temp_alloc(ETensorDType::FP32, {1});
+    Tensor weight_fp4_data = rs.temp_alloc(ETensorDType::BYTE, {static_cast<long>(C_out), static_cast<long>(C_in / 2)}, "weight_fp4_data");
+    Tensor weight_fp4_scales = rs.temp_alloc(ETensorDType::FP8_E4M3, {w_scale_rows, w_scale_cols}, "weight_fp4_scales");
+    Tensor weight_global_amax = rs.temp_alloc(ETensorDType::FP32, {1}, "weight_global_amax");
 
     // Quantize weight to FP4 with column-major scale layout for cuDNN
     quantize_fp4_weight_2d_auto_scale(
@@ -147,7 +147,7 @@ void NVFP4Recipe::forward_matmul(modules::MatmulContext& ctx) const {
     const bool need_bf16_output = (ctx.out->DType == ETensorDType::BF16);
 
     if (need_bf16_output) {
-        out_f32 = rs.temp_alloc(ETensorDType::FP32, {static_cast<long>(BT), static_cast<long>(C_out)});
+        out_f32 = rs.temp_alloc(ETensorDType::FP32, {static_cast<long>(BT), static_cast<long>(C_out)}, "out_f32");
         out_f32_ptr = out_f32.get<float>();
     } else if (ctx.out->DType == ETensorDType::FP32) {
         out_f32_ptr = ctx.out->get<float>();
@@ -291,14 +291,14 @@ void NVFP4Recipe::backward_matmul(modules::MatmulContext& ctx) const {
         // fp4_matmul expects B stored as row-major (N, K) but interpreted as column-major (K, N).
         // For dinp (M=BT, N=C, K=OC), B must represent W (OC, C) as column-major (OC, C),
         // which corresponds to a row-major (C, OC) buffer.
-        Tensor weight_tp = rs.temp_alloc(ETensorDType::BF16, {static_cast<long>(C), static_cast<long>(OC)});
+        Tensor weight_tp = rs.temp_alloc(ETensorDType::BF16, {static_cast<long>(C), static_cast<long>(OC)}, "weight_tp");
         transpose(weight_tp, *ctx.weight, OC, C, ctx.stream);
 
         // Quantize dout (A) with stochastic rounding
-        Tensor dout_fp4 = rs.temp_alloc(ETensorDType::BYTE, {static_cast<long>(BT), static_cast<long>(OC / 2)});
+        Tensor dout_fp4 = rs.temp_alloc(ETensorDType::BYTE, {static_cast<long>(BT), static_cast<long>(OC / 2)}, "dout_fp4");
         auto [a_scale_rows, a_scale_cols] = fp4_scale_shape(BT, OC);
-        Tensor dout_scales = rs.temp_alloc(ETensorDType::FP8_E4M3, {a_scale_rows, a_scale_cols});
-        Tensor dout_amax = rs.temp_alloc(ETensorDType::FP32, {1});
+        Tensor dout_scales = rs.temp_alloc(ETensorDType::FP8_E4M3, {a_scale_rows, a_scale_cols}, "dout_scales");
+        Tensor dout_amax = rs.temp_alloc(ETensorDType::FP32, {1}, "dout_amax");
         quantize_fp4_block_stochastic_auto_scale(
             dout_fp4.get<uint8_t>(),
             dout_scales.get<__nv_fp8_e4m3>(),
@@ -309,10 +309,10 @@ void NVFP4Recipe::backward_matmul(modules::MatmulContext& ctx) const {
             rs.DeviceProp, ctx.stream);
 
         // Quantize W^T (B) with 16x16 weight scaling
-        Tensor w_fp4 = rs.temp_alloc(ETensorDType::BYTE, {static_cast<long>(C), static_cast<long>(OC / 2)});
+        Tensor w_fp4 = rs.temp_alloc(ETensorDType::BYTE, {static_cast<long>(C), static_cast<long>(OC / 2)}, "w_fp4");
         auto [w_scale_rows, w_scale_cols] = compute_weight_scale_shape(C, OC);
-        Tensor w_scales = rs.temp_alloc(ETensorDType::FP8_E4M3, {w_scale_rows, w_scale_cols});
-        Tensor w_amax = rs.temp_alloc(ETensorDType::FP32, {1});
+        Tensor w_scales = rs.temp_alloc(ETensorDType::FP8_E4M3, {w_scale_rows, w_scale_cols}, "w_scales");
+        Tensor w_amax = rs.temp_alloc(ETensorDType::FP32, {1}, "w_amax");
         quantize_fp4_weight_2d_auto_scale(
             w_fp4.get<uint8_t>(),
             w_scales.get<__nv_fp8_e4m3>(),
@@ -327,7 +327,7 @@ void NVFP4Recipe::backward_matmul(modules::MatmulContext& ctx) const {
         const bool need_bf16_dinp = (ctx.dinp->DType == ETensorDType::BF16);
 
         if (need_bf16_dinp) {
-            dinp_f32 = rs.temp_alloc(ETensorDType::FP32, {static_cast<long>(BT), static_cast<long>(C)});
+            dinp_f32 = rs.temp_alloc(ETensorDType::FP32, {static_cast<long>(BT), static_cast<long>(C)}, "dinp_f32");
             dinp_f32_ptr = dinp_f32.get<float>();
         } else if (ctx.dinp->DType == ETensorDType::FP32) {
             dinp_f32_ptr = ctx.dinp->get<float>();
@@ -381,8 +381,8 @@ void NVFP4Recipe::backward_matmul(modules::MatmulContext& ctx) const {
     // =========================================================================
     if (!ctx.skip_weight_grad && ctx.dweight) {
         // Transpose: A = dout^T (OC, BT), B = inp (BT, C) provided as column-major via row-major (C, BT)
-        Tensor dout_tp = rs.temp_alloc(ETensorDType::BF16, {static_cast<long>(OC), static_cast<long>(BT)});
-        Tensor inp_tp = rs.temp_alloc(ETensorDType::BF16, {static_cast<long>(C), static_cast<long>(BT)});
+        Tensor dout_tp = rs.temp_alloc(ETensorDType::BF16, {static_cast<long>(OC), static_cast<long>(BT)}, "dout_tp");
+        Tensor inp_tp = rs.temp_alloc(ETensorDType::BF16, {static_cast<long>(C), static_cast<long>(BT)}, "inp_tp");
         transpose(dout_tp, *ctx.dout, BT, OC, ctx.stream);
         transpose(inp_tp, *ctx.inp, BT, C, ctx.stream);
 
@@ -390,18 +390,18 @@ void NVFP4Recipe::backward_matmul(modules::MatmulContext& ctx) const {
         if ((BT % 16) != 0) {
             throw std::runtime_error("NVFP4Recipe::backward_matmul: BT must be multiple of 16 for RHT");
         }
-        Tensor dout_tp_r = rs.temp_alloc(ETensorDType::BF16, {static_cast<long>(OC), static_cast<long>(BT)});
-        Tensor inp_tp_r = rs.temp_alloc(ETensorDType::BF16, {static_cast<long>(C), static_cast<long>(BT)});
+        Tensor dout_tp_r = rs.temp_alloc(ETensorDType::BF16, {static_cast<long>(OC), static_cast<long>(BT)}, "dout_tp_r");
+        Tensor inp_tp_r = rs.temp_alloc(ETensorDType::BF16, {static_cast<long>(C), static_cast<long>(BT)}, "inp_tp_r");
         hadamard_transform_forward(dout_tp_r.get<nv_bfloat16>(), dout_tp.get<nv_bfloat16>(), nullptr, OC, BT, rht_seed, ctx.stream);
         hadamard_transform_forward(inp_tp_r.get<nv_bfloat16>(), inp_tp.get<nv_bfloat16>(), nullptr, C, BT, rht_seed, ctx.stream);
         const Tensor* q_dout_tp = &dout_tp_r;
         const Tensor* q_inp_tp = &inp_tp_r;
 
         // Quantize A (gradient) with stochastic rounding
-        Tensor a_fp4 = rs.temp_alloc(ETensorDType::BYTE, {static_cast<long>(OC), static_cast<long>(BT / 2)});
+        Tensor a_fp4 = rs.temp_alloc(ETensorDType::BYTE, {static_cast<long>(OC), static_cast<long>(BT / 2)}, "a_fp4");
         auto [a_scale_rows, a_scale_cols] = fp4_scale_shape(OC, BT);
-        Tensor a_scales = rs.temp_alloc(ETensorDType::FP8_E4M3, {a_scale_rows, a_scale_cols});
-        Tensor a_amax = rs.temp_alloc(ETensorDType::FP32, {1});
+        Tensor a_scales = rs.temp_alloc(ETensorDType::FP8_E4M3, {a_scale_rows, a_scale_cols}, "a_scales");
+        Tensor a_amax = rs.temp_alloc(ETensorDType::FP32, {1}, "a_amax");
         quantize_fp4_block_stochastic_auto_scale(
             a_fp4.get<uint8_t>(),
             a_scales.get<__nv_fp8_e4m3>(),
@@ -412,10 +412,10 @@ void NVFP4Recipe::backward_matmul(modules::MatmulContext& ctx) const {
             rs.DeviceProp, ctx.stream);
 
         // Quantize B (activation) with deterministic rounding in B-scale layout
-        Tensor b_fp4 = rs.temp_alloc(ETensorDType::BYTE, {static_cast<long>(C), static_cast<long>(BT / 2)});
+        Tensor b_fp4 = rs.temp_alloc(ETensorDType::BYTE, {static_cast<long>(C), static_cast<long>(BT / 2)}, "b_fp4");
         auto [b_scale_rows, b_scale_cols] = compute_weight_scale_shape(C, BT);
-        Tensor b_scales = rs.temp_alloc(ETensorDType::FP8_E4M3, {b_scale_rows, b_scale_cols});
-        Tensor b_amax = rs.temp_alloc(ETensorDType::FP32, {1});
+        Tensor b_scales = rs.temp_alloc(ETensorDType::FP8_E4M3, {b_scale_rows, b_scale_cols}, "b_scales");
+        Tensor b_amax = rs.temp_alloc(ETensorDType::FP32, {1}, "b_amax");
         quantize_fp4_weight_auto_scale(
             b_fp4.get<uint8_t>(),
             b_scales.get<__nv_fp8_e4m3>(),
@@ -425,7 +425,7 @@ void NVFP4Recipe::backward_matmul(modules::MatmulContext& ctx) const {
             rs.DeviceProp, ctx.stream);
 
         // Matmul: (OC, BT) @ (BT, C) -> (OC, C)
-        Tensor dw_f32 = rs.temp_alloc(ETensorDType::FP32, {static_cast<long>(OC), static_cast<long>(C)});
+        Tensor dw_f32 = rs.temp_alloc(ETensorDType::FP32, {static_cast<long>(OC), static_cast<long>(C)}, "dw_f32");
         float* dw_f32_ptr = dw_f32.get<float>();
 
         fp4_matmul_f32(
@@ -460,7 +460,7 @@ void NVFP4Recipe::backward_matmul(modules::MatmulContext& ctx) const {
                     b_amax.get<float>(),
                     static_cast<long>(OC) * C,
                     rs.DeviceProp, ctx.stream);
-                Tensor dw_bf16 = rs.temp_alloc(ETensorDType::BF16, {static_cast<long>(OC), static_cast<long>(C)});
+                Tensor dw_bf16 = rs.temp_alloc(ETensorDType::BF16, {static_cast<long>(OC), static_cast<long>(C)}, "dw_bf16");
                 convert_dtype(dw_bf16.get<nv_bfloat16>(), dw_f32_ptr,
                               static_cast<std::size_t>(OC) * static_cast<std::size_t>(C), ctx.stream);
                 vector_add_sr(ctx.dweight->get<nv_bfloat16>(), ctx.dweight->get<nv_bfloat16>(), dw_bf16.get<nv_bfloat16>(),
@@ -549,8 +549,8 @@ void NVFP4Recipe::forward_matmul_cutlass(modules::MatmulContext& ctx) const {
 
     // Step 1: Allocate FP4 input buffers with CUTLASS scale layout
     const size_t inp_scale_size = compute_nvfp4_cutlass_scale_size(BT, C_in);
-    Tensor inp_fp4_data = rs.temp_alloc(ETensorDType::BYTE, {static_cast<long>(BT), static_cast<long>(C_in / 2)});
-    Tensor inp_fp4_scales = rs.temp_alloc(ETensorDType::BYTE, {static_cast<long>(inp_scale_size)});
+    Tensor inp_fp4_data = rs.temp_alloc(ETensorDType::BYTE, {static_cast<long>(BT), static_cast<long>(C_in / 2)}, "inp_fp4_data");
+    Tensor inp_fp4_scales = rs.temp_alloc(ETensorDType::BYTE, {static_cast<long>(inp_scale_size)}, "inp_fp4_scales");
 
     // Step 2: Quantize input to FP4 with two-level scaling.
     //
@@ -572,7 +572,7 @@ void NVFP4Recipe::forward_matmul_cutlass(modules::MatmulContext& ctx) const {
             // Note: 4/6 quantization requires computing amax internally, so we can't use the from_amax path
             if (mConfig.enable_four_over_six) {
                 // 4/6 doesn't support from_amax, fall back to auto_scale (will recompute amax)
-                inp_global_amax = rs.temp_alloc(ETensorDType::FP32, {1});
+                inp_global_amax = rs.temp_alloc(ETensorDType::FP32, {1}, "inp_global_amax");
                 inp_global_amax_ptr = inp_global_amax.get<float>();
                 inp_amax_is_temp = true;
                 quantize_nvfp4_4o6_cutlass_auto_scale(
@@ -593,7 +593,7 @@ void NVFP4Recipe::forward_matmul_cutlass(modules::MatmulContext& ctx) const {
                     rs.DeviceProp, ctx.stream);
             }
         } else {
-            inp_global_amax = rs.temp_alloc(ETensorDType::FP32, {1});
+            inp_global_amax = rs.temp_alloc(ETensorDType::FP32, {1}, "inp_global_amax");
             inp_global_amax_ptr = inp_global_amax.get<float>();
             inp_amax_is_temp = true;
             if (mConfig.enable_four_over_six) {
@@ -635,9 +635,9 @@ void NVFP4Recipe::forward_matmul_cutlass(modules::MatmulContext& ctx) const {
     } else {
         // Quantize weight on-the-fly (original path)
         const size_t weight_scale_size = compute_nvfp4_cutlass_scale_size(C_out, C_in);
-        weight_fp4_data = rs.temp_alloc(ETensorDType::BYTE, {static_cast<long>(C_out), static_cast<long>(C_in / 2)});
-        weight_fp4_scales = rs.temp_alloc(ETensorDType::BYTE, {static_cast<long>(weight_scale_size)});
-        weight_global_amax = rs.temp_alloc(ETensorDType::FP32, {1});
+        weight_fp4_data = rs.temp_alloc(ETensorDType::BYTE, {static_cast<long>(C_out), static_cast<long>(C_in / 2)}, "weight_fp4_data");
+        weight_fp4_scales = rs.temp_alloc(ETensorDType::BYTE, {static_cast<long>(weight_scale_size)}, "weight_fp4_scales");
+        weight_global_amax = rs.temp_alloc(ETensorDType::FP32, {1}, "weight_global_amax");
 
         if (mConfig.enable_four_over_six) {
             quantize_nvfp4_4o6_cutlass_auto_scale(
@@ -747,9 +747,9 @@ void NVFP4Recipe::backward_matmul_cutlass(modules::MatmulContext& ctx) const {
         // CUTLASS FP4 matmul requires both inputs to use the same tensor scale.
         // 4/6 is only used for forward (input, weight) and wgrad (dout^T, inp^T).
         const size_t dout_scale_size = compute_nvfp4_cutlass_scale_size(BT, OC);
-        Tensor dout_fp4 = rs.temp_alloc(ETensorDType::BYTE, {static_cast<long>(BT), static_cast<long>(OC / 2)});
-        Tensor dout_scales = rs.temp_alloc(ETensorDType::BYTE, {static_cast<long>(dout_scale_size)});
-        Tensor dout_amax = rs.temp_alloc(ETensorDType::FP32, {1});
+        Tensor dout_fp4 = rs.temp_alloc(ETensorDType::BYTE, {static_cast<long>(BT), static_cast<long>(OC / 2)}, "dout_fp4");
+        Tensor dout_scales = rs.temp_alloc(ETensorDType::BYTE, {static_cast<long>(dout_scale_size)}, "dout_scales");
+        Tensor dout_amax = rs.temp_alloc(ETensorDType::FP32, {1}, "dout_amax");
 
         quantize_nvfp4_stochastic_cutlass_auto_scale(
             dout_fp4.get<uint8_t>(),
@@ -781,9 +781,9 @@ void NVFP4Recipe::backward_matmul_cutlass(modules::MatmulContext& ctx) const {
             w_amax_ptr = ctx.cached_fp4_amax;
         } else {
             const size_t w_scale_size = compute_nvfp4_cutlass_scale_size(C, OC);
-            w_fp4 = rs.temp_alloc(ETensorDType::BYTE, {static_cast<long>(C), static_cast<long>(OC / 2)});
-            w_scales = rs.temp_alloc(ETensorDType::BYTE, {static_cast<long>(w_scale_size)});
-            w_amax = rs.temp_alloc(ETensorDType::FP32, {1});
+            w_fp4 = rs.temp_alloc(ETensorDType::BYTE, {static_cast<long>(C), static_cast<long>(OC / 2)}, "w_fp4");
+            w_scales = rs.temp_alloc(ETensorDType::BYTE, {static_cast<long>(w_scale_size)}, "w_scales");
+            w_amax = rs.temp_alloc(ETensorDType::FP32, {1}, "w_amax");
 
             // Note: No 4/6 variant for weight transpose quantization yet, use standard path
             quantize_nvfp4_weight_cutlass_transpose_auto_scale(
@@ -801,7 +801,7 @@ void NVFP4Recipe::backward_matmul_cutlass(modules::MatmulContext& ctx) const {
 
         // Compute alpha on device
         // For dgrad, both dout and W^T use standard quantization (2688), so always use standard alpha.
-        Tensor alpha = rs.temp_alloc(ETensorDType::FP32, {1});
+        Tensor alpha = rs.temp_alloc(ETensorDType::FP32, {1}, "alpha");
         compute_fp4_alpha(
             alpha.get<float>(),
             dout_amax.get<float>(),
@@ -841,16 +841,16 @@ void NVFP4Recipe::backward_matmul_cutlass(modules::MatmulContext& ctx) const {
     // =========================================================================
     if (!ctx.skip_weight_grad && ctx.dweight) {
         // For wgrad: A = dout^T (OC, BT), B = inp^T (C, BT) -> result (OC, C)
-        Tensor dout_tp = rs.temp_alloc(ETensorDType::BF16, {static_cast<long>(OC), static_cast<long>(BT)});
-        Tensor inp_tp = rs.temp_alloc(ETensorDType::BF16, {static_cast<long>(C), static_cast<long>(BT)});
+        Tensor dout_tp = rs.temp_alloc(ETensorDType::BF16, {static_cast<long>(OC), static_cast<long>(BT)}, "dout_tp");
+        Tensor inp_tp = rs.temp_alloc(ETensorDType::BF16, {static_cast<long>(C), static_cast<long>(BT)}, "inp_tp");
         transpose(dout_tp, *ctx.dout, BT, OC, ctx.stream);
         transpose(inp_tp, *ctx.inp, BT, C, ctx.stream);
 
         // Quantize A (dout^T) with stochastic rounding + two-level scaling
         const size_t a_scale_size = compute_nvfp4_cutlass_scale_size(OC, BT);
-        Tensor a_fp4 = rs.temp_alloc(ETensorDType::BYTE, {static_cast<long>(OC), static_cast<long>(BT / 2)});
-        Tensor a_scales = rs.temp_alloc(ETensorDType::BYTE, {static_cast<long>(a_scale_size)});
-        Tensor a_amax = rs.temp_alloc(ETensorDType::FP32, {1});
+        Tensor a_fp4 = rs.temp_alloc(ETensorDType::BYTE, {static_cast<long>(OC), static_cast<long>(BT / 2)}, "a_fp4");
+        Tensor a_scales = rs.temp_alloc(ETensorDType::BYTE, {static_cast<long>(a_scale_size)}, "a_scales");
+        Tensor a_amax = rs.temp_alloc(ETensorDType::FP32, {1}, "a_amax");
 
         if (mConfig.enable_four_over_six) {
             quantize_nvfp4_4o6_stochastic_cutlass_auto_scale(
@@ -874,9 +874,9 @@ void NVFP4Recipe::backward_matmul_cutlass(modules::MatmulContext& ctx) const {
 
         // Quantize B (inp^T) with two-level scaling
         const size_t b_scale_size = compute_nvfp4_cutlass_scale_size(C, BT);
-        Tensor b_fp4 = rs.temp_alloc(ETensorDType::BYTE, {static_cast<long>(C), static_cast<long>(BT / 2)});
-        Tensor b_scales = rs.temp_alloc(ETensorDType::BYTE, {static_cast<long>(b_scale_size)});
-        Tensor b_amax = rs.temp_alloc(ETensorDType::FP32, {1});
+        Tensor b_fp4 = rs.temp_alloc(ETensorDType::BYTE, {static_cast<long>(C), static_cast<long>(BT / 2)}, "b_fp4");
+        Tensor b_scales = rs.temp_alloc(ETensorDType::BYTE, {static_cast<long>(b_scale_size)}, "b_scales");
+        Tensor b_amax = rs.temp_alloc(ETensorDType::FP32, {1}, "b_amax");
 
         if (mConfig.enable_four_over_six) {
             quantize_nvfp4_4o6_cutlass_auto_scale(
@@ -934,7 +934,7 @@ void NVFP4Recipe::backward_matmul_cutlass(modules::MatmulContext& ctx) const {
                 ctx.stream);
         } else {
             // For accumulate mode, need to compute to temp buffer then add
-            Tensor dw_temp = rs.temp_alloc(ETensorDType::BF16, {static_cast<long>(OC), static_cast<long>(C)});
+            Tensor dw_temp = rs.temp_alloc(ETensorDType::BF16, {static_cast<long>(OC), static_cast<long>(C)}, "dw_temp");
             matmul_cutlass_fp4_alpha(
                 dw_temp.get<nv_bfloat16>(),
                 a_fp4.get<uint8_t>(),

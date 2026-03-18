@@ -84,7 +84,7 @@ void CompiledExecutor::dispatch_gated_delta_rule_common(const CompiledOp& op,
         }
     }
     if (!out_ptr) {
-        Tensor out_t = mRunState.temp_alloc(v.DType, {B, T, H, V});
+        Tensor out_t = mRunState.temp_alloc(v.DType, {B, T, H, V}, "gated_delta_rule_output");
         mTemps.push_back(out_t);
         out_ptr = &mTemps.back();
     }
@@ -98,7 +98,7 @@ void CompiledExecutor::dispatch_gated_delta_rule_common(const CompiledOp& op,
         }
     }
     if (!final_state_ptr) {
-        Tensor state_t = mRunState.temp_alloc(ETensorDType::FP32, {B, H, K, V});
+        Tensor state_t = mRunState.temp_alloc(ETensorDType::FP32, {B, H, K, V}, "gated_delta_rule_final_state");
         mTemps.push_back(state_t);
         final_state_ptr = &mTemps.back();
     }
@@ -122,13 +122,13 @@ void CompiledExecutor::dispatch_gated_delta_rule_common(const CompiledOp& op,
     void* q_eff = q.Data;
     void* k_eff = k.Data;
     if (use_l2norm) {
-        Tensor q_norm = mRunState.temp_alloc(q.DType, {B, T, H, K});
+        Tensor q_norm = mRunState.temp_alloc(q.DType, {B, T, H, K}, "gated_delta_rule_q_norm");
         mTemps.push_back(q_norm);
-        Tensor q_rstd = mRunState.temp_alloc(ETensorDType::FP32, {B, T, H});
+        Tensor q_rstd = mRunState.temp_alloc(ETensorDType::FP32, {B, T, H}, "gated_delta_rule_q_rstd");
         mTemps.push_back(q_rstd);
-        Tensor k_norm = mRunState.temp_alloc(k.DType, {B, T, H, K});
+        Tensor k_norm = mRunState.temp_alloc(k.DType, {B, T, H, K}, "gated_delta_rule_k_norm");
         mTemps.push_back(k_norm);
-        Tensor k_rstd = mRunState.temp_alloc(ETensorDType::FP32, {B, T, H});
+        Tensor k_rstd = mRunState.temp_alloc(ETensorDType::FP32, {B, T, H}, "gated_delta_rule_k_rstd");
         mTemps.push_back(k_rstd);
 
         // L2 norm Q: (x, y, rstd, T)
@@ -152,20 +152,20 @@ void CompiledExecutor::dispatch_gated_delta_rule_common(const CompiledOp& op,
     }
 
     // Allocate intermediates
-    Tensor g_cum = mRunState.temp_alloc(ETensorDType::FP32, {B, T, H});
+    Tensor g_cum = mRunState.temp_alloc(ETensorDType::FP32, {B, T, H}, "gated_delta_rule_g_cum");
     mTemps.push_back(g_cum);
-    Tensor A = mRunState.temp_alloc(ETensorDType::FP32, {B, T, H, BT});
+    Tensor A = mRunState.temp_alloc(ETensorDType::FP32, {B, T, H, BT}, "gated_delta_rule_A");
     mTemps.push_back(A);
-    Tensor Ai = mRunState.temp_alloc(ETensorDType::BF16, {B, T, H, BT});
+    Tensor Ai = mRunState.temp_alloc(ETensorDType::BF16, {B, T, H, BT}, "gated_delta_rule_Ai");
     mTemps.push_back(Ai);
     CUDA_CHECK(cudaMemsetAsync(Ai.Data, 0, Ai.nelem() * 2, stream));
-    Tensor w = mRunState.temp_alloc(ETensorDType::BF16, {B, T, H, K});
+    Tensor w = mRunState.temp_alloc(ETensorDType::BF16, {B, T, H, K}, "gated_delta_rule_w");
     mTemps.push_back(w);
-    Tensor u = mRunState.temp_alloc(ETensorDType::BF16, {B, T, H, V});
+    Tensor u = mRunState.temp_alloc(ETensorDType::BF16, {B, T, H, V}, "gated_delta_rule_u");
     mTemps.push_back(u);
-    Tensor h = mRunState.temp_alloc(ETensorDType::BF16, {B, static_cast<long>(NT), H, K, V});
+    Tensor h = mRunState.temp_alloc(ETensorDType::BF16, {B, static_cast<long>(NT), H, K, V}, "gated_delta_rule_h");
     mTemps.push_back(h);
-    Tensor v_new = mRunState.temp_alloc(ETensorDType::BF16, {B, T, H, V});
+    Tensor v_new = mRunState.temp_alloc(ETensorDType::BF16, {B, T, H, V}, "gated_delta_rule_v_new");
     mTemps.push_back(v_new);
 
     // If no initial_state, allocate a zeroed one.
@@ -175,7 +175,7 @@ void CompiledExecutor::dispatch_gated_delta_rule_common(const CompiledOp& op,
     if (initial_state) {
         h0_ptr = initial_state->Data;
     } else {
-        h0_buf = mRunState.temp_alloc(ETensorDType::BF16, {B, H, K, V});
+        h0_buf = mRunState.temp_alloc(ETensorDType::BF16, {B, H, K, V}, "gated_delta_rule_h0_buf");
         mTemps.push_back(h0_buf);
         CUDA_CHECK(cudaMemsetAsync(h0_buf.Data, 0, h0_buf.nelem() * 2, stream));
         h0_ptr = h0_buf.Data;
@@ -382,13 +382,13 @@ void CompiledExecutor::dispatch_chunk_gated_delta_rule_backward(const CompiledOp
     Tensor dq_norm_buf, dk_norm_buf;
     if (use_l2norm) {
         if (debug_replay) fprintf(stderr, "[GDR_BWD] l2norm: allocating temps...\n");
-        q_norm_bwd = mRunState.temp_alloc(q.DType, {B, T, H, K});
+        q_norm_bwd = mRunState.temp_alloc(q.DType, {B, T, H, K}, "gated_delta_rule_q_norm_bwd");
         mTemps.push_back(q_norm_bwd);
-        q_rstd_bwd = mRunState.temp_alloc(ETensorDType::FP32, {B, T, H});
+        q_rstd_bwd = mRunState.temp_alloc(ETensorDType::FP32, {B, T, H}, "gated_delta_rule_q_rstd_bwd");
         mTemps.push_back(q_rstd_bwd);
-        k_norm_bwd = mRunState.temp_alloc(k.DType, {B, T, H, K});
+        k_norm_bwd = mRunState.temp_alloc(k.DType, {B, T, H, K}, "gated_delta_rule_k_norm_bwd");
         mTemps.push_back(k_norm_bwd);
-        k_rstd_bwd = mRunState.temp_alloc(ETensorDType::FP32, {B, T, H});
+        k_rstd_bwd = mRunState.temp_alloc(ETensorDType::FP32, {B, T, H}, "gated_delta_rule_k_rstd_bwd");
         mTemps.push_back(k_rstd_bwd);
         if (debug_replay) fprintf(stderr, "[GDR_BWD] l2norm: launching q_norm kernel...\n");
         {
@@ -412,10 +412,10 @@ void CompiledExecutor::dispatch_chunk_gated_delta_rule_backward(const CompiledOp
         // Backward pipeline writes dq_norm/dk_norm to temp buffers
         try {
             if (debug_replay) fprintf(stderr, "[GDR_BWD] l2norm: temp_alloc dq_norm q.DType=%d\n", static_cast<int>(q.DType));
-            dq_norm_buf = mRunState.temp_alloc(q.DType, {B, T, H, K});
+            dq_norm_buf = mRunState.temp_alloc(q.DType, {B, T, H, K}, "gated_delta_rule_dq_norm_buf");
             if (debug_replay) fprintf(stderr, "[GDR_BWD] l2norm: dq_norm_buf.Data=%p\n", dq_norm_buf.Data);
             mTemps.push_back(dq_norm_buf);
-            dk_norm_buf = mRunState.temp_alloc(k.DType, {B, T, H, K});
+            dk_norm_buf = mRunState.temp_alloc(k.DType, {B, T, H, K}, "gated_delta_rule_dk_norm_buf");
             if (debug_replay) fprintf(stderr, "[GDR_BWD] l2norm: dk_norm_buf.Data=%p\n", dk_norm_buf.Data);
             mTemps.push_back(dk_norm_buf);
         } catch (const std::exception& e) {
@@ -430,7 +430,7 @@ void CompiledExecutor::dispatch_chunk_gated_delta_rule_backward(const CompiledOp
     // ---- Recompute forward intermediates ----
     if (debug_replay) fprintf(stderr, "[GDR_BWD] recomputing forward intermediates...\n");
     // g_cum
-    Tensor g_cum = mRunState.temp_alloc(ETensorDType::FP32, {B, T, H});
+    Tensor g_cum = mRunState.temp_alloc(ETensorDType::FP32, {B, T, H}, "gated_delta_rule_g_cum");
     mTemps.push_back(g_cum);
     {
         void* g_in = g_input.Data; void* g_out = g_cum.Data;
@@ -439,7 +439,7 @@ void CompiledExecutor::dispatch_chunk_gated_delta_rule_backward(const CompiledOp
         mGdrKernels.cumsum_fwd({static_cast<unsigned>(NT), static_cast<unsigned>(BH), 1}, args, 3, stream);
     }
     // A, Ai
-    Tensor A = mRunState.temp_alloc(ETensorDType::FP32, {B, T, H, BT});
+    Tensor A = mRunState.temp_alloc(ETensorDType::FP32, {B, T, H, BT}, "gated_delta_rule_A");
     mTemps.push_back(A);
     {
         void* gp = g_cum.Data; void* bp = beta.Data; void* ap = A.Data;
@@ -447,7 +447,7 @@ void CompiledExecutor::dispatch_chunk_gated_delta_rule_backward(const CompiledOp
         void* args[] = { &k_eff, &gp, &bp, &ap, &Tv };
         mGdrKernels.kkt_fwd({static_cast<unsigned>(NT), static_cast<unsigned>(BH), 1}, args, 5, stream);
     }
-    Tensor Ai = mRunState.temp_alloc(ETensorDType::BF16, {B, T, H, BT});
+    Tensor Ai = mRunState.temp_alloc(ETensorDType::BF16, {B, T, H, BT}, "gated_delta_rule_Ai");
     mTemps.push_back(Ai);
     CUDA_CHECK(cudaMemsetAsync(Ai.Data, 0, Ai.nelem() * 2, stream));
     {
@@ -457,9 +457,9 @@ void CompiledExecutor::dispatch_chunk_gated_delta_rule_backward(const CompiledOp
         mGdrKernels.solve_tril({static_cast<unsigned>(NT), static_cast<unsigned>(BH), 1}, args, 3, stream);
     }
     // w, u
-    Tensor w = mRunState.temp_alloc(ETensorDType::BF16, {B, T, H, K});
+    Tensor w = mRunState.temp_alloc(ETensorDType::BF16, {B, T, H, K}, "gated_delta_rule_w");
     mTemps.push_back(w);
-    Tensor u_buf = mRunState.temp_alloc(ETensorDType::BF16, {B, T, H, V});
+    Tensor u_buf = mRunState.temp_alloc(ETensorDType::BF16, {B, T, H, V}, "gated_delta_rule_u_buf");
     mTemps.push_back(u_buf);
     {
         void* vp = v.Data; void* bp = beta.Data;
@@ -469,11 +469,11 @@ void CompiledExecutor::dispatch_chunk_gated_delta_rule_backward(const CompiledOp
         mGdrKernels.wy_fwd({static_cast<unsigned>(NT), static_cast<unsigned>(BH), 1}, args, 8, stream);
     }
     // h, v_new
-    Tensor h = mRunState.temp_alloc(ETensorDType::BF16, {B, static_cast<long>(NT), H, K, V});
+    Tensor h = mRunState.temp_alloc(ETensorDType::BF16, {B, static_cast<long>(NT), H, K, V}, "gated_delta_rule_h");
     mTemps.push_back(h);
-    Tensor ht_dummy = mRunState.temp_alloc(ETensorDType::FP32, {B, H, K, V});
+    Tensor ht_dummy = mRunState.temp_alloc(ETensorDType::FP32, {B, H, K, V}, "gated_delta_rule_ht_dummy");
     mTemps.push_back(ht_dummy);
-    Tensor v_new = mRunState.temp_alloc(ETensorDType::BF16, {B, T, H, V});
+    Tensor v_new = mRunState.temp_alloc(ETensorDType::BF16, {B, T, H, V}, "gated_delta_rule_v_new");
     mTemps.push_back(v_new);
 
     void* h0_ptr;
@@ -481,7 +481,7 @@ void CompiledExecutor::dispatch_chunk_gated_delta_rule_backward(const CompiledOp
     if (initial_state) {
         h0_ptr = initial_state->Data;
     } else {
-        h0_buf = mRunState.temp_alloc(ETensorDType::BF16, {B, H, K, V});
+        h0_buf = mRunState.temp_alloc(ETensorDType::BF16, {B, H, K, V}, "gated_delta_rule_h0_buf");
         mTemps.push_back(h0_buf);
         CUDA_CHECK(cudaMemsetAsync(h0_buf.Data, 0, h0_buf.nelem() * 2, stream));
         h0_ptr = h0_buf.Data;
@@ -510,16 +510,16 @@ void CompiledExecutor::dispatch_chunk_gated_delta_rule_backward(const CompiledOp
     }
 
     // bwd_dhu
-    Tensor dh = mRunState.temp_alloc(ETensorDType::BF16, {B, static_cast<long>(NT), H, K, V});
+    Tensor dh = mRunState.temp_alloc(ETensorDType::BF16, {B, static_cast<long>(NT), H, K, V}, "gated_delta_rule_dh");
     mTemps.push_back(dh);
-    Tensor dv2 = mRunState.temp_alloc(ETensorDType::BF16, {B, T, H, V});
+    Tensor dv2 = mRunState.temp_alloc(ETensorDType::BF16, {B, T, H, V}, "gated_delta_rule_dv2");
     mTemps.push_back(dv2);
     {
         void* wp = w.Data; void* gp = g_cum.Data;
         void* dhtp = d_final_state ? d_final_state->Data : nullptr;
         Tensor dht_zero;
         if (!dhtp) {
-            dht_zero = mRunState.temp_alloc(ETensorDType::FP32, {B, H, K, V});
+            dht_zero = mRunState.temp_alloc(ETensorDType::FP32, {B, H, K, V}, "gated_delta_rule_dht_zero");
             mTemps.push_back(dht_zero);
             CUDA_CHECK(cudaMemsetAsync(dht_zero.Data, 0, dht_zero.nelem() * sizeof(float), stream));
             dhtp = dht_zero.Data;
@@ -535,9 +535,9 @@ void CompiledExecutor::dispatch_chunk_gated_delta_rule_backward(const CompiledOp
     }
 
     // bwd_dqkwg
-    Tensor dw = mRunState.temp_alloc(ETensorDType::BF16, {B, T, H, K});
+    Tensor dw = mRunState.temp_alloc(ETensorDType::BF16, {B, T, H, K}, "gated_delta_rule_dw");
     mTemps.push_back(dw);
-    Tensor dg_nk = mRunState.temp_alloc(ETensorDType::FP32, {static_cast<long>(NK), B, T, H});
+    Tensor dg_nk = mRunState.temp_alloc(ETensorDType::FP32, {static_cast<long>(NK), B, T, H}, "gated_delta_rule_dg_nk");
     mTemps.push_back(dg_nk);
     {
         void* vnp = v_new.Data;
@@ -582,7 +582,7 @@ void CompiledExecutor::dispatch_chunk_gated_delta_rule_backward(const CompiledOp
     }
 
     // bwd_wy: (k, v, beta, g, Ai, dw, dv2, dk, dv, db, dg_wy, T)
-    Tensor dg_wy = mRunState.temp_alloc(ETensorDType::FP32, {B, T, H});
+    Tensor dg_wy = mRunState.temp_alloc(ETensorDType::FP32, {B, T, H}, "gated_delta_rule_dg_wy");
     mTemps.push_back(dg_wy);
     {
         void* vp = v.Data; void* bp = beta.Data;
@@ -605,7 +605,7 @@ void CompiledExecutor::dispatch_chunk_gated_delta_rule_backward(const CompiledOp
     }
 
     // cumsum_rev: reverse cumulative sum for dg
-    Tensor dg_out = mRunState.temp_alloc(d_g->DType, {B, T, H});
+    Tensor dg_out = mRunState.temp_alloc(d_g->DType, {B, T, H}, "gated_delta_rule_dg_out");
     mTemps.push_back(dg_out);
     {
         void* dg_in = d_g->Data; void* dg_outp = dg_out.Data;

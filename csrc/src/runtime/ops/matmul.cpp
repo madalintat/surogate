@@ -75,7 +75,7 @@ void CompiledExecutor::dispatch_matmul(const CompiledOp& op, const modules::Forw
         };
         Tensor a_f = a;
         if (a.DType != ETensorDType::FP32) {
-            a_f = mRunState.temp_alloc(ETensorDType::FP32, shape_vec(a));
+            a_f = mRunState.temp_alloc(ETensorDType::FP32, shape_vec(a), "matmul_router_a_fp32");
             mTemps.push_back(a_f);
             if (a.DType == ETensorDType::BF16) {
                 convert_dtype(a_f.get<float>(), a.get<nv_bfloat16>(), a.nelem(), mRunState.MainStream);
@@ -86,7 +86,7 @@ void CompiledExecutor::dispatch_matmul(const CompiledOp& op, const modules::Forw
 
         Tensor b_f = b;
         if (b.DType != ETensorDType::FP32) {
-            b_f = mRunState.temp_alloc(ETensorDType::FP32, shape_vec(b));
+            b_f = mRunState.temp_alloc(ETensorDType::FP32, shape_vec(b), "matmul_router_b_fp32");
             mTemps.push_back(b_f);
             if (b.DType == ETensorDType::BF16) {
                 convert_dtype(b_f.get<float>(), b.get<nv_bfloat16>(), b.nelem(), mRunState.MainStream);
@@ -100,7 +100,7 @@ void CompiledExecutor::dispatch_matmul(const CompiledOp& op, const modules::Forw
             if (bias->DType == ETensorDType::FP32) {
                 bias_f = bias;
             } else {
-                Tensor tmp = mRunState.temp_alloc(ETensorDType::FP32, shape_vec(*bias));
+                Tensor tmp = mRunState.temp_alloc(ETensorDType::FP32, shape_vec(*bias), "matmul_router_bias_fp32");
                 mTemps.push_back(tmp);
                 if (bias->DType == ETensorDType::BF16) {
                     convert_dtype(tmp.get<float>(), bias->get<nv_bfloat16>(), bias->nelem(), mRunState.MainStream);
@@ -113,7 +113,7 @@ void CompiledExecutor::dispatch_matmul(const CompiledOp& op, const modules::Forw
 
         Tensor out_f = out;
         if (out.DType != ETensorDType::FP32) {
-            out_f = mRunState.temp_alloc(ETensorDType::FP32, shape_vec(out));
+            out_f = mRunState.temp_alloc(ETensorDType::FP32, shape_vec(out), "matmul_router_out_fp32");
             mTemps.push_back(out_f);
         }
 
@@ -474,7 +474,7 @@ void CompiledExecutor::dispatch_matmul_backward(const CompiledOp& op, const modu
     auto ensure_backward_output = [&](const TensorRef& ref, const Tensor& shape_source) -> Tensor& {
         if (ref.shape.empty() && shape_source.Rank > 0) {
             std::vector<long> shape(shape_source.Sizes.begin(), shape_source.Sizes.begin() + shape_source.Rank);
-            Tensor t = mRunState.temp_alloc(shape_source.DType, shape);
+            Tensor t = mRunState.temp_alloc(shape_source.DType, shape, "matmul_bwd_temp");
             fill_zero(t, mRunState.MainStream);
             mTemps.push_back(t);
             store_tensor(ref, t);
@@ -517,12 +517,12 @@ void CompiledExecutor::dispatch_matmul_backward(const CompiledOp& op, const modu
         Tensor* dB_use = dB_ptr;
 
         if (!dA_use) {
-            dA_tmp = mRunState.temp_alloc(a.DType, {a.Sizes[0], a.Sizes[1]});
+            dA_tmp = mRunState.temp_alloc(a.DType, {a.Sizes[0], a.Sizes[1]}, "matmul_dA_tmp");
             mTemps.push_back(dA_tmp);
             dA_use = &dA_tmp;
         }
         if (!dB_use) {
-            dB_tmp = mRunState.temp_alloc(b.DType, {b.Sizes[0], b.Sizes[1]});
+            dB_tmp = mRunState.temp_alloc(b.DType, {b.Sizes[0], b.Sizes[1]}, "matmul_dB_tmp");
             mTemps.push_back(dB_tmp);
             dB_use = &dB_tmp;
         }
@@ -718,7 +718,7 @@ void CompiledExecutor::dispatch_matmul_backward(const CompiledOp& op, const modu
                             Tensor dA_tmp{};
                             Tensor* dA_use = dA_ptr;
                             if (!dA_use) {
-                                dA_tmp = mRunState.temp_alloc(a_flat.DType, {a_flat.Sizes[0], a_flat.Sizes[1]});
+                                dA_tmp = mRunState.temp_alloc(a_flat.DType, {a_flat.Sizes[0], a_flat.Sizes[1]}, "matmul_dA_tmp");
                                 fill_zero(dA_tmp, mRunState.MainStream);
                                 mTemps.push_back(dA_tmp);
                                 dA_use = &dA_tmp;
@@ -833,7 +833,7 @@ void CompiledExecutor::dispatch_matmul_backward(const CompiledOp& op, const modu
                     Tensor dA_tmp{};
                     Tensor* dA_use = dA_ptr;
                     if (!dA_use) {
-                        dA_tmp = mRunState.temp_alloc(a_flat.DType, {a_flat.Sizes[0], a_flat.Sizes[1]});
+                        dA_tmp = mRunState.temp_alloc(a_flat.DType, {a_flat.Sizes[0], a_flat.Sizes[1]}, "matmul_lora_dA_tmp");
                         fill_zero(dA_tmp, mRunState.MainStream);
                         mTemps.push_back(dA_tmp);
                         dA_use = &dA_tmp;
@@ -969,7 +969,7 @@ void CompiledExecutor::dispatch_matmul_backward(const CompiledOp& op, const modu
                     if (has_valid_shape) {
                         mRunState.temp_acquire(acts.swiglu);
                     } else {
-                        acts.swiglu = mRunState.temp_alloc(acts.mlp_up.DType, {mB, mT, static_cast<long>(D)});
+                        acts.swiglu = mRunState.temp_alloc(acts.mlp_up.DType, {mB, mT, static_cast<long>(D)}, "matmul_lora_swiglu_recompute");
                         mTemps.push_back(acts.swiglu);
                     }
                     switch (mConfig.activation_type) {

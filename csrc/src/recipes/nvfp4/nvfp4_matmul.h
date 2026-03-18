@@ -96,9 +96,9 @@ inline void forward_matmul(Tensor& out,
     // Step 2: Quantize weight to FP4 with column-major scale layout
     auto [w_scale_rows, w_scale_cols] = fp4_weight_scale_shape(OC, C);
 
-    Tensor weight_fp4_data = rs.temp_alloc(ETensorDType::BYTE, {(long)OC, (long)(C / 2)});
-    Tensor weight_fp4_scales = rs.temp_alloc(ETensorDType::FP8_E4M3, {w_scale_rows, w_scale_cols});
-    Tensor weight_global_amax = rs.temp_alloc(ETensorDType::FP32, {1});
+    Tensor weight_fp4_data = rs.temp_alloc(ETensorDType::BYTE, {(long)OC, (long)(C / 2)}, "weight_fp4_data");
+    Tensor weight_fp4_scales = rs.temp_alloc(ETensorDType::FP8_E4M3, {w_scale_rows, w_scale_cols}, "weight_fp4_scales");
+    Tensor weight_global_amax = rs.temp_alloc(ETensorDType::FP32, {1}, "weight_global_amax");
 
     quantize_fp4_weight_2d_auto_scale(
         weight_fp4_data.template get<uint8_t>(),
@@ -112,7 +112,7 @@ inline void forward_matmul(Tensor& out,
     Tensor out_f32{};
     float* out_f32_ptr = nullptr;
     if (out.DType == ETensorDType::BF16) {
-        out_f32 = rs.temp_alloc(ETensorDType::FP32, {(long)BT, (long)OC});
+        out_f32 = rs.temp_alloc(ETensorDType::FP32, {(long)BT, (long)OC}, "out_f32");
         out_f32_ptr = out_f32.template get<float>();
     } else if (out.DType == ETensorDType::FP32) {
         out_f32_ptr = out.template get<float>();
@@ -215,14 +215,14 @@ inline void backward_matmul(Tensor& dinp,
     // =========================================================================
     {
         // Transpose weight: (OC, C) -> (C, OC)
-        Tensor weight_tp = rs.temp_alloc(ETensorDType::BF16, {(long)C, (long)OC});
+        Tensor weight_tp = rs.temp_alloc(ETensorDType::BF16, {(long)C, (long)OC}, "weight_tp");
         transpose(weight_tp, weight, OC, C, stream);
 
         // Quantize dout (A) with stochastic rounding
         auto [a_scale_rows, a_scale_cols] = fp4_scale_shape(BT, OC);
-        Tensor dout_fp4 = rs.temp_alloc(ETensorDType::BYTE, {(long)BT, (long)(OC / 2)});
-        Tensor dout_scales = rs.temp_alloc(ETensorDType::FP8_E4M3, {a_scale_rows, a_scale_cols});
-        Tensor dout_amax = rs.temp_alloc(ETensorDType::FP32, {1});
+        Tensor dout_fp4 = rs.temp_alloc(ETensorDType::BYTE, {(long)BT, (long)(OC / 2)}, "dout_fp4");
+        Tensor dout_scales = rs.temp_alloc(ETensorDType::FP8_E4M3, {a_scale_rows, a_scale_cols}, "dout_scales");
+        Tensor dout_amax = rs.temp_alloc(ETensorDType::FP32, {1}, "dout_amax");
         quantize_fp4_block_stochastic_auto_scale(
             dout_fp4.template get<uint8_t>(),
             dout_scales.template get<__nv_fp8_e4m3>(),
@@ -234,9 +234,9 @@ inline void backward_matmul(Tensor& dinp,
 
         // Quantize W^T with 16x16 weight scaling
         auto [w_scale_rows, w_scale_cols] = fp4_weight_scale_shape(C, OC);
-        Tensor w_fp4 = rs.temp_alloc(ETensorDType::BYTE, {(long)C, (long)(OC / 2)});
-        Tensor w_scales = rs.temp_alloc(ETensorDType::FP8_E4M3, {w_scale_rows, w_scale_cols});
-        Tensor w_amax = rs.temp_alloc(ETensorDType::FP32, {1});
+        Tensor w_fp4 = rs.temp_alloc(ETensorDType::BYTE, {(long)C, (long)(OC / 2)}, "w_fp4");
+        Tensor w_scales = rs.temp_alloc(ETensorDType::FP8_E4M3, {w_scale_rows, w_scale_cols}, "w_scales");
+        Tensor w_amax = rs.temp_alloc(ETensorDType::FP32, {1}, "w_amax");
         quantize_fp4_weight_2d_auto_scale(
             w_fp4.template get<uint8_t>(),
             w_scales.template get<__nv_fp8_e4m3>(),
@@ -249,7 +249,7 @@ inline void backward_matmul(Tensor& dinp,
         Tensor dinp_f32{};
         float* dinp_f32_ptr = nullptr;
         if (dinp.DType == ETensorDType::BF16) {
-            dinp_f32 = rs.temp_alloc(ETensorDType::FP32, {(long)BT, (long)C});
+            dinp_f32 = rs.temp_alloc(ETensorDType::FP32, {(long)BT, (long)C}, "dinp_f32");
             dinp_f32_ptr = dinp_f32.template get<float>();
         } else if (dinp.DType == ETensorDType::FP32) {
             dinp_f32_ptr = dinp.template get<float>();
@@ -297,8 +297,8 @@ inline void backward_matmul(Tensor& dinp,
     // =========================================================================
     if (!skip_weight_grad) {
         // Transpose: A = dout^T (OC, BT), B = inp as (C, BT)
-        Tensor dout_tp = rs.temp_alloc(ETensorDType::BF16, {(long)OC, (long)BT});
-        Tensor inp_tp = rs.temp_alloc(ETensorDType::BF16, {(long)C, (long)BT});
+        Tensor dout_tp = rs.temp_alloc(ETensorDType::BF16, {(long)OC, (long)BT}, "dout_tp");
+        Tensor inp_tp = rs.temp_alloc(ETensorDType::BF16, {(long)C, (long)BT}, "inp_tp");
         transpose(dout_tp, dout, BT, OC, stream);
         transpose(inp_tp, inp, BT, C, stream);
 
@@ -312,8 +312,8 @@ inline void backward_matmul(Tensor& dinp,
                 throw std::runtime_error("nvfp4::backward_matmul: BT must be multiple of 16 when hadamard is enabled");
             }
             // Apply RHT only to the column-wise usage (BT is the column dimension)
-            dout_tp_r = rs.temp_alloc(ETensorDType::BF16, {(long)OC, (long)BT});
-            inp_tp_r = rs.temp_alloc(ETensorDType::BF16, {(long)C, (long)BT});
+            dout_tp_r = rs.temp_alloc(ETensorDType::BF16, {(long)OC, (long)BT}, "dout_tp_r");
+            inp_tp_r = rs.temp_alloc(ETensorDType::BF16, {(long)C, (long)BT}, "inp_tp_r");
             hadamard_transform_forward(dout_tp_r.template get<nv_bfloat16>(),
                                        dout_tp.template get<nv_bfloat16>(),
                                        nullptr, OC, BT, rht_seed, stream);
@@ -326,9 +326,9 @@ inline void backward_matmul(Tensor& dinp,
 
         // Quantize A (gradient) with stochastic rounding
         auto [a_scale_rows, a_scale_cols] = fp4_scale_shape(OC, BT);
-        Tensor a_fp4 = rs.temp_alloc(ETensorDType::BYTE, {(long)OC, (long)(BT / 2)});
-        Tensor a_scales = rs.temp_alloc(ETensorDType::FP8_E4M3, {a_scale_rows, a_scale_cols});
-        Tensor a_amax = rs.temp_alloc(ETensorDType::FP32, {1});
+        Tensor a_fp4 = rs.temp_alloc(ETensorDType::BYTE, {(long)OC, (long)(BT / 2)}, "a_fp4");
+        Tensor a_scales = rs.temp_alloc(ETensorDType::FP8_E4M3, {a_scale_rows, a_scale_cols}, "a_scales");
+        Tensor a_amax = rs.temp_alloc(ETensorDType::FP32, {1}, "a_amax");
         quantize_fp4_block_stochastic_auto_scale(
             a_fp4.template get<uint8_t>(),
             a_scales.template get<__nv_fp8_e4m3>(),
@@ -340,9 +340,9 @@ inline void backward_matmul(Tensor& dinp,
 
         // Quantize B (activation) with deterministic rounding
         auto [b_scale_rows, b_scale_cols] = fp4_weight_scale_shape(C, BT);
-        Tensor b_fp4 = rs.temp_alloc(ETensorDType::BYTE, {(long)C, (long)(BT / 2)});
-        Tensor b_scales = rs.temp_alloc(ETensorDType::FP8_E4M3, {b_scale_rows, b_scale_cols});
-        Tensor b_amax = rs.temp_alloc(ETensorDType::FP32, {1});
+        Tensor b_fp4 = rs.temp_alloc(ETensorDType::BYTE, {(long)C, (long)(BT / 2)}, "b_fp4");
+        Tensor b_scales = rs.temp_alloc(ETensorDType::FP8_E4M3, {b_scale_rows, b_scale_cols}, "b_scales");
+        Tensor b_amax = rs.temp_alloc(ETensorDType::FP32, {1}, "b_amax");
         quantize_fp4_weight_auto_scale(
             b_fp4.template get<uint8_t>(),
             b_scales.template get<__nv_fp8_e4m3>(),
@@ -352,7 +352,7 @@ inline void backward_matmul(Tensor& dinp,
             rs.DeviceProp, stream);
 
         // Matmul: (OC, BT) @ (BT, C) -> (OC, C)
-        Tensor dw_f32 = rs.temp_alloc(ETensorDType::FP32, {(long)OC, (long)C});
+        Tensor dw_f32 = rs.temp_alloc(ETensorDType::FP32, {(long)OC, (long)C}, "dw_f32");
         float* dw_f32_ptr = dw_f32.template get<float>();
 
         fp4_matmul_f32(
@@ -381,7 +381,7 @@ inline void backward_matmul(Tensor& dinp,
                 convert_dtype(dweight.template get<nv_bfloat16>(), dw_f32_ptr,
                               (std::size_t)OC * (std::size_t)C, stream);
             } else {
-                Tensor dw_bf16 = rs.temp_alloc(ETensorDType::BF16, {(long)OC, (long)C});
+                Tensor dw_bf16 = rs.temp_alloc(ETensorDType::BF16, {(long)OC, (long)C}, "dw_bf16");
                 convert_dtype(dw_bf16.template get<nv_bfloat16>(), dw_f32_ptr,
                               (std::size_t)OC * (std::size_t)C, stream);
                 vector_add_sr(dweight.template get<nv_bfloat16>(),

@@ -103,7 +103,7 @@ void CompiledExecutor::dispatch_fused_residual_rmsnorm(const CompiledOp& op) {
         if (stored_res_ffn.Data) {
             // Use stored residual as residual_in, zero out input
             Tensor zero_input = mRunState.temp_alloc(input.DType,
-                std::vector<long>(input.Sizes.begin(), input.Sizes.begin() + input.Rank));
+                std::vector<long>(input.Sizes.begin(), input.Sizes.begin() + input.Rank), "fused_residual_rmsnorm_zero_input");
             mTemps.push_back(zero_input);
             fill_zero(zero_input, mRunState.MainStream);
             fused_residual_rmsnorm_forward(residual_out, y, rstd, stored_res_ffn, zero_input, weight, nullptr,
@@ -163,8 +163,8 @@ void CompiledExecutor::dispatch_fused_residual_rmsnorm_backward(const CompiledOp
         }
 
         std::vector<long> shape(base_ptr->Sizes.begin(), base_ptr->Sizes.begin() + base_ptr->Rank);
-        weight_eff_fallback = mRunState.temp_alloc(base_ptr->DType, shape);
-        weight_eff_ones = mRunState.temp_alloc(base_ptr->DType, shape);
+        weight_eff_fallback = mRunState.temp_alloc(base_ptr->DType, shape, "fused_residual_rmsnorm_weight_eff_fallback");
+        weight_eff_ones = mRunState.temp_alloc(base_ptr->DType, shape, "fused_residual_rmsnorm_weight_eff_ones");
         mTemps.push_back(weight_eff_fallback);
         mTemps.push_back(weight_eff_ones);
         fill_constant(weight_eff_ones, 1.0f, static_cast<std::size_t>(weight_eff_ones.nelem()),
@@ -212,7 +212,7 @@ void CompiledExecutor::dispatch_fused_residual_rmsnorm_backward(const CompiledOp
     if (!op.inputs[1].name.empty()) {
         d_residual_next = &resolve_tensor(op.inputs[1]);
     } else {
-        d_residual_zero = mRunState.temp_alloc(d_y.DType, {mB, mT, static_cast<long>(mConfig.HiddenSize)});
+        d_residual_zero = mRunState.temp_alloc(d_y.DType, {mB, mT, static_cast<long>(mConfig.HiddenSize)}, "fused_residual_rmsnorm_d_residual_zero");
         fill_zero(d_residual_zero, mRunState.MainStream);
         mTemps.push_back(d_residual_zero);
         d_residual_next = &d_residual_zero;
@@ -259,7 +259,7 @@ void CompiledExecutor::dispatch_fused_residual_rmsnorm_backward(const CompiledOp
             fill_zero(*d_weight_ptr, mRunState.MainStream);
         }
     } else {
-        dummy_weight = mRunState.temp_alloc(weight.DType, {static_cast<long>(mConfig.HiddenSize)});
+        dummy_weight = mRunState.temp_alloc(weight.DType, {static_cast<long>(mConfig.HiddenSize)}, "fused_residual_rmsnorm_dummy_weight");
         mTemps.push_back(dummy_weight);
         d_weight_ptr = &dummy_weight;
     }
@@ -282,7 +282,7 @@ void CompiledExecutor::dispatch_fused_residual_rmsnorm_backward(const CompiledOp
 
     if (mixed_weight_grad) {
         // Compute d_input in BF16 and weight grad separately in FP32.
-        Tensor tmp_dw = mRunState.temp_alloc(ETensorDType::BF16, {static_cast<long>(C)});
+        Tensor tmp_dw = mRunState.temp_alloc(ETensorDType::BF16, {static_cast<long>(C)}, "fused_residual_rmsnorm_tmp_dw");
         mTemps.push_back(tmp_dw);
         rmsnorm_backward(d_input, tmp_dw, mRunState.scratch().rmsnorm_scratch,
                          *d_residual_input, d_y, residual_out, weight, *rstd_ptr,

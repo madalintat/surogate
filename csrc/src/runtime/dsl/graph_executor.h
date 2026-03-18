@@ -205,6 +205,16 @@ public:
                                      const modules::BackwardHook* hook,
                                      const float* temperatures_cpu = nullptr);
 
+    /// Estimate the peak stack usage during backward execution.
+    ///
+    /// Compiles the backward graph (if not already compiled) and walks its ops to
+    /// compute the maximum stack-resident memory within any single layer's backward
+    /// pass.  This accounts for both graph-level Temporary-slot outputs and known
+    /// op-internal temporaries (e.g. ChunkGatedDeltaRuleBackward).
+    ///
+    /// @return Estimated peak stack bytes (0 if no backward graph exists).
+    long estimate_backward_stack_peak(long B, long T);
+
     /// Set document masking context for Flash Attention varlen dispatch.
     /// cu_seqlens_cpu: (num_docs + 1,) int32 cumulative token offsets on CPU.
     /// Copies to GPU and propagates to CompiledExecutor.

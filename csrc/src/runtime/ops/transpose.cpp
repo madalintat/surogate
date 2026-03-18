@@ -57,7 +57,7 @@ void CompiledExecutor::dispatch_transpose(const CompiledOp& op) {
     Tensor& out_ref = ensure_output_tensor(op.outputs[0]);
     Tensor out = out_ref;
     if (out.DType != in.DType || !tensor_matches_shape(out, out_shape)) {
-        out = mRunState.temp_alloc(in.DType, out_shape);
+        out = mRunState.temp_alloc(in.DType, out_shape, "transpose_out");
         mTemps.push_back(out);
     }
 

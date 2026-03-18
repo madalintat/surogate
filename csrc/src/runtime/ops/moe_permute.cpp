@@ -24,10 +24,10 @@ void CompiledExecutor::dispatch_moe_permute(const CompiledOp& op) {
     // The compiled graph may have empty shapes for these intermediates, so we
     // allocate directly with the correct dimensions instead of using ensure_output_tensor.
     Tensor permuted = mRunState.temp_alloc(inp.DType,
-        {static_cast<long>(total_tokens), static_cast<long>(hidden_size)});
+        {static_cast<long>(total_tokens), static_cast<long>(hidden_size)}, "moe_permute_out");
     mTemps.push_back(permuted);
     Tensor scatter_indices = mRunState.temp_alloc(ETensorDType::INT32,
-        {static_cast<long>(total_tokens)});
+        {static_cast<long>(total_tokens)}, "moe_permute_scatter_indices");
     mTemps.push_back(scatter_indices);
     const int num_experts = static_cast<int>(mConfig.NumExperts);
     int layer_idx_any = op.attrs.layer_idx;

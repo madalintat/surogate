@@ -77,7 +77,7 @@ void CompiledExecutor::dispatch_flash_attention(const CompiledOp& op) {
         num_docs = static_cast<int>(mB);
         max_doc_seqlen = static_cast<int>(mT);
         total_doc_tokens = num_docs * max_doc_seqlen;
-        generated_cu_seqlens = mRunState.temp_alloc(ETensorDType::INT32, {static_cast<long>(num_docs + 1)});
+        generated_cu_seqlens = mRunState.temp_alloc(ETensorDType::INT32, {static_cast<long>(num_docs + 1)}, "generated_cu_seqlens");
         mTemps.push_back(generated_cu_seqlens);
         fill_dense_cu_seqlens(generated_cu_seqlens.get<int32_t>(), num_docs, max_doc_seqlen, mRunState.MainStream);
         cu_seqlens_ptr = generated_cu_seqlens.get<int32_t>();
@@ -112,7 +112,7 @@ void CompiledExecutor::dispatch_flash_attention(const CompiledOp& op) {
         Tensor* sinks_use = sinks;
         Tensor sinks_cast;
         if (sinks->DType != out.DType) {
-            sinks_cast = mRunState.temp_alloc(out.DType, {static_cast<long>(Hq)});
+            sinks_cast = mRunState.temp_alloc(out.DType, {static_cast<long>(Hq)}, "flash_attention_sinks_cast");
             mTemps.push_back(sinks_cast);
             if (out.DType == ETensorDType::BF16) {
                 convert_dtype(sinks_cast.get<nv_bfloat16>(), sinks->get<float>(),
@@ -155,7 +155,7 @@ void CompiledExecutor::dispatch_flash_attention_backward(const CompiledOp& op) {
     const long qkv_nelem = static_cast<long>(qkv.nelem());
     if (d_qkv_ptr->Rank == 0 || d_qkv_ptr->nelem() != qkv_nelem || d_qkv_ptr->DType != d_out.DType) {
         std::vector<long> shape(qkv.Sizes.begin(), qkv.Sizes.begin() + qkv.Rank);
-        Tensor tmp = mRunState.temp_alloc(d_out.DType, shape);
+        Tensor tmp = mRunState.temp_alloc(d_out.DType, shape, "flash_attention_d_qkv");
         mTemps.push_back(tmp);
         d_qkv_ptr = &mTemps.back();
     }
@@ -194,7 +194,7 @@ void CompiledExecutor::dispatch_flash_attention_backward(const CompiledOp& op) {
         num_docs = static_cast<int>(mB);
         max_doc_seqlen = static_cast<int>(mT);
         total_doc_tokens = num_docs * max_doc_seqlen;
-        generated_cu_seqlens = mRunState.temp_alloc(ETensorDType::INT32, {static_cast<long>(num_docs + 1)});
+        generated_cu_seqlens = mRunState.temp_alloc(ETensorDType::INT32, {static_cast<long>(num_docs + 1)}, "generated_cu_seqlens");
         mTemps.push_back(generated_cu_seqlens);
         fill_dense_cu_seqlens(generated_cu_seqlens.get<int32_t>(), num_docs, max_doc_seqlen, mRunState.MainStream);
         cu_seqlens_ptr = generated_cu_seqlens.get<int32_t>();
@@ -212,8 +212,8 @@ void CompiledExecutor::dispatch_flash_attention_backward(const CompiledOp& op) {
         const long padded_total = static_cast<long>(total_doc_tokens) + 128L * static_cast<long>(num_docs);
         const long dq_accum_elems = padded_total * static_cast<long>(Hq) * static_cast<long>(Hs_rounded);
         const long dsoftmax_elems = static_cast<long>(Hq) * padded_total;
-        Tensor dq_accum = mRunState.temp_alloc(ETensorDType::FP32, {dq_accum_elems});
-        Tensor dsoftmax = mRunState.temp_alloc(ETensorDType::FP32, {dsoftmax_elems});
+        Tensor dq_accum = mRunState.temp_alloc(ETensorDType::FP32, {dq_accum_elems}, "flash_attention_dq_accum");
+        Tensor dsoftmax = mRunState.temp_alloc(ETensorDType::FP32, {dsoftmax_elems}, "flash_attention_dsoftmax");
         mTemps.push_back(dq_accum);
         mTemps.push_back(dsoftmax);
 
@@ -225,8 +225,8 @@ void CompiledExecutor::dispatch_flash_attention_backward(const CompiledOp& op) {
         Tensor dk_expanded, dv_expanded;
         if (Hq != Hkv) {
             const long exp_elems = static_cast<long>(total_doc_tokens) * static_cast<long>(Hq) * static_cast<long>(Hs);
-            dk_expanded = mRunState.temp_alloc(ETensorDType::BF16, {exp_elems});
-            dv_expanded = mRunState.temp_alloc(ETensorDType::BF16, {exp_elems});
+            dk_expanded = mRunState.temp_alloc(ETensorDType::BF16, {exp_elems}, "flash_attention_dk_expanded");
+            dv_expanded = mRunState.temp_alloc(ETensorDType::BF16, {exp_elems}, "flash_attention_dv_expanded");
             mTemps.push_back(dk_expanded);
             mTemps.push_back(dv_expanded);
             dk_exp_ptr = dk_expanded.get<nv_bfloat16>();
@@ -253,10 +253,10 @@ void CompiledExecutor::dispatch_flash_attention_backward(const CompiledOp& op) {
             auto shape_vec = [](const Tensor& t) {
                 return std::vector<long>(t.Sizes.begin(), t.Sizes.begin() + t.Rank);
             };
-            Tensor out_f32 = mRunState.temp_alloc(ETensorDType::FP32, shape_vec(out));
-            Tensor d_out_f32 = mRunState.temp_alloc(ETensorDType::FP32, shape_vec(d_out));
-            Tensor qkv_f32 = mRunState.temp_alloc(ETensorDType::FP32, shape_vec(qkv));
-            Tensor d_qkv_f32 = mRunState.temp_alloc(ETensorDType::FP32, shape_vec(d_qkv));
+            Tensor out_f32 = mRunState.temp_alloc(ETensorDType::FP32, shape_vec(out), "flash_attention_out_f32");
+            Tensor d_out_f32 = mRunState.temp_alloc(ETensorDType::FP32, shape_vec(d_out), "flash_attention_d_out_f32");
+            Tensor qkv_f32 = mRunState.temp_alloc(ETensorDType::FP32, shape_vec(qkv), "flash_attention_qkv_f32");
+            Tensor d_qkv_f32 = mRunState.temp_alloc(ETensorDType::FP32, shape_vec(d_qkv), "flash_attention_d_qkv_f32");
             mTemps.push_back(out_f32);
             mTemps.push_back(d_out_f32);
             mTemps.push_back(qkv_f32);
@@ -328,14 +328,14 @@ void CompiledExecutor::dispatch_flash_attention_backward(const CompiledOp& op) {
             }
         }
 
-        Tensor d_sinks_f32 = mRunState.temp_alloc(ETensorDType::FP32, {static_cast<long>(Hq)});
+        Tensor d_sinks_f32 = mRunState.temp_alloc(ETensorDType::FP32, {static_cast<long>(Hq)}, "flash_attention_d_sinks_f32");
         mTemps.push_back(d_sinks_f32);
         fill_zero(d_sinks_f32, mRunState.MainStream);
 
         Tensor* sinks_use = sinks;
         Tensor sinks_cast;
         if (sinks->DType != out.DType) {
-            sinks_cast = mRunState.temp_alloc(out.DType, {static_cast<long>(Hq)});
+            sinks_cast = mRunState.temp_alloc(out.DType, {static_cast<long>(Hq)}, "flash_attention_sinks_cast");
             mTemps.push_back(sinks_cast);
             if (out.DType == ETensorDType::BF16) {
                 convert_dtype(sinks_cast.get<nv_bfloat16>(), sinks->get<float>(),
@@ -374,7 +374,7 @@ void CompiledExecutor::dispatch_flash_attention_backward(const CompiledOp& op) {
                                            cudaMemcpyDeviceToDevice, mRunState.MainStream));
             }
         } else if (d_sinks_out.DType == ETensorDType::BF16) {
-            Tensor d_sinks_bf16 = mRunState.temp_alloc(ETensorDType::BF16, {static_cast<long>(Hq)});
+            Tensor d_sinks_bf16 = mRunState.temp_alloc(ETensorDType::BF16, {static_cast<long>(Hq)}, "flash_attention_d_sinks_bf16");
             mTemps.push_back(d_sinks_bf16);
             convert_dtype(d_sinks_bf16.get<nv_bfloat16>(), d_sinks_f32.get<float>(),
                           d_sinks_f32.nelem(), mRunState.MainStream);

@@ -47,34 +47,34 @@ void CompiledExecutor::dispatch_mamba_ssm_scan(const CompiledOp& op) {
     const int n_chunks = (T + kKernelMaxChunkSize - 1) / kKernelMaxChunkSize;
 
     // Expand A_log to A [D, N]
-    Tensor A = mRunState.temp_alloc(ETensorDType::FP32, {D, dstate});
+    Tensor A = mRunState.temp_alloc(ETensorDType::FP32, {D, dstate}, "mamba_ssm_scan_A");
     mTemps.push_back(A);
     mamba_expand_A(A, A_log, num_heads, head_dim, dstate, mRunState.MainStream);
 
     // Expand D_param to D_expanded [D]
-    Tensor D_expanded = mRunState.temp_alloc(ETensorDType::FP32, {D});
+    Tensor D_expanded = mRunState.temp_alloc(ETensorDType::FP32, {D}, "mamba_ssm_scan_D_expanded");
     mTemps.push_back(D_expanded);
     mamba_expand_head_param(D_expanded, D_param, num_heads, head_dim, mRunState.MainStream);
 
     // Expand dt_bias if present
     Tensor dt_bias_expanded;
     if (dt_bias) {
-        dt_bias_expanded = mRunState.temp_alloc(ETensorDType::FP32, {D});
+        dt_bias_expanded = mRunState.temp_alloc(ETensorDType::FP32, {D}, "mamba_ssm_scan_dt_bias_expanded");
         mTemps.push_back(dt_bias_expanded);
         mamba_expand_head_param(dt_bias_expanded, *dt_bias, num_heads, head_dim, mRunState.MainStream);
     } else {
         // Create zero bias
-        dt_bias_expanded = mRunState.temp_alloc(ETensorDType::FP32, {D});
+        dt_bias_expanded = mRunState.temp_alloc(ETensorDType::FP32, {D}, "mamba_ssm_scan_dt_bias_expanded_zero");
         mTemps.push_back(dt_bias_expanded);
         CUDA_CHECK(cudaMemsetAsync(dt_bias_expanded.Data, 0, dt_bias_expanded.bytes(), mRunState.MainStream));
     }
 
     // Allocate output
-    Tensor out = mRunState.temp_alloc(u.DType, {B, D, T});
+    Tensor out = mRunState.temp_alloc(u.DType, {B, D, T}, "mamba_ssm_scan_out");
     mTemps.push_back(out);
 
     // Allocate SSM state buffer (used internally by selective_scan)
-    Tensor x = mRunState.temp_alloc(ETensorDType::FP32, {B, D, n_chunks, dstate * 2});
+    Tensor x = mRunState.temp_alloc(ETensorDType::FP32, {B, D, n_chunks, dstate * 2}, "mamba_ssm_scan_x");
     mTemps.push_back(x);
 
     // Call selective scan forward
@@ -146,50 +146,50 @@ void CompiledExecutor::dispatch_mamba_ssm_scan_backward(const CompiledOp& op) {
     const int n_chunks = (T + kKernelMaxChunkSize - 1) / kKernelMaxChunkSize;
 
     // Expand parameters (same as forward)
-    Tensor A = mRunState.temp_alloc(ETensorDType::FP32, {D, dstate});
+    Tensor A = mRunState.temp_alloc(ETensorDType::FP32, {D, dstate}, "mamba_ssm_scan_A");
     mTemps.push_back(A);
     mamba_expand_A(A, A_log, num_heads, head_dim, dstate, mRunState.MainStream);
 
-    Tensor D_expanded = mRunState.temp_alloc(ETensorDType::FP32, {D});
+    Tensor D_expanded = mRunState.temp_alloc(ETensorDType::FP32, {D}, "mamba_ssm_scan_D_expanded");
     mTemps.push_back(D_expanded);
     mamba_expand_head_param(D_expanded, D_param, num_heads, head_dim, mRunState.MainStream);
 
-    Tensor dt_bias_expanded = mRunState.temp_alloc(ETensorDType::FP32, {D});
+    Tensor dt_bias_expanded = mRunState.temp_alloc(ETensorDType::FP32, {D}, "mamba_ssm_scan_dt_bias_expanded");
     mTemps.push_back(dt_bias_expanded);
     mamba_expand_head_param(dt_bias_expanded, dt_bias, num_heads, head_dim, mRunState.MainStream);
 
     // Transpose d_out from [B, T, D] to [B, D, T] to match kernel's expected layout.
     // The forward output was transposed from [B, D, T] to [B, T, D], so the incoming
     // gradient is in [B, T, D] layout and must be transposed back.
-    Tensor d_out_bdt = mRunState.temp_alloc(d_out.DType, {B, D, T});
+    Tensor d_out_bdt = mRunState.temp_alloc(d_out.DType, {B, D, T}, "mamba_ssm_scan_d_out_bdt");
     mTemps.push_back(d_out_bdt);
     mamba_transpose_btd_to_bdt(d_out_bdt, d_out, B, T, D, mRunState.MainStream);
 
     // Allocate gradient outputs — du and ddelta are written directly by the kernel (store_output),
     // while dA/dB/dC/dD/ddelta_bias use atomicAdd, so they MUST be zero-initialized.
-    Tensor du = mRunState.temp_alloc(u.DType, {B, D, T});
+    Tensor du = mRunState.temp_alloc(u.DType, {B, D, T}, "mamba_ssm_scan_du");
     mTemps.push_back(du);
 
-    Tensor ddelta = mRunState.temp_alloc(u.DType, {B, D, T});
+    Tensor ddelta = mRunState.temp_alloc(u.DType, {B, D, T}, "mamba_ssm_scan_ddelta");
     mTemps.push_back(ddelta);
 
-    Tensor dA = mRunState.temp_alloc(ETensorDType::FP32, {D, dstate});
+    Tensor dA = mRunState.temp_alloc(ETensorDType::FP32, {D, dstate}, "mamba_ssm_scan_dA");
     mTemps.push_back(dA);
     fill_zero(dA, mRunState.MainStream);
 
-    Tensor dB = mRunState.temp_alloc(ETensorDType::FP32, {B, groups, dstate, T});
+    Tensor dB = mRunState.temp_alloc(ETensorDType::FP32, {B, groups, dstate, T}, "mamba_ssm_scan_dB");
     mTemps.push_back(dB);
     fill_zero(dB, mRunState.MainStream);
 
-    Tensor dC = mRunState.temp_alloc(ETensorDType::FP32, {B, groups, dstate, T});
+    Tensor dC = mRunState.temp_alloc(ETensorDType::FP32, {B, groups, dstate, T}, "mamba_ssm_scan_dC");
     mTemps.push_back(dC);
     fill_zero(dC, mRunState.MainStream);
 
-    Tensor dD_expanded = mRunState.temp_alloc(ETensorDType::FP32, {D});
+    Tensor dD_expanded = mRunState.temp_alloc(ETensorDType::FP32, {D}, "mamba_ssm_scan_dD_expanded");
     mTemps.push_back(dD_expanded);
     fill_zero(dD_expanded, mRunState.MainStream);
 
-    Tensor ddelta_bias_expanded = mRunState.temp_alloc(ETensorDType::FP32, {D});
+    Tensor ddelta_bias_expanded = mRunState.temp_alloc(ETensorDType::FP32, {D}, "mamba_ssm_scan_ddelta_bias_expanded");
     mTemps.push_back(ddelta_bias_expanded);
     fill_zero(ddelta_bias_expanded, mRunState.MainStream);
 
@@ -200,15 +200,15 @@ void CompiledExecutor::dispatch_mamba_ssm_scan_backward(const CompiledOp& op) {
                                    d_out_bdt, x, B, T, D, dstate, groups, n_chunks, mRunState.MainStream);
 
     // Reduce expanded gradients back to per-head
-    Tensor dA_log = mRunState.temp_alloc(ETensorDType::FP32, {num_heads});
+    Tensor dA_log = mRunState.temp_alloc(ETensorDType::FP32, {num_heads}, "mamba_ssm_scan_dA_log");
     mTemps.push_back(dA_log);
     mamba_reduce_dA_log(dA_log, dA, A, num_heads, head_dim, dstate, false, mRunState.MainStream);
 
-    Tensor dD = mRunState.temp_alloc(ETensorDType::FP32, {num_heads});
+    Tensor dD = mRunState.temp_alloc(ETensorDType::FP32, {num_heads}, "mamba_ssm_scan_dD");
     mTemps.push_back(dD);
     mamba_reduce_head_param(dD, dD_expanded, num_heads, head_dim, false, mRunState.MainStream);
 
-    Tensor ddelta_bias = mRunState.temp_alloc(ETensorDType::FP32, {num_heads});
+    Tensor ddelta_bias = mRunState.temp_alloc(ETensorDType::FP32, {num_heads}, "mamba_ssm_scan_ddelta_bias");
     mTemps.push_back(ddelta_bias);
     mamba_reduce_head_param(ddelta_bias, ddelta_bias_expanded, num_heads, head_dim, false, mRunState.MainStream);
 

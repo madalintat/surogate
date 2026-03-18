@@ -198,7 +198,7 @@ public:
     float get_accuracy() const;
 
     // temporary buffers
-    Tensor temp_alloc(ETensorDType dtype, const std::vector<long>& shape);
+    Tensor temp_alloc(ETensorDType dtype, const std::vector<long>& shape, const char* name="<unnamed>");
     void temp_acquire(Tensor& target);
     void temp_free(Tensor& tensor);
 

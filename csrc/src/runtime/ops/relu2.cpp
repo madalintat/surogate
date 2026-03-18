@@ -21,7 +21,7 @@ void CompiledExecutor::dispatch_relu2(const CompiledOp& op) {
     Tensor out;
     if (op.outputs[0].shape.empty() && inp.Rank > 0) {
         std::vector<long> shape(inp.Sizes.begin(), inp.Sizes.begin() + inp.Rank);
-        out = mRunState.temp_alloc(inp.DType, shape);
+        out = mRunState.temp_alloc(inp.DType, shape, "relu2_out");
         mTemps.push_back(out);
     } else {
         out = ensure_output_tensor(op.outputs[0]);
@@ -45,7 +45,7 @@ void CompiledExecutor::dispatch_relu2_backward(const CompiledOp& op) {
     const long expected_nelem = static_cast<long>(inp.nelem());
     if (d_inp_ptr->nelem() != expected_nelem) {
         std::vector<long> shape(inp.Sizes.begin(), inp.Sizes.begin() + inp.Rank);
-        Tensor t = mRunState.temp_alloc(inp.DType, shape);
+        Tensor t = mRunState.temp_alloc(inp.DType, shape, "relu2_backward_d_inp");
         fill_zero(t, mRunState.MainStream);
         mTemps.push_back(t);
         store_tensor(op.outputs[0], t);

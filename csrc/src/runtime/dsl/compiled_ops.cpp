@@ -1739,8 +1739,8 @@ Tensor& CompiledExecutor::resolve_tensor(const TensorRef& ref) {
                 if (base_ptr && base_ptr->Data) {
                     std::vector<long> shape(base_ptr->Sizes.begin(),
                                             base_ptr->Sizes.begin() + base_ptr->Rank);
-                    Tensor ones = mRunState.temp_alloc(base_ptr->DType, shape);
-                    Tensor eff = mRunState.temp_alloc(base_ptr->DType, shape);
+                    Tensor ones = mRunState.temp_alloc(base_ptr->DType, shape, "ones");
+                    Tensor eff = mRunState.temp_alloc(base_ptr->DType, shape, "eff");
                     mTemps.push_back(ones);
                     mTemps.push_back(eff);
                     fill_constant(ones, 1.0f, static_cast<std::size_t>(ones.nelem()), mRunState.MainStream);
@@ -1896,7 +1896,7 @@ Tensor& CompiledExecutor::ensure_output_tensor(const TensorRef& ref) {
         return mTensors[static_cast<std::size_t>(tid)];
     }
 
-    Tensor t = mRunState.temp_alloc(ref.dtype, ref.shape);
+    Tensor t = mRunState.temp_alloc(ref.dtype, ref.shape, "t");
 
     // Zero gradient tensors to prevent stale values from accumulating.
     if (ref.is_gradient) {
@@ -2127,7 +2127,7 @@ void CompiledExecutor::replay_layer_forward(int layer_idx, long B, long T,
             if (!resolved.Data && !inp.name.empty() && inp.name.find("zeros") != std::string::npos) {
                 // Allocate a zeros tensor on stack for the initial residual
                 long C = static_cast<long>(mConfig.HiddenSize);
-                resolved = mRunState.temp_alloc(ETensorDType::BF16, {mB, mT, C});
+                resolved = mRunState.temp_alloc(ETensorDType::BF16, {mB, mT, C}, "zeros");
                 fill_zero(resolved, mRunState.MainStream);
             }
 
@@ -2415,7 +2415,7 @@ void CompiledExecutor::execute_tiled_mlp(const CompiledGraph& graph,
     const ETensorDType dtype = full_input.DType;
 
     // Pre-allocate full output [B*T, C]
-    Tensor full_output = mRunState.temp_alloc(dtype, {BT, C});
+    Tensor full_output = mRunState.temp_alloc(dtype, {BT, C}, "tiled_mlp_out");
 
     // Chunk size: min(B*T, C) — Unsloth's "arctic" strategy
     const long chunk_size = std::min(BT, C);
@@ -2436,7 +2436,7 @@ void CompiledExecutor::execute_tiled_mlp(const CompiledGraph& graph,
         auto temp_mark = mTemps.size();
 
         // 1) Up-proj matmul: [N, C] × [MUp, C]^T → [N, MUp]
-        Tensor up_out = mRunState.temp_alloc(dtype, {N, MUp});
+        Tensor up_out = mRunState.temp_alloc(dtype, {N, MUp}, "up_out");
         mTemps.push_back(up_out);
         {
             int mm_M = 0, mm_N = 0, mm_K = 0;
@@ -2448,7 +2448,7 @@ void CompiledExecutor::execute_tiled_mlp(const CompiledGraph& graph,
         }
 
         // 2) SwiGLU: [N, MUp] → [N, M] (operate in 2D, swiglu_forward handles it as B=1, T=N)
-        Tensor act_out = mRunState.temp_alloc(dtype, {N, M});
+        Tensor act_out = mRunState.temp_alloc(dtype, {N, M}, "act_out");
         mTemps.push_back(act_out);
         swiglu_forward(act_out, up_out, nullptr, 1, static_cast<int>(N), static_cast<int>(M),
                        mRunState.MainStream);
@@ -2563,7 +2563,7 @@ void CompiledExecutor::execute_tiled_mlp_backward(const CompiledGraph& bwd_graph
     const int layer_idx = down_bwd_op->attrs.layer_idx;
 
     // Allocate full d_ln2_flat [B*T, C] output
-    Tensor d_ln2_flat = mRunState.temp_alloc(dtype, {BT, C});
+    Tensor d_ln2_flat = mRunState.temp_alloc(dtype, {BT, C}, "d_ln2_flat");
     fill_zero(d_ln2_flat, mRunState.MainStream);
     mTemps.push_back(d_ln2_flat);
 
@@ -2669,7 +2669,7 @@ void CompiledExecutor::execute_tiled_mlp_backward(const CompiledGraph& bwd_graph
 
         // ---- Forward recompute for this chunk ----
         // 1) Up-proj: up_out = ln2_chunk @ up_weight^T → [N, MUp]
-        Tensor up_out = mRunState.temp_alloc(dtype, {N, MUp});
+        Tensor up_out = mRunState.temp_alloc(dtype, {N, MUp}, "up_out");
         {
             int mm_M = 0, mm_N = 0, mm_K = 0;
             matmul_dims(ln2_chunk, up_weight, fwd_mode, mm_M, mm_N, mm_K);
@@ -2679,13 +2679,13 @@ void CompiledExecutor::execute_tiled_mlp_backward(const CompiledGraph& bwd_graph
         }
 
         // 2) SwiGLU: act_out = swiglu(up_out) → [N, M]
-        Tensor act_out = mRunState.temp_alloc(dtype, {N, M});
+        Tensor act_out = mRunState.temp_alloc(dtype, {N, M}, "act_out");
         swiglu_forward(act_out, up_out, nullptr, 1, static_cast<int>(N), static_cast<int>(M),
                        mRunState.MainStream);
 
         // ---- Backward for this chunk ----
         // 3) Down-proj backward: dA = d_out_chunk @ down_weight (activation grad)
-        Tensor d_act = mRunState.temp_alloc(dtype, {N, M});
+        Tensor d_act = mRunState.temp_alloc(dtype, {N, M}, "d_act");
         {
             int mm_M = 0, mm_N = 0, mm_K = 0;
             matmul_dims(d_out_chunk, down_weight, mode_dA, mm_M, mm_N, mm_K);
@@ -2734,7 +2734,7 @@ void CompiledExecutor::execute_tiled_mlp_backward(const CompiledGraph& bwd_graph
         }
 
         // 4) SwiGLU backward: d_up = swiglu_backward(d_act, up_out) → [N, MUp]
-        Tensor d_up = mRunState.temp_alloc(dtype, {N, MUp});
+        Tensor d_up = mRunState.temp_alloc(dtype, {N, MUp}, "d_up");
         swiglu_backward(d_up, d_act, up_out, nullptr,
                         1, static_cast<int>(N), static_cast<int>(M), mRunState.MainStream);
 
@@ -3235,7 +3235,7 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
         if (t.DType != ETensorDType::BF16 && t.DType != ETensorDType::FP32) {
             return -1;
         }
-        Tensor non_finite_count = mRunState.temp_alloc(ETensorDType::INT32, {1});
+        Tensor non_finite_count = mRunState.temp_alloc(ETensorDType::INT32, {1}, "non_finite_count");
         CUDA_CHECK(cudaMemsetAsync(non_finite_count.Data, 0, sizeof(int), mRunState.MainStream));
         count_non_finite(non_finite_count, t, mRunState.MainStream);
         int host_count = 0;
@@ -3252,7 +3252,7 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
         if (t.DType != ETensorDType::BF16 && t.DType != ETensorDType::FP32) {
             return -1.0f;
         }
-        Tensor amax = mRunState.temp_alloc(ETensorDType::FP32, {1});
+        Tensor amax = mRunState.temp_alloc(ETensorDType::FP32, {1}, "amax");
         CUDA_CHECK(cudaMemsetAsync(amax.Data, 0, sizeof(float), mRunState.MainStream));
         global_amax(amax.get<float>(), t, static_cast<std::size_t>(t.nelem()), mRunState.DeviceProp, mRunState.MainStream);
         float host_amax = 0.0f;
@@ -3281,7 +3281,7 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
                 continue;
             }
 
-            Tensor non_finite_count = mRunState.temp_alloc(ETensorDType::INT32, {1});
+            Tensor non_finite_count = mRunState.temp_alloc(ETensorDType::INT32, {1}, "non_finite_count");
             CUDA_CHECK(cudaMemsetAsync(non_finite_count.Data, 0, sizeof(int), mRunState.MainStream));
             count_non_finite(non_finite_count, *t, mRunState.MainStream);
             int host_count = 0;
@@ -4160,7 +4160,7 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
                 continue;
             }
 
-            Tensor non_finite_count = mRunState.temp_alloc(ETensorDType::INT32, {1});
+            Tensor non_finite_count = mRunState.temp_alloc(ETensorDType::INT32, {1}, "non_finite_count");
             CUDA_CHECK(cudaMemsetAsync(non_finite_count.Data, 0, sizeof(int), mRunState.MainStream));
             count_non_finite(non_finite_count, *t, mRunState.MainStream);
             int host_count = 0;

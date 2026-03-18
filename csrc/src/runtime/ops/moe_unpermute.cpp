@@ -79,9 +79,9 @@ void CompiledExecutor::dispatch_moe_unpermute_backward(const CompiledOp& op) {
     // d_expert_out shape: [total_tokens, hidden_size]
     // d_routing_weights shape: [num_tokens, top_k]
     Tensor d_expert_out = mRunState.temp_alloc(d_output.DType,
-        {static_cast<long>(total_tokens), static_cast<long>(hidden_size)});
+        {static_cast<long>(total_tokens), static_cast<long>(hidden_size)}, "moe_unpermute_backward_d_expert_out");
     Tensor d_routing_weights = mRunState.temp_alloc(routing_weights.DType,
-        {static_cast<long>(num_tokens), static_cast<long>(top_k)});
+        {static_cast<long>(num_tokens), static_cast<long>(top_k)}, "moe_unpermute_backward_d_routing_weights");
     mTemps.push_back(d_expert_out);
     mTemps.push_back(d_routing_weights);
 

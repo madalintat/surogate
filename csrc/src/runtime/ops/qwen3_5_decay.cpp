@@ -36,7 +36,7 @@ void CompiledExecutor::dispatch_qwen3_5_decay(const CompiledOp& op) {
 
     Tensor out = ensure_output_tensor(op.outputs[0]);
     if (out.Rank != 3 || out.Sizes[0] != B || out.Sizes[1] != T || out.Sizes[2] != H || out.DType != ETensorDType::FP32) {
-        out = mRunState.temp_alloc(ETensorDType::FP32, {B, T, H});
+        out = mRunState.temp_alloc(ETensorDType::FP32, {B, T, H}, "qwen3_5_decay_out");
         mTemps.push_back(out);
     }
     qwen3_5_decay_forward(out, a, a_log, dt_bias, mRunState.MainStream);
@@ -90,7 +90,7 @@ void CompiledExecutor::dispatch_qwen3_5_decay_backward(const CompiledOp& op) {
     };
 
     auto alloc_temp = [&](ETensorDType dtype, const std::vector<long>& shape) -> Tensor {
-        Tensor out = mRunState.temp_alloc(dtype, shape);
+        Tensor out = mRunState.temp_alloc(dtype, shape, "qwen3_5_decay_backward_temp");
         mTemps.push_back(out);
         return out;
     };

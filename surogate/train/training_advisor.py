@@ -10,8 +10,6 @@ Advisory only — logs warnings/info, never takes automatic actions.
 
 from __future__ import annotations
 
-from typing import Optional
-
 from surogate.train.metrics import StepMetrics
 from surogate.train.phase_detector import TrainingPhase
 
@@ -115,10 +113,10 @@ class TrainingAdvisor:
             return
 
         # Gradient trend near-zero or negative while on plateau
-        if self.gradient_tracker.mean > 0:
-            relative_trend = self.gradient_tracker.trend / self.gradient_tracker.mean
-        else:
-            relative_trend = 0.0
+        if self.gradient_tracker.mean <= 0:
+            return  # no meaningful gradient data yet
+
+        relative_trend = self.gradient_tracker.trend / self.gradient_tracker.mean
 
         if relative_trend <= 0.1:  # not growing
             self._plateau_grad_flat_count += 1
@@ -210,7 +208,8 @@ class TrainingAdvisor:
                 f"[Advisor] Gradient vanishing at step {step}: "
                 f"gradients shrinking (trend={relative_trend:.2%}) for "
                 f"{self._converging_grad_shrink_count} steps while loss improvement stalls. "
-                f"Consider increasing learning rate or reducing weight decay."
+                f"Consider increasing learning rate to counter vanishing gradients, "
+                f"or reducing weight decay if weights are being driven too small."
             )
             self._mark_warned("gradient_vanishing", step)
 
@@ -309,8 +308,9 @@ class TrainingAdvisor:
         # A drop > 5% over 10 steps means loss is still falling steeply
         if drop_rate > 0.05:
             self.logger.info(
-                f"[Advisor] Warmup may be too short: loss still dropping steeply "
-                f"({drop_rate:.1%} over last 10 steps) as warmup ends at step {step}. "
-                f"Consider increasing warmup_steps from {self.warmup_steps} "
+                f"[Advisor] Warmup may be too short: loss still changing rapidly "
+                f"({drop_rate:.1%} drop over last 10 steps) as warmup ends at step {step}. "
+                f"Optimizer states may not have stabilized at warmup LR — "
+                f"consider increasing warmup_steps from {self.warmup_steps} "
                 f"to ~{int(self.warmup_steps * 1.5)}."
             )

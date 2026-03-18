@@ -122,8 +122,8 @@ void FP8HybridRecipe::forward_matmul(modules::MatmulContext& ctx) const {
                N, M, K, EMMTranspose::TN, /*accumulate=*/false, ctx.stream);
     } else if (ctx.weight->DType == ETensorDType::BF16) {
         // Weight is BF16 - quantize on-the-fly for this forward pass
-        Tensor weight_fp8 = rs.temp_alloc(ETensorDType::FP8_E4M3, {N, K});
-        Tensor weight_stats = rs.temp_alloc(ETensorDType::FP32, {2});  // [abs_max, scale]
+        Tensor weight_fp8 = rs.temp_alloc(ETensorDType::FP8_E4M3, {N, K}, "weight_fp8");
+        Tensor weight_stats = rs.temp_alloc(ETensorDType::FP32, {2}, "weight_stats");  // [abs_max, scale]
         weight_fp8.Stats = reinterpret_cast<float*>(weight_stats.Data);
 
         // Compute abs_max and quantize weight to FP8
@@ -253,8 +253,8 @@ void FP8HybridRecipe::backward_matmul(modules::MatmulContext& ctx) const {
         }
     } else {
         // Quantize BF16/FP32 weight to E4M3 on-the-fly
-        weight_e4m3 = rs.temp_alloc(ETensorDType::FP8_E4M3, {N, K});
-        weight_stats = rs.temp_alloc(ETensorDType::FP32, {2});
+        weight_e4m3 = rs.temp_alloc(ETensorDType::FP8_E4M3, {N, K}, "weight_e4m3");
+        weight_stats = rs.temp_alloc(ETensorDType::FP32, {2}, "weight_stats");
         weight_e4m3.Stats = weight_stats.get<float>();
 
         abs_max(weight_e4m3.abs_max(), *ctx.weight, static_cast<long>(N) * K, rs.DeviceProp, ctx.stream);
@@ -274,8 +274,8 @@ void FP8HybridRecipe::backward_matmul(modules::MatmulContext& ctx) const {
                K, M, N, EMMTranspose::TN, /*accumulate=*/false, ctx.stream);
     } else {
         // Need to transpose weight: (N, K) -> (K, N)
-        auto weight_tp = rs.temp_alloc(ETensorDType::FP8_E4M3, {K, N});
-        Tensor weight_tp_stats = rs.temp_alloc(ETensorDType::FP32, {2});
+        auto weight_tp = rs.temp_alloc(ETensorDType::FP8_E4M3, {K, N}, "weight_tp");
+        Tensor weight_tp_stats = rs.temp_alloc(ETensorDType::FP32, {2}, "weight_tp_stats");
         weight_tp.Stats = weight_tp_stats.get<float>();
 
         transpose(weight_tp, weight_e4m3, N, K, ctx.stream);
@@ -298,8 +298,8 @@ void FP8HybridRecipe::backward_matmul(modules::MatmulContext& ctx) const {
     // Step 4: Compute dweight = inp^T @ dout (skip if LoRA-only mode)
     if (!ctx.skip_weight_grad && ctx.dweight) {
         // Quantize-and-transpose input activation to E4M3
-        auto activation_tp = rs.temp_alloc(ETensorDType::FP8_E4M3, {K, M});
-        Tensor act_stats = rs.temp_alloc(ETensorDType::FP32, {2});
+        auto activation_tp = rs.temp_alloc(ETensorDType::FP8_E4M3, {K, M}, "activation_tp");
+        Tensor act_stats = rs.temp_alloc(ETensorDType::FP32, {2}, "act_stats");
         activation_tp.Stats = act_stats.get<float>();
 
         // Use abs_max from forward pass if available
@@ -314,8 +314,8 @@ void FP8HybridRecipe::backward_matmul(modules::MatmulContext& ctx) const {
         }
 
         // Transpose gradient to E5M2: (M, N) -> (N, M)
-        auto grad_tp = rs.temp_alloc(ETensorDType::FP8_E5M2, {N, M});
-        Tensor grad_stats = rs.temp_alloc(ETensorDType::FP32, {2});
+        auto grad_tp = rs.temp_alloc(ETensorDType::FP8_E5M2, {N, M}, "grad_tp");
+        Tensor grad_stats = rs.temp_alloc(ETensorDType::FP32, {2}, "grad_stats");
         grad_tp.Stats = grad_stats.get<float>();
         transpose(grad_tp, dout_e5m2, M, N, ctx.stream);
         cudaMemcpyAsync(grad_tp.scale(), dout_e5m2.scale(), sizeof(float), cudaMemcpyDeviceToDevice, ctx.stream);
@@ -417,8 +417,8 @@ void FP8HybridRecipe::forward_moe_matmul(modules::MoeMatmulContext& ctx) const {
         }
 
         // Step 2: Quantize expert weights to FP8 E4M3 (per-expert quantization)
-        Tensor weights_fp8 = rs.temp_alloc(ETensorDType::FP8_E4M3, {ctx.num_experts, ctx.N, ctx.K});
-        Tensor weight_stats = rs.temp_alloc(ETensorDType::FP32, {ctx.num_experts, 2});
+        Tensor weights_fp8 = rs.temp_alloc(ETensorDType::FP8_E4M3, {ctx.num_experts, ctx.N, ctx.K}, "weights_fp8");
+        Tensor weight_stats = rs.temp_alloc(ETensorDType::FP32, {ctx.num_experts, 2}, "weight_stats");
         weights_fp8.Stats = weight_stats.get<float>();
 
         for (int e = 0; e < ctx.num_experts; ++e) {
@@ -505,8 +505,8 @@ void FP8HybridRecipe::backward_moe_matmul(modules::MoeMatmulContext& ctx) const 
                               num_elements, rs.DeviceProp, ctx.stream);
 
         // Step 2: Quantize expert weights to E4M3
-        Tensor weights_e4m3 = rs.temp_alloc(ETensorDType::FP8_E4M3, {ctx.num_experts, ctx.N, ctx.K});
-        Tensor weight_stats = rs.temp_alloc(ETensorDType::FP32, {ctx.num_experts, 2});
+        Tensor weights_e4m3 = rs.temp_alloc(ETensorDType::FP8_E4M3, {ctx.num_experts, ctx.N, ctx.K}, "weights_e4m3");
+        Tensor weight_stats = rs.temp_alloc(ETensorDType::FP32, {ctx.num_experts, 2}, "weight_stats");
         weights_e4m3.Stats = weight_stats.get<float>();
 
         for (int e = 0; e < ctx.num_experts; ++e) {

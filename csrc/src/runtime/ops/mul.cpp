@@ -27,7 +27,7 @@ void CompiledExecutor::dispatch_mul(const CompiledOp& op) {
     Tensor out = out_ref;
     if (out.nelem() != a.nelem() || out.DType != a.DType) {
         std::vector<long> shape(a.Sizes.begin(), a.Sizes.begin() + a.Rank);
-        out = mRunState.temp_alloc(a.DType, shape);
+        out = mRunState.temp_alloc(a.DType, shape, "mul_out");
         mTemps.push_back(out);
     }
 
@@ -69,7 +69,7 @@ void CompiledExecutor::dispatch_mul_backward(const CompiledOp& op) {
             }
         }
         std::vector<long> shape(like.Sizes.begin(), like.Sizes.begin() + like.Rank);
-        Tensor out = mRunState.temp_alloc(like.DType, shape);
+        Tensor out = mRunState.temp_alloc(like.DType, shape, "mul_backward_out");
         mTemps.push_back(out);
         return out;
     };

@@ -62,9 +62,9 @@ void NVFP4QuartetRecipe::forward_matmul(modules::MatmulContext& ctx) const {
     // Step 1: Allocate FP4 input buffers (CUTLASS layout)
     // =========================================================================
     const size_t inp_scale_size = compute_nvfp4_cutlass_scale_size(BT, C_in);
-    Tensor inp_fp4_data = rs.temp_alloc(ETensorDType::BYTE, {static_cast<long>(BT), static_cast<long>(C_in / 2)});
-    Tensor inp_fp4_scales = rs.temp_alloc(ETensorDType::BYTE, {static_cast<long>(inp_scale_size)});
-    Tensor inp_global_amax = rs.temp_alloc(ETensorDType::FP32, {1});
+    Tensor inp_fp4_data = rs.temp_alloc(ETensorDType::BYTE, {static_cast<long>(BT), static_cast<long>(C_in / 2)}, "inp_fp4_data");
+    Tensor inp_fp4_scales = rs.temp_alloc(ETensorDType::BYTE, {static_cast<long>(inp_scale_size)}, "inp_fp4_scales");
+    Tensor inp_global_amax = rs.temp_alloc(ETensorDType::FP32, {1}, "inp_global_amax");
 
     // =========================================================================
     // Step 2: Quantize input with standard RTN (no Hadamard, no EDEN for forward)
@@ -97,9 +97,9 @@ void NVFP4QuartetRecipe::forward_matmul(modules::MatmulContext& ctx) const {
     } else {
         // Quantize weight on-the-fly (RTN, no Hadamard per TransformerEngine convention)
         const size_t weight_scale_size = compute_nvfp4_cutlass_scale_size(C_out, C_in);
-        weight_fp4_data = rs.temp_alloc(ETensorDType::BYTE, {static_cast<long>(C_out), static_cast<long>(C_in / 2)});
-        weight_fp4_scales = rs.temp_alloc(ETensorDType::BYTE, {static_cast<long>(weight_scale_size)});
-        weight_global_amax = rs.temp_alloc(ETensorDType::FP32, {1});
+        weight_fp4_data = rs.temp_alloc(ETensorDType::BYTE, {static_cast<long>(C_out), static_cast<long>(C_in / 2)}, "weight_fp4_data");
+        weight_fp4_scales = rs.temp_alloc(ETensorDType::BYTE, {static_cast<long>(weight_scale_size)}, "weight_fp4_scales");
+        weight_global_amax = rs.temp_alloc(ETensorDType::FP32, {1}, "weight_global_amax");
 
         // Weights use standard RTN quantization (no Hadamard, no EDEN)
         quantize_nvfp4_weight_cutlass_auto_scale(
@@ -119,7 +119,7 @@ void NVFP4QuartetRecipe::forward_matmul(modules::MatmulContext& ctx) const {
     // Step 4: Compute alpha (standard tensor scale since forward uses RTN)
     // =========================================================================
     // Forward uses standard NVFP4 quantization (FP8_MAX = 448), so use standard alpha
-    Tensor alpha = rs.temp_alloc(ETensorDType::FP32, {1});
+    Tensor alpha = rs.temp_alloc(ETensorDType::FP32, {1}, "alpha");
     compute_fp4_alpha(
         alpha.get<float>(),
         inp_global_amax.get<float>(),
@@ -236,7 +236,7 @@ void NVFP4QuartetRecipe::backward_matmul(modules::MatmulContext& ctx) const {
     const unsigned int sr_seed = ctx.seed ^ 0x9E3779B9u;
 
     Tensor hadamard = rs.temp_alloc(ETensorDType::BF16,
-        {quartet::HADAMARD_DIM, quartet::HADAMARD_DIM});
+        {quartet::HADAMARD_DIM, quartet::HADAMARD_DIM}, "hadamard");
     quartet::initialize_hadamard_128(hadamard.get<nv_bfloat16>(), hadamard_seed, ctx.stream);
 
     // =========================================================================
@@ -245,15 +245,15 @@ void NVFP4QuartetRecipe::backward_matmul(modules::MatmulContext& ctx) const {
     {
         // Allocate FP4 buffers for dout with EDEN quantization
         const size_t dout_scale_size = compute_nvfp4_cutlass_scale_size(BT, OC);
-        Tensor dout_fp4 = rs.temp_alloc(ETensorDType::BYTE, {static_cast<long>(BT), static_cast<long>(OC / 2)});
+        Tensor dout_fp4 = rs.temp_alloc(ETensorDType::BYTE, {static_cast<long>(BT), static_cast<long>(OC / 2)}, "dout_fp4");
         const size_t dout_scale_elems = (static_cast<size_t>(BT) * OC) / quartet::QUANT_GROUP_SIZE;
-        Tensor dout_scales_linear = rs.temp_alloc(ETensorDType::BYTE, {static_cast<long>(dout_scale_elems)});
-        Tensor dout_scales_cutlass = rs.temp_alloc(ETensorDType::BYTE, {static_cast<long>(dout_scale_size)});
-        Tensor dout_amax = rs.temp_alloc(ETensorDType::FP32, {1});
+        Tensor dout_scales_linear = rs.temp_alloc(ETensorDType::BYTE, {static_cast<long>(dout_scale_elems)}, "dout_scales_linear");
+        Tensor dout_scales_cutlass = rs.temp_alloc(ETensorDType::BYTE, {static_cast<long>(dout_scale_size)}, "dout_scales_cutlass");
+        Tensor dout_amax = rs.temp_alloc(ETensorDType::FP32, {1}, "dout_amax");
 
         // EDEN scratch buffers
-        Tensor dout_scratch_scales = rs.temp_alloc(ETensorDType::BF16, {static_cast<long>(dout_scale_elems)});
-        Tensor dout_max_scale = rs.temp_alloc(ETensorDType::INT32, {1});
+        Tensor dout_scratch_scales = rs.temp_alloc(ETensorDType::BF16, {static_cast<long>(dout_scale_elems)}, "dout_scratch_scales");
+        Tensor dout_max_scale = rs.temp_alloc(ETensorDType::INT32, {1}, "dout_max_scale");
 
         // EDEN quantize dout with Hadamard transform
         // Key Quartet-II features:
@@ -303,17 +303,17 @@ void NVFP4QuartetRecipe::backward_matmul(modules::MatmulContext& ctx) const {
 
         if (use_cached_wt) {
             const size_t w_scale_size = compute_nvfp4_cutlass_scale_size(C, OC);
-            w_fp4 = rs.temp_alloc(ETensorDType::BYTE, {static_cast<long>(C), static_cast<long>(OC / 2)});
+            w_fp4 = rs.temp_alloc(ETensorDType::BYTE, {static_cast<long>(C), static_cast<long>(OC / 2)}, "w_fp4");
             const size_t w_scale_elems = (static_cast<size_t>(C) * OC) / quartet::QUANT_GROUP_SIZE;
-            w_scales_linear = rs.temp_alloc(ETensorDType::BYTE, {static_cast<long>(w_scale_elems)});
-            w_scales = rs.temp_alloc(ETensorDType::BYTE, {static_cast<long>(w_scale_size)});
-            w_amax = rs.temp_alloc(ETensorDType::FP32, {1});
+            w_scales_linear = rs.temp_alloc(ETensorDType::BYTE, {static_cast<long>(w_scale_elems)}, "w_scales_linear");
+            w_scales = rs.temp_alloc(ETensorDType::BYTE, {static_cast<long>(w_scale_size)}, "w_scales");
+            w_amax = rs.temp_alloc(ETensorDType::FP32, {1}, "w_amax");
 
-            w_scratch_scales = rs.temp_alloc(ETensorDType::BF16, {static_cast<long>(w_scale_elems)});
-            w_max_scale = rs.temp_alloc(ETensorDType::INT32, {1});
+            w_scratch_scales = rs.temp_alloc(ETensorDType::BF16, {static_cast<long>(w_scale_elems)}, "w_scratch_scales");
+            w_max_scale = rs.temp_alloc(ETensorDType::INT32, {1}, "w_max_scale");
             const size_t cached_w_scale_elems = (static_cast<size_t>(OC) * C) / quartet::QUANT_GROUP_SIZE;
-            Tensor cached_w_scales_linear = rs.temp_alloc(ETensorDType::BYTE, {static_cast<long>(cached_w_scale_elems)});
-            Tensor cached_w_tensor_scale = rs.temp_alloc(ETensorDType::FP32, {1});
+            Tensor cached_w_scales_linear = rs.temp_alloc(ETensorDType::BYTE, {static_cast<long>(cached_w_scale_elems)}, "cached_w_scales_linear");
+            Tensor cached_w_tensor_scale = rs.temp_alloc(ETensorDType::FP32, {1}, "cached_w_tensor_scale");
 
             // FP4 cache stores global amax; dequant kernel expects tensor_scale = amax / (FP4_MAX * FP8_MAX).
             // Cached weights are produced by the standard NVFP4 path (FP8_MAX=448).
@@ -365,17 +365,17 @@ void NVFP4QuartetRecipe::backward_matmul(modules::MatmulContext& ctx) const {
             // No cached weights: quantize W^T from BF16 directly
             // Use Hadamard-aware quantize-transpose
             const size_t w_scale_size = compute_nvfp4_cutlass_scale_size(C, OC);
-            w_fp4 = rs.temp_alloc(ETensorDType::BYTE, {static_cast<long>(C), static_cast<long>(OC / 2)});
+            w_fp4 = rs.temp_alloc(ETensorDType::BYTE, {static_cast<long>(C), static_cast<long>(OC / 2)}, "w_fp4");
             const size_t w_scale_elems = (static_cast<size_t>(C) * OC) / quartet::QUANT_GROUP_SIZE;
-            w_scales_linear = rs.temp_alloc(ETensorDType::BYTE, {static_cast<long>(w_scale_elems)});
-            w_scales = rs.temp_alloc(ETensorDType::BYTE, {static_cast<long>(w_scale_size)});
-            w_amax = rs.temp_alloc(ETensorDType::FP32, {1});
+            w_scales_linear = rs.temp_alloc(ETensorDType::BYTE, {static_cast<long>(w_scale_elems)}, "w_scales_linear");
+            w_scales = rs.temp_alloc(ETensorDType::BYTE, {static_cast<long>(w_scale_size)}, "w_scales");
+            w_amax = rs.temp_alloc(ETensorDType::FP32, {1}, "w_amax");
 
-            w_scratch_scales = rs.temp_alloc(ETensorDType::BF16, {static_cast<long>(w_scale_elems)});
-            w_max_scale = rs.temp_alloc(ETensorDType::INT32, {1});
+            w_scratch_scales = rs.temp_alloc(ETensorDType::BF16, {static_cast<long>(w_scale_elems)}, "w_scratch_scales");
+            w_max_scale = rs.temp_alloc(ETensorDType::INT32, {1}, "w_max_scale");
 
             // Transpose W (OC, C) -> W^T (C, OC) then EDEN quantize
-            Tensor weight_tp = rs.temp_alloc(ETensorDType::BF16, {static_cast<long>(C), static_cast<long>(OC)});
+            Tensor weight_tp = rs.temp_alloc(ETensorDType::BF16, {static_cast<long>(C), static_cast<long>(OC)}, "weight_tp");
             transpose(weight_tp, *ctx.weight, OC, C, ctx.stream);
 
             quartet::group_transform_128_eden(
@@ -407,7 +407,7 @@ void NVFP4QuartetRecipe::backward_matmul(modules::MatmulContext& ctx) const {
         }
 
         // EDEN kernels produce tensor_scale (amax / (fp4_max * fp8_max)), so alpha is just the product.
-        Tensor alpha = rs.temp_alloc(ETensorDType::FP32, {1});
+        Tensor alpha = rs.temp_alloc(ETensorDType::FP32, {1}, "alpha");
         compute_fp4_alpha_from_tensor_scale(
             alpha.get<float>(),
             dout_amax.get<float>(),
@@ -456,20 +456,20 @@ void NVFP4QuartetRecipe::backward_matmul(modules::MatmulContext& ctx) const {
     // =========================================================================
     if (!ctx.skip_weight_grad && ctx.dweight) {
         // Transpose tensors for wgrad computation
-        Tensor dout_tp = rs.temp_alloc(ETensorDType::BF16, {static_cast<long>(OC), static_cast<long>(BT)});
-        Tensor inp_tp = rs.temp_alloc(ETensorDType::BF16, {static_cast<long>(C), static_cast<long>(BT)});
+        Tensor dout_tp = rs.temp_alloc(ETensorDType::BF16, {static_cast<long>(OC), static_cast<long>(BT)}, "dout_tp");
+        Tensor inp_tp = rs.temp_alloc(ETensorDType::BF16, {static_cast<long>(C), static_cast<long>(BT)}, "inp_tp");
         transpose(dout_tp, *ctx.dout, BT, OC, ctx.stream);
         transpose(inp_tp, *ctx.inp, BT, C, ctx.stream);
 
         // Quantize A (dout^T) with EDEN
         const size_t a_scale_size = compute_nvfp4_cutlass_scale_size(OC, BT);
-        Tensor a_fp4 = rs.temp_alloc(ETensorDType::BYTE, {static_cast<long>(OC), static_cast<long>(BT / 2)});
+        Tensor a_fp4 = rs.temp_alloc(ETensorDType::BYTE, {static_cast<long>(OC), static_cast<long>(BT / 2)}, "a_fp4");
         const size_t a_scale_elems = (static_cast<size_t>(OC) * BT) / quartet::QUANT_GROUP_SIZE;
-        Tensor a_scales_linear = rs.temp_alloc(ETensorDType::BYTE, {static_cast<long>(a_scale_elems)});
-        Tensor a_scales_cutlass = rs.temp_alloc(ETensorDType::BYTE, {static_cast<long>(a_scale_size)});
-        Tensor a_amax = rs.temp_alloc(ETensorDType::FP32, {1});
-        Tensor a_scratch = rs.temp_alloc(ETensorDType::BF16, {static_cast<long>(a_scale_elems)});
-        Tensor a_max_scale = rs.temp_alloc(ETensorDType::INT32, {1});
+        Tensor a_scales_linear = rs.temp_alloc(ETensorDType::BYTE, {static_cast<long>(a_scale_elems)}, "a_scales_linear");
+        Tensor a_scales_cutlass = rs.temp_alloc(ETensorDType::BYTE, {static_cast<long>(a_scale_size)}, "a_scales_cutlass");
+        Tensor a_amax = rs.temp_alloc(ETensorDType::FP32, {1}, "a_amax");
+        Tensor a_scratch = rs.temp_alloc(ETensorDType::BF16, {static_cast<long>(a_scale_elems)}, "a_scratch");
+        Tensor a_max_scale = rs.temp_alloc(ETensorDType::INT32, {1}, "a_max_scale");
 
         quartet::group_transform_128_eden(
             reinterpret_cast<__nv_fp4x2_storage_t*>(a_fp4.get<uint8_t>()),
@@ -494,13 +494,13 @@ void NVFP4QuartetRecipe::backward_matmul(modules::MatmulContext& ctx) const {
 
         // Quantize B (inp^T) with EDEN (same Hadamard as dout^T for wgrad)
         const size_t b_scale_size = compute_nvfp4_cutlass_scale_size(C, BT);
-        Tensor b_fp4 = rs.temp_alloc(ETensorDType::BYTE, {static_cast<long>(C), static_cast<long>(BT / 2)});
+        Tensor b_fp4 = rs.temp_alloc(ETensorDType::BYTE, {static_cast<long>(C), static_cast<long>(BT / 2)}, "b_fp4");
         const size_t b_scale_elems = (static_cast<size_t>(C) * BT) / quartet::QUANT_GROUP_SIZE;
-        Tensor b_scales_linear = rs.temp_alloc(ETensorDType::BYTE, {static_cast<long>(b_scale_elems)});
-        Tensor b_scales_cutlass = rs.temp_alloc(ETensorDType::BYTE, {static_cast<long>(b_scale_size)});
-        Tensor b_amax = rs.temp_alloc(ETensorDType::FP32, {1});
-        Tensor b_scratch = rs.temp_alloc(ETensorDType::BF16, {static_cast<long>(b_scale_elems)});
-        Tensor b_max_scale = rs.temp_alloc(ETensorDType::INT32, {1});
+        Tensor b_scales_linear = rs.temp_alloc(ETensorDType::BYTE, {static_cast<long>(b_scale_elems)}, "b_scales_linear");
+        Tensor b_scales_cutlass = rs.temp_alloc(ETensorDType::BYTE, {static_cast<long>(b_scale_size)}, "b_scales_cutlass");
+        Tensor b_amax = rs.temp_alloc(ETensorDType::FP32, {1}, "b_amax");
+        Tensor b_scratch = rs.temp_alloc(ETensorDType::BF16, {static_cast<long>(b_scale_elems)}, "b_scratch");
+        Tensor b_max_scale = rs.temp_alloc(ETensorDType::INT32, {1}, "b_max_scale");
 
         quartet::group_transform_128_eden(
             reinterpret_cast<__nv_fp4x2_storage_t*>(b_fp4.get<uint8_t>()),
@@ -524,7 +524,7 @@ void NVFP4QuartetRecipe::backward_matmul(modules::MatmulContext& ctx) const {
             ctx.stream);
 
         // EDEN kernels produce tensor_scale (amax / (fp4_max * fp8_max)), so alpha is just the product.
-        Tensor alpha = rs.temp_alloc(ETensorDType::FP32, {1});
+        Tensor alpha = rs.temp_alloc(ETensorDType::FP32, {1}, "alpha");
         compute_fp4_alpha_from_tensor_scale(
             alpha.get<float>(),
             a_amax.get<float>(),
@@ -550,7 +550,7 @@ void NVFP4QuartetRecipe::backward_matmul(modules::MatmulContext& ctx) const {
                 ctx.stream);
         } else {
             // Accumulate mode: compute to temp buffer then add
-            Tensor dw_temp = rs.temp_alloc(ETensorDType::BF16, {static_cast<long>(OC), static_cast<long>(C)});
+            Tensor dw_temp = rs.temp_alloc(ETensorDType::BF16, {static_cast<long>(OC), static_cast<long>(C)}, "dw_temp");
             matmul_cutlass_fp4_alpha(
                 dw_temp.get<nv_bfloat16>(),
                 a_fp4.get<uint8_t>(),

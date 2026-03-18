@@ -56,12 +56,12 @@ void CompiledExecutor::dispatch_bias_add_backward(const CompiledOp& op) {
 
         // Allocate scratch buffer for bias reduction
         const int scratch_bytes = get_bias_backward_scratch_size(d_out.DType, OC, mRunState.DeviceProp);
-        Tensor scratch = mRunState.temp_alloc(ETensorDType::FP32, {static_cast<long>(scratch_bytes / sizeof(float))});
+        Tensor scratch = mRunState.temp_alloc(ETensorDType::FP32, {static_cast<long>(scratch_bytes / sizeof(float))}, "bias_add_backward_scratch");
         mTemps.push_back(scratch);
 
         if (accumulate) {
             // Accumulate into existing gradient: compute to tmp, then add
-            Tensor tmp = mRunState.temp_alloc(d_out.DType, {static_cast<long>(OC)});
+            Tensor tmp = mRunState.temp_alloc(d_out.DType, {static_cast<long>(OC)}, "bias_add_backward_tmp");
             mTemps.push_back(tmp);
             backward_bias(tmp, d_out, nullptr, nullptr, scratch, Bv, Tv, OC, mRunState.DeviceProp, mRunState.MainStream);
             vector_add_sr(d_bias, d_bias, tmp, 1.0f, static_cast<long>(d_bias.nelem()), 0, mRunState.MainStream);

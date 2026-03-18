@@ -31,7 +31,7 @@ void CompiledExecutor::dispatch_moe_softmax(const CompiledOp& op) {
 
     // Allocate output with same shape as input (softmax doesn't change shape)
     std::vector<long> out_shape = {static_cast<long>(num_tokens), static_cast<long>(num_experts)};
-    Tensor out = mRunState.temp_alloc(inp.DType, out_shape);
+    Tensor out = mRunState.temp_alloc(inp.DType, out_shape, "moe_softmax_out");
     mTemps.push_back(out);
 
     if (inp.DType == ETensorDType::BF16) {

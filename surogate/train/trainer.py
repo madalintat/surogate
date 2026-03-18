@@ -639,9 +639,7 @@ class SurogateTrainerWrapper():
         # fill_sequential_position_ids (by not passing position_ids).
         uses_mrope = self._detect_pos_planes() > 1
         pos_ids = np.empty((total_rows, self.config.sequence_len), dtype=np.int32)
-        if uses_mrope:
-            logger.info("MRoPE model in DataLoader path: C++ will fill multi-plane position IDs")
-
+    
         # Preload first batch (eager path only)
         if not use_full_step_graphs:
             if uses_mrope:

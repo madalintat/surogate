@@ -290,7 +290,7 @@ Tensor& ensure_tensor(ExecState& st, const std::string& name, ETensorDType dtype
     if (Tensor* mapped = resolve_block_activation_tensor(st, name, dtype, shape)) {
         return *mapped;
     }
-    Tensor t = st.rs.temp_alloc(dtype, shape);
+    Tensor t = st.rs.temp_alloc(dtype, shape, name.c_str());
     st.temps.push_back(t);
     auto [ins_it, inserted] = st.tensors.emplace(name, t);
     (void)inserted;

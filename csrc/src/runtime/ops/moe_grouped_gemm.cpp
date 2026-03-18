@@ -130,7 +130,7 @@ void CompiledExecutor::dispatch_moe_grouped_gemm(const CompiledOp& op) {
     // Output shape: [total_tokens, out_features]
     const long total_tokens = inp.Sizes[0];
     std::vector<long> out_shape = {total_tokens, static_cast<long>(out_features)};
-    Tensor out = mRunState.temp_alloc(inp.DType, out_shape);
+    Tensor out = mRunState.temp_alloc(inp.DType, out_shape, "moe_grouped_gemm_out");
     mTemps.push_back(out);
 
     if (weight_is_compact && compact.active_experts.empty()) {
@@ -164,8 +164,8 @@ void CompiledExecutor::dispatch_moe_grouped_gemm(const CompiledOp& op) {
         Tensor inp_quant_buf, inp_stats_buf;
         if (mRecipe->is_fp8_hybrid() && ctx.allow_fp8) {
             const long num_elements = total_tokens * in_features;
-            inp_quant_buf = mRunState.temp_alloc(ETensorDType::FP8_E4M3, {total_tokens, static_cast<long>(in_features)});
-            inp_stats_buf = mRunState.temp_alloc(ETensorDType::FP32, {2});  // abs_max, scale
+            inp_quant_buf = mRunState.temp_alloc(ETensorDType::FP8_E4M3, {total_tokens, static_cast<long>(in_features)}, "moe_grouped_gemm_inp_quant_buf");
+            inp_stats_buf = mRunState.temp_alloc(ETensorDType::FP32, {2}, "moe_grouped_gemm_inp_stats_buf");  // abs_max, scale
             inp_quant_buf.Stats = inp_stats_buf.get<float>();
             ctx.inp_quant = &inp_quant_buf;
             mTemps.push_back(inp_quant_buf);
@@ -233,7 +233,7 @@ void CompiledExecutor::dispatch_moe_grouped_gemm(const CompiledOp& op) {
             auto view_or_temp = [&](Tensor& buf, long rows, long cols) -> Tensor {
                 const long need = rows * cols;
                 if (!buf.Data || buf.DType != out.DType || buf.nelem() < need) {
-                    Tensor tmp = mRunState.temp_alloc(out.DType, {rows, cols});
+                    Tensor tmp = mRunState.temp_alloc(out.DType, {rows, cols}, "moe_grouped_gemm_lora_temp");
                     mTemps.push_back(tmp);
                     return tmp;
                 }
@@ -392,7 +392,7 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_backward(const CompiledOp& op) 
                 const size_t expert_bytes = static_cast<size_t>(w_rows * w_cols) * elem_sz;
                 // Allocate zero buffer for foreign expert weight pointers
                 std::vector<long> zw_shape = {1L, w_rows, w_cols};
-                Tensor zero_weight = mRunState.temp_alloc(weights.DType, zw_shape);
+                Tensor zero_weight = mRunState.temp_alloc(weights.DType, zw_shape, "moe_grouped_gemm_zero_weight");
                 fill_zero(zero_weight, mRunState.MainStream);
                 mTemps.push_back(zero_weight);
 
@@ -440,7 +440,7 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_backward(const CompiledOp& op) 
     // Input gradient shape: same as inp
     const long total_tokens = d_out.Sizes[0];
     std::vector<long> d_inp_shape = {total_tokens, static_cast<long>(in_features)};
-    Tensor d_inp = mRunState.temp_alloc(d_out.DType, d_inp_shape);
+    Tensor d_inp = mRunState.temp_alloc(d_out.DType, d_inp_shape, "moe_grouped_gemm_backward_d_input");
     mTemps.push_back(d_inp);
 
     if (weight_is_compact && compact.active_experts.empty()) {
@@ -473,8 +473,8 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_backward(const CompiledOp& op) 
         Tensor dout_quant_buf, dout_stats_buf;
         if (mRecipe->is_fp8_hybrid() && ctx.allow_fp8) {
             const long num_elements = total_tokens * out_features;
-            dout_quant_buf = mRunState.temp_alloc(ETensorDType::FP8_E5M2, {total_tokens, static_cast<long>(out_features)});
-            dout_stats_buf = mRunState.temp_alloc(ETensorDType::FP32, {2});  // abs_max, scale
+            dout_quant_buf = mRunState.temp_alloc(ETensorDType::FP8_E5M2, {total_tokens, static_cast<long>(out_features)}, "moe_grouped_gemm_dout_quant_buf");
+            dout_stats_buf = mRunState.temp_alloc(ETensorDType::FP32, {2}, "moe_grouped_gemm_dout_stats_buf");  // abs_max, scale
             dout_quant_buf.Stats = dout_stats_buf.get<float>();
             ctx.dout_quant = &dout_quant_buf;
             mTemps.push_back(dout_quant_buf);
@@ -543,7 +543,7 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_backward(const CompiledOp& op) 
             auto view_or_temp = [&](Tensor& buf, long rows, long cols) -> Tensor {
                 const long need = rows * cols;
                 if (!buf.Data || buf.DType != d_out.DType || buf.nelem() < need) {
-                    Tensor tmp = mRunState.temp_alloc(d_out.DType, {rows, cols});
+                    Tensor tmp = mRunState.temp_alloc(d_out.DType, {rows, cols}, "moe_grouped_gemm_lora_temp");
                     mTemps.push_back(tmp);
                     return tmp;
                 }

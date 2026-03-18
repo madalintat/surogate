@@ -34,9 +34,9 @@ void CompiledExecutor::dispatch_mamba_split_conv_out(const CompiledOp& op) {
 
     // Allocate all output tensors upfront (before any mTemps.push_back)
     // to avoid dangling pointers from vector reallocation.
-    Tensor u_t = mRunState.temp_alloc(conv_out.DType, {B, D, T});
-    Tensor b_t = mRunState.temp_alloc(conv_out.DType, {B, groups, dstate, T});
-    Tensor c_t = mRunState.temp_alloc(conv_out.DType, {B, groups, dstate, T});
+    Tensor u_t = mRunState.temp_alloc(conv_out.DType, {B, D, T}, "mamba_split_conv_out_u");
+    Tensor b_t = mRunState.temp_alloc(conv_out.DType, {B, groups, dstate, T}, "mamba_split_conv_out_b");
+    Tensor c_t = mRunState.temp_alloc(conv_out.DType, {B, groups, dstate, T}, "mamba_split_conv_out_c");
     mTemps.push_back(u_t);
     mTemps.push_back(b_t);
     mTemps.push_back(c_t);
@@ -67,7 +67,7 @@ void CompiledExecutor::dispatch_mamba_split_conv_out_backward(const CompiledOp& 
     const int conv_dim = D + 2 * groups * dstate;
 
     // Allocate output
-    Tensor d_conv_out = mRunState.temp_alloc(d_u.DType, {B, conv_dim, T});
+    Tensor d_conv_out = mRunState.temp_alloc(d_u.DType, {B, conv_dim, T}, "mamba_split_conv_out_d_conv_out");
     mTemps.push_back(d_conv_out);
 
     // Call kernel (d_B and d_C are expected to be FP32 from selective_scan backward)

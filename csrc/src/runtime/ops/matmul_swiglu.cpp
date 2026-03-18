@@ -139,7 +139,7 @@ void CompiledExecutor::dispatch_matmul_swiglu_backward(const CompiledOp& op, con
         Tensor inp_flat = (inp.Rank == 2) ? inp : view_tensor(inp, {mB * mT, inp.Sizes[inp.Rank - 1]});
         matmul_dims(inp_flat, weight, op.attrs.transpose, M, N, K);
         const long D2 = N;
-        Tensor mlp_up_flat = mRunState.temp_alloc(inp.DType, {mB * mT, D2});
+        Tensor mlp_up_flat = mRunState.temp_alloc(inp.DType, {mB * mT, D2}, "matmul_swiglu_backward_recompute_mlp_up");
         mTemps.push_back(mlp_up_flat);
 
         EMMTranspose mode_col = swap_transpose(op.attrs.transpose);
@@ -166,7 +166,7 @@ void CompiledExecutor::dispatch_matmul_swiglu_backward(const CompiledOp& op, con
         }
     }
     Tensor d_mlp_up = d_mlp_up_ptr ? *d_mlp_up_ptr
-                                   : mRunState.temp_alloc(mlp_up.DType, {mlp_up.Sizes[0], mlp_up.Sizes[1], mlp_up.Sizes[2]});
+                                   : mRunState.temp_alloc(mlp_up.DType, {mlp_up.Sizes[0], mlp_up.Sizes[1], mlp_up.Sizes[2]}, "matmul_swiglu_backward_d_mlp_up");
     if (!d_mlp_up_ptr) {
         mTemps.push_back(d_mlp_up);
     }
@@ -232,12 +232,12 @@ void CompiledExecutor::dispatch_matmul_swiglu_backward(const CompiledOp& op, con
         Tensor* dB_use = d_weight_ptr;
 
         if (!dA_use) {
-            dA_tmp = mRunState.temp_alloc(inp.DType, {inp_flat.Sizes[0], inp_flat.Sizes[1]});
+            dA_tmp = mRunState.temp_alloc(inp.DType, {inp_flat.Sizes[0], inp_flat.Sizes[1]}, "matmul_swiglu_backward_dA_tmp");
             mTemps.push_back(dA_tmp);
             dA_use = &dA_tmp;
         }
         if (!dB_use && !skip_weight_grad) {
-            dB_tmp = mRunState.temp_alloc(weight.DType, {weight.Sizes[0], weight.Sizes[1]});
+            dB_tmp = mRunState.temp_alloc(weight.DType, {weight.Sizes[0], weight.Sizes[1]}, "matmul_swiglu_backward_dB_tmp");
             mTemps.push_back(dB_tmp);
             dB_use = &dB_tmp;
         }

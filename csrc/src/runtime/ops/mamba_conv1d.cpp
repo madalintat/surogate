@@ -53,7 +53,7 @@ void CompiledExecutor::dispatch_mamba_conv1d(const CompiledOp& op) {
         }
     }
     if (!out_ptr) {
-        Tensor out = mRunState.temp_alloc(x.DType, {B, conv_dim, T});
+        Tensor out = mRunState.temp_alloc(x.DType, {B, conv_dim, T}, "mamba_conv1d_out");
         mTemps.push_back(out);
         out_ptr = &mTemps.back();
     }
@@ -81,17 +81,17 @@ void CompiledExecutor::dispatch_mamba_conv1d_backward(const CompiledOp& op) {
     bool silu = (op.attrs.activation == "silu");
 
     // Allocate outputs
-    Tensor dx = mRunState.temp_alloc(d_out.DType, {B, conv_dim, T});
+    Tensor dx = mRunState.temp_alloc(d_out.DType, {B, conv_dim, T}, "mamba_conv1d_backward_dx");
     mTemps.push_back(dx);
 
     // Weight gradient is accumulated via atomicAdd — must zero-init (stack memory is stale)
-    Tensor dweight_fp32 = mRunState.temp_alloc(ETensorDType::FP32, {conv_dim, kernel});
+    Tensor dweight_fp32 = mRunState.temp_alloc(ETensorDType::FP32, {conv_dim, kernel}, "mamba_conv1d_backward_dweight_fp32");
     mTemps.push_back(dweight_fp32);
     fill_zero(dweight_fp32, mRunState.MainStream);
 
     Tensor* dbias_fp32 = nullptr;
     if (op.outputs.size() > 2) {
-        Tensor dbias = mRunState.temp_alloc(ETensorDType::FP32, {conv_dim});
+        Tensor dbias = mRunState.temp_alloc(ETensorDType::FP32, {conv_dim}, "mamba_conv1d_backward_dbias_fp32");
         mTemps.push_back(dbias);
         fill_zero(mTemps.back(), mRunState.MainStream);
         dbias_fp32 = &mTemps.back();

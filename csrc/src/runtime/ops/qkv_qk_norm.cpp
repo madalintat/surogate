@@ -175,7 +175,7 @@ void CompiledExecutor::dispatch_qkv_qk_norm_backward(const CompiledOp& op) {
     Tensor* d_qkv_ptr = &ensure_output_tensor(op.outputs[0]);
     if (d_qkv_ptr->Rank == 0 || d_qkv_ptr->nelem() != d_out.nelem() || d_qkv_ptr->DType != d_out.DType) {
         std::vector<long> shape(d_out.Sizes.begin(), d_out.Sizes.begin() + d_out.Rank);
-        Tensor tmp = mRunState.temp_alloc(d_out.DType, shape);
+        Tensor tmp = mRunState.temp_alloc(d_out.DType, shape, "qkv_qk_norm_backward_d_qkv");
         mTemps.push_back(tmp);
         d_qkv_ptr = &mTemps.back();
     }

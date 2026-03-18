@@ -32,7 +32,7 @@ void CompiledExecutor::dispatch_silu_backward(const CompiledOp& op) {
     Tensor& d_inp = (op.outputs[0].shape.empty() && inp.Rank > 0)
         ? [&]() -> Tensor& {
             std::vector<long> shape(inp.Sizes.begin(), inp.Sizes.begin() + inp.Rank);
-            Tensor t = mRunState.temp_alloc(inp.DType, shape);
+            Tensor t = mRunState.temp_alloc(inp.DType, shape, "silu_backward_d_inp");
             fill_zero(t, mRunState.MainStream);
             mTemps.push_back(t);
             store_tensor(op.outputs[0], t);

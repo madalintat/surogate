@@ -229,7 +229,7 @@ void DslModel::forward(Tensor inputs, Tensor position_ids, NCCLCommunicator& com
                     Tensor down_input_tmp{};
                     bool free_down_input_tmp = false;
                     if (!down_input.Data && acts.mlp_up.Data) {
-                        down_input_tmp = rs.temp_alloc(acts.mlp_down.DType, {B * T, D});
+                        down_input_tmp = rs.temp_alloc(acts.mlp_down.DType, {B * T, D}, "down_input_tmp");
                         Tensor down_input_view = down_input_tmp;
                         down_input_view.Rank = 3;
                         down_input_view.Sizes[0] = B;
@@ -368,7 +368,7 @@ float DslModel::validate(Tensor inputs, Tensor position_ids, Tensor targets, NCC
                     Tensor down_input_tmp{};
                     bool free_down_input_tmp = false;
                     if (!down_input.Data && acts.mlp_up.Data) {
-                        down_input_tmp = rs.temp_alloc(acts.mlp_down.DType, {B * T, D});
+                        down_input_tmp = rs.temp_alloc(acts.mlp_down.DType, {B * T, D}, "down_input_tmp");
                         Tensor down_input_view = down_input_tmp;
                         down_input_view.Rank = 3;
                         down_input_view.Sizes[0] = B;
@@ -880,6 +880,33 @@ void DslModel::allocate_run_state(const RuntimeOptions& options, NCCLCommunicato
         mExecutor->set_rng_state(mRngState);
     }
 
+    // Estimate actual backward stack peak from the compiled graph and resize if needed.
+    // The heuristic sizing above may underestimate for architectures with heavy backward
+    // ops (e.g. Qwen3.5 gated delta rule) that allocate many internal temps on the stack.
+    if (auto* exec = dynamic_cast<GraphExecutor*>(mExecutor.get())) {
+        const long bwd_peak = exec->estimate_backward_stack_peak(B, T);
+        if (options.DebugMemoryBreakdown && comm.rank() == 0) {
+            std::cerr << "[DEBUG-STACK] Backward peak estimate=" << bwd_peak / (1024 * 1024) << " MiB"
+                      << ", heuristic=" << required_size / (1024 * 1024) << " MiB" << std::endl;
+        }
+        if (bwd_peak > 0) {
+            // Use bwd_peak/3 safety margin to account for dispatch-internal temps
+            // (e.g. fused matmul+swiglu backward) that are not represented in the graph.
+            const long safety = std::max(128L * 1024 * 1024, bwd_peak / 3);
+            const long needed = bwd_peak + safety;
+            if (needed > required_size) {
+                if (options.DebugMemoryBreakdown && comm.rank() == 0) {
+                    std::cerr << "[DEBUG-STACK] Resizing stack: " << required_size / (1024 * 1024) << " MiB"
+                              << " -> " << needed / (1024 * 1024) << " MiB" << std::endl;
+                }
+                Tensor new_stack = mAllocator->allocate(ETensorDType::BYTE, "dsl_stack",
+                                                        EAllocationType::ON_DEVICE, {needed});
+                mRunState->set_stack_buffer(std::move(new_stack), high_mark);
+                required_size = needed;
+            }
+        }
+    }
+
     // Enable MoE routing stats tracking
     if (mModelConfig.NumExperts > 0) {
         float aux_coef = mModelConfig.moe_config.has_value()
@@ -1028,7 +1055,7 @@ std::vector<float> DslModel::compute_logprobs(const std::int32_t* input_ids,
                         Tensor down_input_tmp{};
                         bool free_down_input_tmp = false;
                         if (!down_input.Data && acts.mlp_up.Data) {
-                            down_input_tmp = rs.temp_alloc(acts.mlp_down.DType, {B_ * T_, D});
+                            down_input_tmp = rs.temp_alloc(acts.mlp_down.DType, {B_ * T_, D}, "down_input_tmp");
                             Tensor down_input_view = down_input_tmp;
                             down_input_view.Rank = 3;
                             down_input_view.Sizes[0] = B_;

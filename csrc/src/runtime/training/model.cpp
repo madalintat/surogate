@@ -330,8 +330,8 @@ float IRunState::get_accuracy() const {
     return AccuracyHost[0];
 }
 
-Tensor IRunState::temp_alloc(ETensorDType dtype, const std::vector<long>& shape) {
-    return Stack.allocate(dtype, shape);
+Tensor IRunState::temp_alloc(ETensorDType dtype, const std::vector<long>& shape, const char* name) {
+    return Stack.allocate(dtype, shape, name);
 }
 
 void IRunState::temp_acquire(Tensor& target) {

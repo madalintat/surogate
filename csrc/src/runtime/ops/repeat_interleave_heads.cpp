@@ -34,7 +34,7 @@ void CompiledExecutor::dispatch_repeat_interleave_heads(const CompiledOp& op) {
     if (out.Rank != 4 || out.DType != x.DType ||
         out.Sizes[0] != B || out.Sizes[1] != T ||
         out.Sizes[2] != H * repeats || out.Sizes[3] != D) {
-        out = mRunState.temp_alloc(x.DType, {B, T, H * repeats, D});
+        out = mRunState.temp_alloc(x.DType, {B, T, H * repeats, D}, "repeat_interleave_heads_out");
         mTemps.push_back(out);
     }
     repeat_interleave_heads_forward(out, x, repeats, mRunState.MainStream);
@@ -62,7 +62,7 @@ void CompiledExecutor::dispatch_repeat_interleave_heads_backward(const CompiledO
     if (d_x.Rank != 4 || d_x.DType != x.DType ||
         d_x.Sizes[0] != x.Sizes[0] || d_x.Sizes[1] != x.Sizes[1] ||
         d_x.Sizes[2] != x.Sizes[2] || d_x.Sizes[3] != x.Sizes[3]) {
-        d_x = mRunState.temp_alloc(x.DType, {x.Sizes[0], x.Sizes[1], x.Sizes[2], x.Sizes[3]});
+        d_x = mRunState.temp_alloc(x.DType, {x.Sizes[0], x.Sizes[1], x.Sizes[2], x.Sizes[3]}, "repeat_interleave_heads_backward_d_x");
         mTemps.push_back(d_x);
     }
 

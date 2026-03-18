@@ -33,9 +33,9 @@ void CompiledExecutor::dispatch_mamba_split_proj(const CompiledOp& op) {
 
     // Allocate all output tensors upfront (before any mTemps.push_back)
     // to avoid dangling pointers from vector reallocation.
-    Tensor gate_t = mRunState.temp_alloc(proj.DType, {B, T, intermediate_size});
-    Tensor conv_t = mRunState.temp_alloc(proj.DType, {B, conv_dim, T});
-    Tensor delta_t = mRunState.temp_alloc(proj.DType, {B, intermediate_size, T});
+    Tensor gate_t = mRunState.temp_alloc(proj.DType, {B, T, intermediate_size}, "mamba_split_proj_gate");
+    Tensor conv_t = mRunState.temp_alloc(proj.DType, {B, conv_dim, T}, "mamba_split_proj_conv");
+    Tensor delta_t = mRunState.temp_alloc(proj.DType, {B, intermediate_size, T}, "mamba_split_proj_delta");
     mTemps.push_back(gate_t);
     mTemps.push_back(conv_t);
     mTemps.push_back(delta_t);
@@ -69,7 +69,7 @@ void CompiledExecutor::dispatch_mamba_split_proj_backward(const CompiledOp& op) 
 
     // Allocate output
     const int proj_size = intermediate_size + conv_dim + num_heads;
-    Tensor d_proj = mRunState.temp_alloc(d_gate.DType, {B, T, proj_size});
+    Tensor d_proj = mRunState.temp_alloc(d_gate.DType, {B, T, proj_size}, "mamba_split_proj_d_proj");
     mTemps.push_back(d_proj);
 
     // Call kernel — reduces d_delta [B, D, T] to per-head d_dt inline

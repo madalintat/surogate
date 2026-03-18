@@ -45,10 +45,10 @@ void CompiledExecutor::dispatch_moe_topk(const CompiledOp& op) {
     // The compiled graph may have empty shapes for these intermediates, so we
     // allocate directly with the correct dimensions.
     Tensor weights = mRunState.temp_alloc(probs.DType,
-        {static_cast<long>(num_tokens), static_cast<long>(top_k)});
+        {static_cast<long>(num_tokens), static_cast<long>(top_k)}, "moe_topk_weights");
     mTemps.push_back(weights);
     Tensor indices = mRunState.temp_alloc(ETensorDType::INT32,
-        {static_cast<long>(num_tokens), static_cast<long>(top_k)});
+        {static_cast<long>(num_tokens), static_cast<long>(top_k)}, "moe_topk_indices");
     mTemps.push_back(indices);
 
     if (probs.DType == ETensorDType::BF16) {
@@ -114,7 +114,7 @@ void CompiledExecutor::dispatch_moe_topk_backward(const CompiledOp& op) {
     Tensor d_weights_scaled;
     if (scaling_factor != 1.0f) {
         d_weights_scaled = mRunState.temp_alloc(d_routing_weights.DType,
-            {static_cast<long>(num_tokens), static_cast<long>(top_k)});
+            {static_cast<long>(num_tokens), static_cast<long>(top_k)}, "moe_topk_d_weights_scaled");
         mTemps.push_back(d_weights_scaled);
         const int n = num_tokens * top_k;
         if (d_routing_weights.DType == ETensorDType::BF16) {
@@ -132,7 +132,7 @@ void CompiledExecutor::dispatch_moe_topk_backward(const CompiledOp& op) {
     // Allocate output with correct shape derived from probs (not from compile-time inference)
     // d_probs must have shape [num_tokens, num_experts] matching probs
     std::vector<long> d_probs_shape = {static_cast<long>(num_tokens), static_cast<long>(num_experts)};
-    Tensor d_probs = mRunState.temp_alloc(d_routing_weights.DType, d_probs_shape);
+    Tensor d_probs = mRunState.temp_alloc(d_routing_weights.DType, d_probs_shape, "moe_topk_d_probs");
     mTemps.push_back(d_probs);
 
     // TopK backward kernel only supports FP32

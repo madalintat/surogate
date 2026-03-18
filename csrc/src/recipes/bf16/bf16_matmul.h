@@ -115,7 +115,7 @@ inline void backward_matmul(Tensor& dinp,
 
     // Compute dinp = dout @ W
     // Need W transposed: (OC, C) -> (C, OC)
-    Tensor weight_tp = rs.temp_alloc(weight.DType, {(long)C, (long)OC});
+    Tensor weight_tp = rs.temp_alloc(weight.DType, {(long)C, (long)OC}, "weight_tp");
     transpose(weight_tp, weight, OC, C, stream);
 
     matmul(dinp, weight_tp, dout, std::nullopt, nullptr, nullptr,
@@ -127,11 +127,11 @@ inline void backward_matmul(Tensor& dinp,
     // Compute dweight = inp^T @ dout
     if (!skip_weight_grad) {
         // Transpose input: (BT, C) -> (C, BT)
-        Tensor inp_tp = rs.temp_alloc(inp.DType, {(long)C, (long)BT});
+        Tensor inp_tp = rs.temp_alloc(inp.DType, {(long)C, (long)BT}, "inp_tp");
         transpose(inp_tp, inp, BT, C, stream);
 
         // Transpose dout: (BT, OC) -> (OC, BT)
-        Tensor dout_tp = rs.temp_alloc(dout.DType, {(long)OC, (long)BT});
+        Tensor dout_tp = rs.temp_alloc(dout.DType, {(long)OC, (long)BT}, "dout_tp");
         transpose(dout_tp, dout, BT, OC, stream);
 
         // dweight (OC, C) = dout_tp (OC, BT) @ inp_tp^T (BT, C)

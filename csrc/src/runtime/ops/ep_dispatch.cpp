@@ -164,7 +164,7 @@ void CompiledExecutor::dispatch_ep_dispatch(const CompiledOp& op) {
     if (threshold < 100.0f) {
         // All-reduce expert counts across EP group
         Tensor counts_gpu = mRunState.temp_alloc(ETensorDType::INT32,
-            {static_cast<long>(num_experts)});
+            {static_cast<long>(num_experts)}, "ep_expert_counts");
         CUDA_CHECK(cudaMemcpyAsync(counts_gpu.Data, local_expert_counts.data(),
                                     num_experts * sizeof(int), cudaMemcpyHostToDevice,
                                     mRunState.MainStream));
@@ -247,29 +247,29 @@ void CompiledExecutor::dispatch_ep_dispatch(const CompiledOp& op) {
     if (use_llep) {
         // Upload expert_offsets and expert_to_gpu to GPU (small H2D copies)
         Tensor offsets_gpu = mRunState.temp_alloc(ETensorDType::INT32,
-            {static_cast<long>(num_experts + 1)});
+            {static_cast<long>(num_experts + 1)}, "ep_offsets_gpu");
         CUDA_CHECK(cudaMemcpyAsync(offsets_gpu.Data, expert_offsets.data(),
                                     (num_experts + 1) * sizeof(int), cudaMemcpyHostToDevice,
                                     mRunState.MainStream));
 
         Tensor e2g_gpu = mRunState.temp_alloc(ETensorDType::INT32,
-            {static_cast<long>(num_experts)});
+            {static_cast<long>(num_experts)}, "ep_e2g_gpu");
         CUDA_CHECK(cudaMemcpyAsync(e2g_gpu.Data, expert_to_gpu.data(),
                                     num_experts * sizeof(int), cudaMemcpyHostToDevice,
                                     mRunState.MainStream));
 
         // Allocate output send buffer
         send_buf = mRunState.temp_alloc(permuted_input.DType,
-            {static_cast<long>(total_send), static_cast<long>(hidden_size)});
+            {static_cast<long>(total_send), static_cast<long>(hidden_size)}, "ep_send_buf");
         mTemps.push_back(send_buf);
 
         // Temporary buffer for per-expert write offsets
         Tensor pwo_gpu = mRunState.temp_alloc(ETensorDType::INT32,
-            {static_cast<long>(num_experts)});
+            {static_cast<long>(num_experts)}, "ep_pwo_gpu");
 
         // Output buffer for send_order mapping (needed for backward)
         Tensor send_order_gpu = mRunState.temp_alloc(ETensorDType::INT32,
-            {static_cast<long>(total_send)});
+            {static_cast<long>(total_send)}, "ep_send_order_gpu");
 
         // Fused GPU kernel: compute write offsets + scatter tokens + record send_order
         if (permuted_input.DType == ETensorDType::BF16) {
@@ -305,9 +305,9 @@ void CompiledExecutor::dispatch_ep_dispatch(const CompiledOp& op) {
     auto _t_a2a_start = std::chrono::steady_clock::now();
     // A2A 1: exchange per-GPU token splits
     Tensor send_splits_gpu = mRunState.temp_alloc(ETensorDType::INT32,
-        {static_cast<long>(ep_size)});
+        {static_cast<long>(ep_size)}, "ep_send_splits_gpu");
     Tensor recv_splits_gpu = mRunState.temp_alloc(ETensorDType::INT32,
-        {static_cast<long>(ep_size)});
+        {static_cast<long>(ep_size)}, "ep_recv_splits_gpu");
     CUDA_CHECK(cudaMemcpyAsync(send_splits_gpu.Data, send_splits.data(),
                                 ep_size * sizeof(int), cudaMemcpyHostToDevice,
                                 mRunState.MainStream));
@@ -320,9 +320,9 @@ void CompiledExecutor::dispatch_ep_dispatch(const CompiledOp& op) {
 
     // A2A 2: exchange per-expert counts (fixed-size, independent of A2A 1 results)
     Tensor send_ec_gpu = mRunState.temp_alloc(ETensorDType::INT32,
-        {static_cast<long>(num_experts * ep_size)});
+        {static_cast<long>(num_experts * ep_size)}, "ep_send_ec_gpu");
     Tensor recv_ec_gpu = mRunState.temp_alloc(ETensorDType::INT32,
-        {static_cast<long>(num_experts * ep_size)});
+        {static_cast<long>(num_experts * ep_size)}, "ep_recv_ec_gpu");
     for (int p = 0; p < ep_size; ++p) {
         CUDA_CHECK(cudaMemcpyAsync(
             static_cast<std::byte*>(send_ec_gpu.Data) + static_cast<size_t>(p) * num_experts * sizeof(int),

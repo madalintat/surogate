@@ -30,9 +30,9 @@ void CompiledExecutor::dispatch_mask_scatter(const CompiledOp& op) {
     }
 
     std::size_t temp_bytes = mask_scatter_temp_bytes(N);
-    Tensor temp = mRunState.temp_alloc(ETensorDType::BYTE, {static_cast<long>(temp_bytes)});
+    Tensor temp = mRunState.temp_alloc(ETensorDType::BYTE, {static_cast<long>(temp_bytes)}, "mask_scatter_temp");
     mTemps.push_back(temp);
-    Tensor prefix = mRunState.temp_alloc(ETensorDType::INT32, {static_cast<long>(N)});
+    Tensor prefix = mRunState.temp_alloc(ETensorDType::INT32, {static_cast<long>(N)}, "mask_scatter_prefix");
     mTemps.push_back(prefix);
 
     mask_scatter_forward(out, inp, mask, src, prefix, temp, B, T, C, mRunState.MainStream);
@@ -62,9 +62,9 @@ void CompiledExecutor::dispatch_mask_scatter_backward(const CompiledOp& op) {
     const int N = B * T;
 
     std::size_t temp_bytes = mask_scatter_temp_bytes(N);
-    Tensor temp = mRunState.temp_alloc(ETensorDType::BYTE, {static_cast<long>(temp_bytes)});
+    Tensor temp = mRunState.temp_alloc(ETensorDType::BYTE, {static_cast<long>(temp_bytes)}, "mask_scatter_temp");
     mTemps.push_back(temp);
-    Tensor prefix = mRunState.temp_alloc(ETensorDType::INT32, {static_cast<long>(N)});
+    Tensor prefix = mRunState.temp_alloc(ETensorDType::INT32, {static_cast<long>(N)}, "mask_scatter_prefix");
     mTemps.push_back(prefix);
 
     Tensor dummy;

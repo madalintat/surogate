@@ -130,7 +130,7 @@ void CompiledExecutor::dispatch_moe_expert_bias_add(const CompiledOp& op) {
     }
 
     std::vector<long> out_shape = {static_cast<long>(total_tokens), static_cast<long>(hidden_size)};
-    Tensor out = mRunState.temp_alloc(inp.DType, out_shape);
+    Tensor out = mRunState.temp_alloc(inp.DType, out_shape, "moe_expert_bias_add_out");
     mTemps.push_back(out);
 
     if (llep) {
@@ -140,7 +140,7 @@ void CompiledExecutor::dispatch_moe_expert_bias_add(const CompiledOp& op) {
         // Direct HF mapping (2D tensors are not EP-sharded).
         const size_t row_bytes = static_cast<size_t>(hidden_size) * get_dtype_size(bias.DType);
         Tensor merged_bias = mRunState.temp_alloc(bias.DType,
-            {static_cast<long>(num_experts), static_cast<long>(hidden_size)});
+            {static_cast<long>(num_experts), static_cast<long>(hidden_size)}, "moe_expert_bias_add_merged_bias");
         mTemps.push_back(merged_bias);
         for (int m = 0; m < num_experts; ++m) {
             const int global_e = llep->merged_to_global[m];
@@ -262,7 +262,7 @@ void CompiledExecutor::dispatch_moe_expert_bias_add_backward(const CompiledOp& o
     Tensor d_bias_f32;
     if (need_temp) {
         d_bias_f32 = mRunState.temp_alloc(ETensorDType::FP32,
-                                          {static_cast<long>(num_experts), static_cast<long>(hidden_size)});
+                                          {static_cast<long>(num_experts), static_cast<long>(hidden_size)}, "moe_expert_bias_add_d_bias_f32");
         mTemps.push_back(d_bias_f32);
     }
 
@@ -290,7 +290,7 @@ void CompiledExecutor::dispatch_moe_expert_bias_add_backward(const CompiledOp& o
     auto shape_vec = [](const Tensor& t) {
         return std::vector<long>(t.Sizes.begin(), t.Sizes.begin() + t.Rank);
     };
-    Tensor d_bias_cast = mRunState.temp_alloc(d_bias.DType, shape_vec(d_bias));
+    Tensor d_bias_cast = mRunState.temp_alloc(d_bias.DType, shape_vec(d_bias), "moe_expert_bias_add_d_bias_cast");
     mTemps.push_back(d_bias_cast);
     convert_dtype(d_bias_cast.get<nv_bfloat16>(), d_bias_f32.get<float>(),
                   d_bias_f32.nelem(), mRunState.MainStream);

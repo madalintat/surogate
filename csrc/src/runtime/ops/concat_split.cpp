@@ -135,7 +135,7 @@ void CompiledExecutor::dispatch_concat(const CompiledOp& op) {
     Tensor& out_ref = ensure_output_tensor(op.outputs[0]);
     Tensor out = out_ref;
     if (out.DType != first.DType || !shape_equal(out, out_shape)) {
-        out = mRunState.temp_alloc(first.DType, out_shape);
+        out = mRunState.temp_alloc(first.DType, out_shape, "concat_output");
         mTemps.push_back(out);
     }
 
@@ -320,7 +320,7 @@ void CompiledExecutor::dispatch_split(const CompiledOp& op) {
         Tensor& out_ref = ensure_output_tensor(op.outputs[i]);
         Tensor out = out_ref;
         if (out.DType != in.DType || !shape_equal(out, out_shape)) {
-            out = mRunState.temp_alloc(in.DType, out_shape);
+            out = mRunState.temp_alloc(in.DType, out_shape, "split_output");
             mTemps.push_back(out);
         }
         std::byte* out_ptr = static_cast<std::byte*>(out.Data);

@@ -31,7 +31,7 @@ void CompiledExecutor::dispatch_swiglu(const CompiledOp& op) {
 
         // MoE output shape is dynamic, allocate with runtime shape
         std::vector<long> out_shape = {N, D};
-        Tensor out = mRunState.temp_alloc(inp.DType, out_shape);
+        Tensor out = mRunState.temp_alloc(inp.DType, out_shape, "swiglu_out");
         mTemps.push_back(out);
 
         swiglu_forward(out, inp, nullptr, 1, static_cast<int>(N), static_cast<int>(D), mRunState.MainStream);
@@ -74,7 +74,7 @@ void CompiledExecutor::dispatch_swiglu_backward(const CompiledOp& op) {
         const long expected_nelem = static_cast<long>(inp.nelem());
         if (d_inp_ptr->nelem() != expected_nelem) {
             std::vector<long> shape(inp.Sizes.begin(), inp.Sizes.begin() + inp.Rank);
-            Tensor tmp = mRunState.temp_alloc(inp.DType, shape);
+            Tensor tmp = mRunState.temp_alloc(inp.DType, shape, "swiglu_backward_d_inp");
             mTemps.push_back(tmp);
             store_tensor(op.outputs[0], tmp);
             d_inp_ptr = &mTensors[op.outputs[0].tensor_id];

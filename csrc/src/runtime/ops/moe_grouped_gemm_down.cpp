@@ -126,7 +126,7 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_down(const CompiledOp& op) {
     // total_tokens = inp.Sizes[0] (permuted token count)
     const long total_tokens = inp.Sizes[0];
     std::vector<long> out_shape = {total_tokens, static_cast<long>(hidden_size)};
-    Tensor out = mRunState.temp_alloc(inp.DType, out_shape);
+    Tensor out = mRunState.temp_alloc(inp.DType, out_shape, "moe_grouped_gemm_down_out");
     mTemps.push_back(out);
 
     if (weight_is_compact && compact.active_experts.empty()) {
@@ -213,7 +213,7 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_down(const CompiledOp& op) {
             auto view_or_temp = [&](Tensor& buf, long rows, long cols) -> Tensor {
                 const long need = rows * cols;
                 if (!buf.Data || buf.DType != out.DType || buf.nelem() < need) {
-                    Tensor tmp = mRunState.temp_alloc(out.DType, {rows, cols});
+                    Tensor tmp = mRunState.temp_alloc(out.DType, {rows, cols}, "moe_grouped_gemm_down_temp");
                     mTemps.push_back(tmp);
                     return tmp;
                 }
@@ -291,7 +291,7 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_down_backward(const CompiledOp&
     Tensor* d_input_ptr = nullptr;
     if (needs_dynamic(op.outputs[0], inp)) {
         std::vector<long> shape(inp.Sizes.begin(), inp.Sizes.begin() + inp.Rank);
-        d_input_local = mRunState.temp_alloc(inp.DType, shape);
+        d_input_local = mRunState.temp_alloc(inp.DType, shape, "moe_grouped_gemm_down_d_input_local");
         mTemps.push_back(d_input_local);
         store_tensor(op.outputs[0], d_input_local);
         d_input_ptr = &mTensors[op.outputs[0].tensor_id];
@@ -379,7 +379,7 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_down_backward(const CompiledOp&
                 const size_t elem_sz = get_dtype_size(weights.DType);
                 const size_t expert_bytes = static_cast<size_t>(hidden_size) * intermediate_size * elem_sz;
                 std::vector<long> zw_shape = {1L, static_cast<long>(hidden_size), static_cast<long>(intermediate_size)};
-                Tensor zero_weight = mRunState.temp_alloc(weights.DType, zw_shape);
+                Tensor zero_weight = mRunState.temp_alloc(weights.DType, zw_shape, "moe_grouped_gemm_down_zero_weight");
                 fill_zero(zero_weight, mRunState.MainStream);
                 mTemps.push_back(zero_weight);
 
@@ -551,7 +551,7 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_down_backward(const CompiledOp&
             auto view_or_temp = [&](Tensor& buf, long rows, long cols) -> Tensor {
                 const long need = rows * cols;
                 if (!buf.Data || buf.DType != d_output.DType || buf.nelem() < need) {
-                    Tensor tmp = mRunState.temp_alloc(d_output.DType, {rows, cols});
+                    Tensor tmp = mRunState.temp_alloc(d_output.DType, {rows, cols}, "moe_grouped_gemm_down_temp");
                     mTemps.push_back(tmp);
                     return tmp;
                 }
