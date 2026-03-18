@@ -1312,6 +1312,45 @@ NB_MODULE(_surogate, m) {
         "- temperatures:    Optional float32 per-token temperatures shaped [B, T].\n\n"
         "Equivalent to step() but uses provided per-token gradients instead of d_loss=1.0.\n"
         "Call update_with_config() after grad_accum steps to apply gradients.")
+        .def("forward_for_grpo", [](MultiGPUPyTrainer* trainer,
+                nb::ndarray<int32_t, nb::ndim<2>, nb::c_contig> input_ids,
+                nb::ndarray<int32_t, nb::ndim<2>, nb::c_contig> targets,
+                nb::object position_ids_obj,
+                nb::object temperatures_obj) {
+            const std::int32_t* position_ids_ptr = nullptr;
+            if (!position_ids_obj.is_none()) {
+                auto position_ids = nb::cast<nb::ndarray<int32_t, nb::ndim<2>, nb::c_contig>>(position_ids_obj);
+                position_ids_ptr = position_ids.data();
+            }
+            const float* temperatures_ptr = nullptr;
+            if (!temperatures_obj.is_none()) {
+                auto temperatures = nb::cast<nb::ndarray<float, nb::ndim<2>, nb::c_contig>>(temperatures_obj);
+                temperatures_ptr = temperatures.data();
+            }
+            auto logprobs = trainer->forward_for_grpo(input_ids.data(), targets.data(),
+                                                       position_ids_ptr, temperatures_ptr);
+            const std::size_t n = logprobs.size();
+            float* data = new float[n];
+            std::copy(logprobs.begin(), logprobs.end(), data);
+            nb::capsule owner(data, [](void* p) noexcept { delete[] static_cast<float*>(p); });
+            const std::size_t B = input_ids.shape(0), T = input_ids.shape(1);
+            return nb::ndarray<nb::numpy, float, nb::ndim<2>>(data, {B, T}, owner);
+        },
+        nb::arg("input_ids"), nb::arg("targets"),
+        nb::arg("position_ids") = nb::none(),
+        nb::arg("temperatures") = nb::none(),
+        "GRPO single-pass forward: saves activations AND returns per-token logprobs.\n\n"
+        "Call backward_grpo() after computing per-token gradient multipliers.\n"
+        "Returns: float32 logprobs shaped [B, T].")
+        .def("backward_grpo", [](MultiGPUPyTrainer* trainer,
+                nb::ndarray<float, nb::ndim<2>, nb::c_contig> per_token_grads,
+                nb::object position_ids_obj) {
+            (void)position_ids_obj;
+            trainer->backward_grpo(per_token_grads.data());
+        },
+        nb::arg("per_token_grads"),
+        nb::arg("position_ids") = nb::none(),
+        "GRPO backward pass using activations saved by forward_for_grpo().")
         .def("set_grad_accumulation", &MultiGPUPyTrainer::set_grad_accumulation, nb::arg("n"),
              "Set the gradient accumulation step count for the next training step.\n\n"
              "Call this before the first step_with_custom_loss() of each optimizer step\n"

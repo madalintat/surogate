@@ -207,6 +207,25 @@ public:
                                 NCCLCommunicator& comm,
                                 const float* temperatures = nullptr);
 
+    /// GRPO single-pass forward: runs training forward (saves activations) AND
+    /// returns per-token log-probabilities extracted from the loss buffer.
+    /// The caller should compute per-token GRPO gradients from the returned logprobs
+    /// and then call backward_grpo() to complete the micro-step.
+    ///
+    /// logprob[t] = -loss[t] where loss[t] = logsumexp - logit[target[t]].
+    /// Masked positions (target == -100) receive 0.
+    std::vector<float> forward_for_grpo(Tensor inputs, Tensor position_ids, Tensor targets,
+                                         int grad_accum_steps, int micro_step,
+                                         NCCLCommunicator& comm,
+                                         const float* temperatures = nullptr);
+
+    /// GRPO backward pass using activations saved by forward_for_grpo().
+    /// Must be called after forward_for_grpo() in the same micro-step.
+    void backward_grpo(Tensor inputs, Tensor targets,
+                        const float* per_token_grads_cpu,
+                        int grad_accum_steps, int micro_step,
+                        NCCLCommunicator& comm);
+
     void init_weights(NCCLCommunicator& comm) override;
     void import_weights(const std::string& file_name, bool allow_cast, NCCLCommunicator& comm) override;
 
@@ -307,6 +326,7 @@ private:
     bool mIsMoEModel = false;
     bool mUseTokenScale = true;  // apply 1/valid_token_count in global_norm_sqrt
     bool mDocMaskingActive = false;  // set by forward(), cleared by backward()
+    float* mGrpoInvTemperatureGpu = nullptr;  // persists from forward_for_grpo() to backward_grpo()
 
     // Pre-built name tables for LoRA backward (avoids per-layer string construction).
     // Indexed by layer. Populated lazily on first use.

@@ -330,19 +330,38 @@ class GRPOTrainer:
                 temp_padded = np.ones((1, seq_len), dtype=np.float32)
                 temp_padded[0, :T_actual] = temps_flat[:T_actual]
 
-                # --- Compute logprobs on packed batch ---
-                # C++ engine detects document boundaries from position_ids and
-                # uses Flash Attention varlen for document-level masking.
+                # --- Build backward targets with loss mask applied ---
+                # Mask out prompt tokens so CE forward produces 0 (= logprob 0) for them.
+                # This target array is used for BOTH forward (logprob extraction) and backward.
+                targets_padded = logprob_targets.copy()
+                tmask = loss_mask_flat[:T_actual].astype(bool)
+                tmask_shifted = np.zeros_like(tmask)
+                if T_actual > 1:
+                    tmask_shifted[:-1] = tmask[1:]
+                targets_padded[0, :T_actual][~tmask_shifted] = -100
+
+                # Tile for multi-GPU before forward (forward_for_grpo uses same layout as step_with_custom_loss)
+                input_step = input_padded
+                pos_step = pos_padded
+                temp_step = temp_padded
+                targets_step = targets_padded
+                if ngpu > 1:
+                    input_step = np.tile(input_padded, (ngpu, 1))
+                    pos_step = np.tile(pos_padded, (ngpu, 1))
+                    targets_step = np.tile(targets_padded, (ngpu, 1))
+                    temp_step = np.tile(temp_padded, (ngpu, 1))
+
+                # --- Single forward pass: logprobs + save activations ---
                 logprob_start = time.time()
-                raw_lp_full = self.trainer.compute_logprobs(
-                    input_padded, logprob_targets, use_lora=config.lora,
-                    position_ids=pos_padded,
-                    temperatures=temp_padded,
+                raw_lp_full = self.trainer.forward_for_grpo(
+                    input_step, targets_step,
+                    position_ids=pos_step,
+                    temperatures=temp_step,
                 )
                 raw_lp = np.asarray(raw_lp_full[0, :T_actual], dtype=np.float32)
                 logprob_time = time.time() - logprob_start
 
-                # Right-shift globally (packed sequence), 
+                # Right-shift globally (packed sequence),
                 # shift_tensor_right after a packed shift_tensor_left.
                 all_trainer_logprobs = np.zeros(T_actual, dtype=np.float32)
                 if T_actual > 1:
@@ -369,38 +388,15 @@ class GRPOTrainer:
                 surogate_grads = np.zeros(T_actual, dtype=np.float32)
                 if T_actual > 1:
                     surogate_grads[:T_actual - 1] = per_token_grads_flat[1:T_actual]
-               
-                # Packed backward: all samples in one call via flash varlen.
-                # Mask out prompt tokens using a left-shifted loss mask so that
-                # targets align with per-token grads (grads are shifted left to labels).
-                # This keeps ValidTokenCount aligned with the GRPO loss mask while
-                # avoiding zeroing the first response token's gradient per sample.
-                # Use the same packed next-token targets as compute_logprobs
-                # to keep gradients aligned with the logprobs used for GRPO.
-                targets_padded = logprob_targets.copy()
-                tmask = loss_mask_flat[:T_actual].astype(bool)
-                tmask_shifted = np.zeros_like(tmask)
-                if T_actual > 1:
-                    tmask_shifted[:-1] = tmask[1:]
-                targets_padded[0, :T_actual][~tmask_shifted] = -100
+
                 grads_padded = np.zeros((1, seq_len), dtype=np.float32)
                 grads_padded[0, :T_actual] = surogate_grads
 
-                input_step = input_padded
-                pos_step = pos_padded
-                temp_step = temp_padded
                 if ngpu > 1:
-                    input_step = np.tile(input_padded, (ngpu, 1))
-                    pos_step = np.tile(pos_padded, (ngpu, 1))
-                    targets_padded = np.tile(targets_padded, (ngpu, 1))
                     grads_padded = np.tile(grads_padded, (ngpu, 1))
-                    temp_step = np.tile(temp_padded, (ngpu, 1))
 
-                self.trainer.step_with_custom_loss(
-                    input_step, targets_padded, grads_padded,
-                    position_ids=pos_step,
-                    temperatures=temp_step,
-                )
+                # --- Backward pass only (reuses saved activations from forward) ---
+                self.trainer.backward_grpo(grads_padded)
 
                 # Accumulate metrics
                 for key in step_metrics:

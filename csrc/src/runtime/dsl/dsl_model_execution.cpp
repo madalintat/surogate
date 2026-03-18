@@ -1404,4 +1404,327 @@ void DslModel::step_with_custom_loss(Tensor inputs, Tensor position_ids, Tensor 
     internal::record_event_if_not_capturing(rs.BackwardDone, main_stream);
 }
 
+// ============================================================================
+// GRPO single-pass: forward (saves activations) + logprobs extraction
+// ============================================================================
+
+std::vector<float> DslModel::forward_for_grpo(Tensor inputs, Tensor position_ids, Tensor targets,
+                                               int grad_accum_steps, int micro_step,
+                                               NCCLCommunicator& comm,
+                                               const float* temperatures) {
+    if (!mExecutor) {
+        throw std::logic_error("DslModel::forward_for_grpo called before allocate_run_state()");
+    }
+    mUseTokenScale = false;
+
+    auto* graph_exec = dynamic_cast<GraphExecutor*>(mExecutor.get());
+    if (!graph_exec) {
+        throw std::runtime_error("DslModel::forward_for_grpo: executor is not a GraphExecutor");
+    }
+
+    // Detect document boundaries and enable flash varlen masking if needed.
+    const int B_val = static_cast<int>(inputs.Sizes[0]);
+    const int T_val = static_cast<int>(inputs.Sizes[1]);
+    const std::size_t BT = static_cast<std::size_t>(B_val) * static_cast<std::size_t>(T_val);
+    const std::int32_t* position_ids_ptr =
+        (position_ids.Data && position_ids.Device == -1)
+            ? reinterpret_cast<const std::int32_t*>(position_ids.Data)
+            : nullptr;
+    std::optional<DocMaskingInfo> doc_info;
+    if (mOptions.DocMasking) {
+        doc_info = compute_doc_masking(position_ids_ptr, B_val, T_val);
+    }
+    if (doc_info) {
+        graph_exec->set_doc_masking(doc_info->cu_seqlens.data(),
+                                     doc_info->num_docs,
+                                     doc_info->max_seqlen,
+                                     doc_info->total_q);
+    }
+
+    auto& rs = *mRunState;
+    cudaStream_t main_stream = rs.MainStream;
+
+    // Set up per-token inverse temperatures (persists for backward_grpo).
+    if (mGrpoInvTemperatureGpu) {
+        CUDA_CHECK(cudaFree(mGrpoInvTemperatureGpu));
+        mGrpoInvTemperatureGpu = nullptr;
+    }
+    if (temperatures) {
+        std::vector<float> inv_temp(BT);
+        for (std::size_t i = 0; i < BT; ++i) {
+            inv_temp[i] = 1.0f / temperatures[i];
+        }
+        CUDA_CHECK(cudaMalloc(&mGrpoInvTemperatureGpu, BT * sizeof(float)));
+        CUDA_CHECK(cudaMemcpyAsync(mGrpoInvTemperatureGpu, inv_temp.data(),
+                                   BT * sizeof(float), cudaMemcpyHostToDevice, main_stream));
+        graph_exec->set_inv_temperature_context(mGrpoInvTemperatureGpu);
+    }
+
+    // Always zero the losses buffer so we get per-micro-batch losses
+    // (not accumulated from previous micro-steps).
+    fill_zero(rs.Losses, main_stream);
+    fill_zero(rs.ValidTokenCount, main_stream);
+    fill_zero(rs.CorrectCount, main_stream);
+
+    // Forward pass (with LoRA hooks if enabled) — saves activations for backward.
+    forward(inputs, position_ids, comm, micro_step);
+
+    // Extract logprobs from the Losses buffer.
+    // cross_entropy_forward writes: losses[t] = logsumexp - logit[target[t]] = -logprob[t].
+    // Masked positions (target == -100) have losses[t] = 0, so logprob[t] = 0.
+    std::vector<float> logprobs(BT, 0.0f);
+    CUDA_CHECK(cudaMemcpyAsync(logprobs.data(), rs.Losses.Data,
+                               BT * sizeof(float), cudaMemcpyDeviceToHost, main_stream));
+    CUDA_CHECK(cudaStreamSynchronize(main_stream));
+    for (std::size_t i = 0; i < BT; ++i) {
+        logprobs[i] = -logprobs[i];
+    }
+
+    // Doc masking and temperature context persist for backward_grpo().
+    return logprobs;
+}
+
+// ============================================================================
+// GRPO backward pass (uses activations saved by forward_for_grpo)
+// ============================================================================
+
+void DslModel::backward_grpo(Tensor inputs, Tensor targets,
+                               const float* per_token_grads_cpu,
+                               int grad_accum_steps, int micro_step,
+                               NCCLCommunicator& comm) {
+    if (!mExecutor) {
+        throw std::logic_error("DslModel::backward_grpo called before allocate_run_state()");
+    }
+
+    auto* graph_exec = dynamic_cast<GraphExecutor*>(mExecutor.get());
+    if (!graph_exec) {
+        throw std::runtime_error("DslModel::backward_grpo: executor is not a GraphExecutor");
+    }
+
+    auto& rs = *mRunState;
+    cudaStream_t main_stream = rs.MainStream;
+
+    if (!lora_enabled()) {
+        // No LoRA: plain backward with custom d_loss.
+        // Temperature context is already set from forward_for_grpo (pass nullptr to skip re-allocation).
+        graph_exec->backward_with_custom_dloss(inputs, targets, per_token_grads_cpu,
+                                               comm, grad_accum_steps, micro_step, nullptr,
+                                               nullptr);
+    } else {
+        // LoRA backward: mirror step_with_custom_loss LoRA backward path exactly.
+        ensure_lora_run_state(comm, (int)inputs.Sizes[0], (int)inputs.Sizes[1]);
+
+        if (mLoRALn1Names.empty()) {
+            build_lora_name_tables();
+        }
+
+        mLoRAGrads->start_micro_step(main_stream, micro_step, grad_accum_steps);
+
+        modules::BackwardHook hook = [this, &comm](int layer_idx, bool accumulate, cudaStream_t stream,
+                                   modules::BackwardHookPoint point, void* context) {
+            (void)context;
+            const auto& cfg = mModelConfig;
+            auto& rs = *mRunState;
+            const int B = (int)rs.B;
+            const int T = (int)rs.T;
+            const int C = (int)cfg.HiddenSize;
+            const int D = cfg.get_intermediate_size(layer_idx);
+            const int Hq = (int)cfg.NumQueryHeads;
+            const int Hkv = (int)cfg.NumKeyValHeads;
+            const int Hs = (int)cfg.head_size();
+            const int rank = mLoRAConfig->rank;
+            const float dropout = mLoRAConfig->dropout;
+            const bool is_training = mLoRARunState->is_training;
+            const int micro_step = mLoRARunState->micro_step;
+            const bool gated_mlp = modules::is_gated_activation(cfg.activation_type);
+
+            auto get_dropout_seed = [&](int proj_type) -> unsigned int {
+                return mLoRARunState->dropout_base_seed
+                       + static_cast<unsigned int>(layer_idx) * 1000000u
+                       + static_cast<unsigned int>(proj_type) * 100000u
+                       + static_cast<unsigned int>(micro_step) * 10000u;
+            };
+
+            auto& lora_block = mLoRAWeights->get_block(layer_idx, stream);
+
+            switch (point) {
+                case modules::BackwardHookPoint::AfterMLPDownBackward: {
+                    if (!lora_block.mlp.down.has_value()) {
+                        break;
+                    }
+                    bool lora_accum = false;
+                    auto& lora_grads = mLoRAGrads->get_block_full(layer_idx, stream, comm, lora_accum);
+                    lora_accum = lora_accum || accumulate;
+                    if (!lora_grads.mlp.down.has_value()) {
+                        break;
+                    }
+                    auto& a = rs.simplified_acts(layer_idx);
+                    auto& da = rs.simplified_grads(layer_idx);
+                    modules::detail::backward_lora_layer(
+                        lora_grads.mlp.down->A, lora_grads.mlp.down->B,
+                        da.d_swiglu, da.d_res_ffn, 0, a.swiglu,
+                        lora_block.mlp.down->A, lora_block.mlp.down->B,
+                        mLoRAConfig->scaling(), dropout, get_dropout_seed(6), is_training,
+                        mLoRARunState->intermediate, mLoRARunState->slice,
+                        B * T, D, C, rank, lora_accum,
+                        rs.CublasLtHandle, rs.CuBlasWorkspace, stream);
+                } break;
+                case modules::BackwardHookPoint::AfterMLPUpBackward: {
+                    bool lora_accum = false;
+                    auto& lora_grads = mLoRAGrads->get_block_full(layer_idx, stream, comm, lora_accum);
+                    lora_accum = lora_accum || accumulate;
+                    auto& a = rs.simplified_acts(layer_idx);
+                    auto& da = rs.simplified_grads(layer_idx);
+                    Tensor& d_ln2 = da.d_ln2.Data ? da.d_ln2 : da.d_ln1;
+                    Tensor ln2_input;
+                    if (mOptions.recompute_enabled()) {
+                        if (mLoRARunState && mLoRARunState->recompute_ln.Data) {
+                            Tensor& ln2_weight = mParams->get(mLoRALn2Names[layer_idx]);
+                            Tensor ln2_residual;
+                            if (a.residual_att.Data) {
+                                ln2_residual = a.residual_att;
+                            } else if (mModelConfig.architecture == modules::ArchitectureType::Hybrid) {
+                                if (rs.has_residual_offloading()) rs.fetch_residual(layer_idx, rs.side_stream());
+                                ln2_residual = rs.get_residual(layer_idx, stream);
+                            } else if (layer_idx == 0) {
+                                ln2_residual = rs.non_block_activations().encoded;
+                            } else {
+                                if (rs.has_residual_offloading()) rs.fetch_residual(layer_idx - 1, rs.side_stream());
+                                ln2_residual = rs.get_residual(layer_idx - 1, stream);
+                            }
+                            ln2_input = recompute_lora_rmsnorm(*mLoRARunState, ln2_residual, ln2_weight,
+                                                               mModelConfig.RmsNormEps, B, T, C, stream);
+                        } else {
+                            ln2_input = a.ln2.Data ? a.ln2 : a.ln1;
+                        }
+                    } else {
+                        ln2_input = a.ln2.Data ? a.ln2 : a.ln1;
+                    }
+                    Tensor dA_up{}, dB_up{}, dA_gate{}, dB_gate{};
+                    modules::LoRALayerWeights<Tensor> lora_up{}, lora_gate{};
+                    if (gated_mlp) {
+                        if (lora_block.mlp.up.has_value() && lora_grads.mlp.up.has_value()) {
+                            dA_up = lora_grads.mlp.up->A; dB_up = lora_grads.mlp.up->B;
+                            lora_up = *lora_block.mlp.up;
+                        }
+                        if (lora_block.mlp.gate.has_value() && lora_grads.mlp.gate.has_value()) {
+                            dA_gate = lora_grads.mlp.gate->A; dB_gate = lora_grads.mlp.gate->B;
+                            lora_gate = *lora_block.mlp.gate;
+                        }
+                        if (!dA_up.Data && !dA_gate.Data) break;
+                        modules::detail::backward_lora_mlp_up_gate_fused(
+                            dA_up, dB_up, dA_gate, dB_gate, d_ln2, da.d_mlp_up, ln2_input,
+                            lora_up, lora_gate, mLoRAConfig->scaling(),
+                            dropout, get_dropout_seed(4), get_dropout_seed(5), is_training,
+                            B * T, C, D, rank, lora_accum,
+                            mLoRARunState->intermediate, mLoRARunState->intermediate2,
+                            mLoRARunState->slice, rs.CublasLtHandle, rs.CuBlasWorkspace, stream);
+                    } else {
+                        if (!lora_block.mlp.up.has_value() || !lora_grads.mlp.up.has_value()) break;
+                        dA_up = lora_grads.mlp.up->A; dB_up = lora_grads.mlp.up->B;
+                        lora_up = *lora_block.mlp.up;
+                        modules::detail::backward_lora_layer(
+                            dA_up, dB_up, d_ln2, da.d_mlp_up, 0, ln2_input,
+                            lora_up.A, lora_up.B, mLoRAConfig->scaling(),
+                            dropout, get_dropout_seed(4), is_training,
+                            mLoRARunState->intermediate, mLoRARunState->slice,
+                            B * T, C, D, rank, lora_accum,
+                            rs.CublasLtHandle, rs.CuBlasWorkspace, stream);
+                    }
+                } break;
+                case modules::BackwardHookPoint::AfterAttnOutBackward: {
+                    if (!lora_block.attention.o.has_value()) break;
+                    bool lora_accum = false;
+                    auto& lora_grads = mLoRAGrads->get_block_full(layer_idx, stream, comm, lora_accum);
+                    lora_accum = lora_accum || accumulate;
+                    if (!lora_grads.attention.o.has_value()) break;
+                    auto& a = rs.simplified_acts(layer_idx);
+                    auto& da = rs.simplified_grads(layer_idx);
+                    modules::detail::backward_lora_layer(
+                        lora_grads.attention.o->A, lora_grads.attention.o->B,
+                        da.d_att, da.d_att_out, 0, a.att,
+                        lora_block.attention.o->A, lora_block.attention.o->B,
+                        mLoRAConfig->scaling(), dropout, get_dropout_seed(3), is_training,
+                        mLoRARunState->intermediate, mLoRARunState->slice,
+                        B * T, Hq * Hs, C, rank, lora_accum,
+                        rs.CublasLtHandle, rs.CuBlasWorkspace, stream);
+                } break;
+                case modules::BackwardHookPoint::AfterQKVBackward: {
+                    bool lora_accum = false;
+                    auto& lora_grads = mLoRAGrads->get_block_full(layer_idx, stream, comm, lora_accum);
+                    lora_accum = lora_accum || accumulate;
+                    auto& a = rs.simplified_acts(layer_idx);
+                    auto& da = rs.simplified_grads(layer_idx);
+                    Tensor ln1_input;
+                    if (mOptions.recompute_enabled()) {
+                        if (mLoRARunState && mLoRARunState->recompute_ln.Data) {
+                            Tensor& ln1_weight = mParams->get(mLoRALn1Names[layer_idx]);
+                            Tensor ln1_residual;
+                            if (mModelConfig.architecture == modules::ArchitectureType::Hybrid) {
+                                if (rs.has_residual_offloading()) rs.fetch_residual(layer_idx, rs.side_stream());
+                                ln1_residual = rs.get_residual(layer_idx, stream);
+                            } else if (layer_idx == 0) {
+                                ln1_residual = rs.non_block_activations().encoded;
+                            } else {
+                                if (rs.has_residual_offloading()) rs.fetch_residual(layer_idx - 1, rs.side_stream());
+                                ln1_residual = rs.get_residual(layer_idx - 1, stream);
+                            }
+                            ln1_input = recompute_lora_rmsnorm(*mLoRARunState, ln1_residual, ln1_weight,
+                                                               mModelConfig.RmsNormEps, B, T, C, stream);
+                        } else {
+                            ln1_input = a.ln1;
+                        }
+                    } else {
+                        ln1_input = a.ln1;
+                    }
+                    Tensor dA_q{}, dB_q{}, dA_k{}, dB_k{}, dA_v{}, dB_v{};
+                    modules::LoRALayerWeights<Tensor> lora_q{}, lora_k{}, lora_v{};
+                    if (lora_block.attention.q.has_value() && lora_grads.attention.q.has_value()) {
+                        dA_q = lora_grads.attention.q->A; dB_q = lora_grads.attention.q->B;
+                        lora_q = *lora_block.attention.q;
+                    }
+                    if (lora_block.attention.k.has_value() && lora_grads.attention.k.has_value()) {
+                        dA_k = lora_grads.attention.k->A; dB_k = lora_grads.attention.k->B;
+                        lora_k = *lora_block.attention.k;
+                    }
+                    if (lora_block.attention.v.has_value() && lora_grads.attention.v.has_value()) {
+                        dA_v = lora_grads.attention.v->A; dB_v = lora_grads.attention.v->B;
+                        lora_v = *lora_block.attention.v;
+                    }
+                    if (!dA_q.Data && !dA_k.Data && !dA_v.Data) break;
+                    modules::detail::backward_lora_qkv_fused(
+                        dA_q, dB_q, dA_k, dB_k, dA_v, dB_v,
+                        da.d_ln1, da.d_qkv, ln1_input, lora_q, lora_k, lora_v,
+                        mLoRAConfig->scaling(),
+                        dropout, get_dropout_seed(0), get_dropout_seed(1), get_dropout_seed(2), is_training,
+                        B * T, C, Hq * Hs, Hkv * Hs, rank, lora_accum,
+                        mLoRARunState->intermediate, mLoRARunState->intermediate2,
+                        mLoRARunState->slice, rs.CublasLtHandle, rs.CuBlasWorkspace, stream);
+                    mLoRAGrads->notify_block(layer_idx, stream, comm);
+                } break;
+                default:
+                    break;
+            }
+        };
+
+        graph_exec->backward_with_custom_dloss(inputs, targets, per_token_grads_cpu,
+                                                comm, grad_accum_steps, micro_step, &hook,
+                                                nullptr);
+
+        mLoRAGrads->end_micro_step(main_stream, comm);
+        internal::record_event_if_not_capturing(rs.BackwardDone, main_stream);
+    }
+
+    // Clean up state that was set by forward_for_grpo.
+    if (mDocMaskingActive) {
+        graph_exec->clear_doc_masking();
+        mDocMaskingActive = false;
+    }
+    if (mGrpoInvTemperatureGpu) {
+        graph_exec->set_inv_temperature_context(nullptr);
+        CUDA_CHECK(cudaFree(mGrpoInvTemperatureGpu));
+        mGrpoInvTemperatureGpu = nullptr;
+    }
+}
+
 }  // namespace dsl

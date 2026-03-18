@@ -127,6 +127,17 @@ public:
                                 const std::int32_t* position_ids = nullptr,
                                 const float* temperatures = nullptr);
 
+    // GRPO single-pass: training forward that saves activations AND returns logprobs.
+    // Returns B*T float logprobs extracted from the loss buffer (logprob = -loss).
+    // Call backward_grpo() after computing per-token grads from these logprobs.
+    std::vector<float> forward_for_grpo(const std::int32_t* inputs, const std::int32_t* targets,
+                                         const std::int32_t* position_ids = nullptr,
+                                         const float* temperatures = nullptr);
+
+    // GRPO backward pass using activations saved by forward_for_grpo().
+    // Inputs/targets/position_ids are reused from forward_for_grpo (already in GPU buffers).
+    void backward_grpo(const float* per_token_grads);
+
 private:
     std::unique_ptr<PretrainedConfig> mConfig;  // unique_ptr to preserve polymorphism
     RuntimeOptions mOptions;

@@ -1631,6 +1631,97 @@ void MultiGPUPyTrainer::step_with_custom_loss(
     ++mTrainMicroStep;
 }
 
+std::vector<float> MultiGPUPyTrainer::forward_for_grpo(
+        const std::int32_t* inputs,
+        const std::int32_t* targets,
+        const std::int32_t* position_ids,
+        const float* temperatures) {
+    // Distribute inputs, targets, and position_ids to each GPU's CPU-side buffers.
+    for (int i = 0; i < (int)mContexts.size(); ++i) {
+        auto& ctx = mContexts.at(i);
+        if (!ctx.Model) {
+            throw std::runtime_error(fmt::format("forward_for_grpo: ctx[{}].Model is null", i));
+        }
+        auto* ib = ctx.Model->get_input_buffer().get<std::int32_t>();
+        auto* tb = ctx.Model->get_target_buffer().get<std::int32_t>();
+        Tensor pos_buf = ctx.Model->get_position_ids_buffer();
+        auto* pb = pos_buf.get<std::int32_t>();
+        const int pos_planes = (pos_buf.Rank == 3) ? static_cast<int>(pos_buf.Sizes[0]) : 1;
+        const std::size_t bt = static_cast<std::size_t>(B) * static_cast<std::size_t>(T);
+
+        std::memcpy(ib, inputs + i * B * T, B * T * sizeof(std::int32_t));
+        std::memcpy(tb, targets + i * B * T, B * T * sizeof(std::int32_t));
+        if (position_ids) {
+            const auto* src = position_ids + static_cast<std::ptrdiff_t>(i) * static_cast<std::ptrdiff_t>(bt);
+            for (int p = 0; p < pos_planes; ++p) {
+                std::memcpy(pb + p * bt, src, bt * sizeof(std::int32_t));
+            }
+        } else {
+            fill_sequential_position_ids(pb, pos_planes, B, T);
+        }
+    }
+
+    if (mTrainMicroStep >= mGradAccumulation) {
+        throw std::runtime_error(fmt::format("forward_for_grpo: micro_step {} >= grad_accumulation {}",
+                                             mTrainMicroStep, mGradAccumulation));
+    }
+
+    std::vector<float> result;
+    run_work([&result, micro_idx = mTrainMicroStep, micro_batches = mGradAccumulation,
+              temperatures, B = this->B, T = this->T](sThreadContext& ctx) {
+        auto* dsl_model = dynamic_cast<dsl::DslModel*>(ctx.Model.get());
+        if (!dsl_model) {
+            throw std::runtime_error("forward_for_grpo: model is not a DslModel");
+        }
+
+        Tensor inputs_tensor = ctx.Model->get_input_buffer();
+        Tensor position_ids_tensor = ctx.Model->get_position_ids_buffer();
+        Tensor targets_tensor = ctx.Model->get_target_buffer();
+
+        const int gpu_rank = ctx.Communicator->local_rank();
+        const float* temps_for_this_gpu = nullptr;
+        if (temperatures) {
+            temps_for_this_gpu = temperatures + static_cast<std::ptrdiff_t>(gpu_rank) * B * T;
+        }
+
+        auto logprobs = dsl_model->forward_for_grpo(inputs_tensor, position_ids_tensor, targets_tensor,
+                                                      micro_batches, micro_idx,
+                                                      *ctx.Communicator, temps_for_this_gpu);
+        if (ctx.Communicator->local_rank() == 0) {
+            result = std::move(logprobs);
+        }
+    });
+    // Don't increment mTrainMicroStep — that happens in backward_grpo.
+    return result;
+}
+
+void MultiGPUPyTrainer::backward_grpo(const float* per_token_grads) {
+    if (mTrainMicroStep >= mGradAccumulation) {
+        throw std::runtime_error(fmt::format("backward_grpo: micro_step {} >= grad_accumulation {}",
+                                             mTrainMicroStep, mGradAccumulation));
+    }
+
+    run_work([micro_idx = mTrainMicroStep, micro_batches = mGradAccumulation,
+              per_token_grads, B = this->B, T = this->T](sThreadContext& ctx) {
+        auto* dsl_model = dynamic_cast<dsl::DslModel*>(ctx.Model.get());
+        if (!dsl_model) {
+            throw std::runtime_error("backward_grpo: model is not a DslModel");
+        }
+
+        Tensor inputs_tensor = ctx.Model->get_input_buffer();
+        Tensor targets_tensor = ctx.Model->get_target_buffer();
+
+        const int gpu_rank = ctx.Communicator->local_rank();
+        const float* grads_for_this_gpu = per_token_grads +
+                                          static_cast<std::ptrdiff_t>(gpu_rank) * B * T;
+
+        dsl_model->backward_grpo(inputs_tensor, targets_tensor, grads_for_this_gpu,
+                                  micro_batches, micro_idx, *ctx.Communicator);
+    });
+
+    ++mTrainMicroStep;
+}
+
 int MultiGPUPyTrainer::get_valid_token_count(int gpu_id) {
     int result = 0;
     run_work([&result](sThreadContext& ctx) {
