@@ -43,9 +43,9 @@ MODEL_DIR = find_qwen3_model_dir()
 class TestNativeTokenizer:
     """Test the native C++ tokenizer."""
 
-    @pytest.fixture(autouse=True)
-    def setup(self):
-        self.tok = _surogate.Tokenizer.from_pretrained(MODEL_DIR)
+    @pytest.fixture(autouse=True, scope="class")
+    def setup(self, request):
+        request.cls.tok = _surogate.Tokenizer.from_pretrained(MODEL_DIR)
 
     def test_vocab_size(self):
         assert self.tok.vocab_size > 100_000
@@ -139,10 +139,10 @@ class TestNativeTokenizer:
 class TestNativeVsHuggingFace:
     """Compare native tokenizer output against HuggingFace reference."""
 
-    @pytest.fixture(autouse=True)
-    def setup(self):
-        self.native = _surogate.Tokenizer.from_pretrained(MODEL_DIR)
-        self.hf = AutoTokenizer.from_pretrained(MODEL_DIR)
+    @pytest.fixture(autouse=True, scope="class")
+    def setup(self, request):
+        request.cls.native = _surogate.Tokenizer.from_pretrained(MODEL_DIR)
+        request.cls.hf = AutoTokenizer.from_pretrained(MODEL_DIR)
 
     TEST_STRINGS = [
         "Hello, world!",
@@ -195,3 +195,48 @@ class TestNativeVsHuggingFace:
             assert self.native.eos_token_id == self.hf.eos_token_id
         if self.hf.pad_token_id is not None:
             assert self.native.pad_token_id == self.hf.pad_token_id
+
+    CHAT_TEMPLATE_TESTS = [
+        ("single turn gen", [
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": "Hello!"},
+        ], True),
+        ("multi turn gen", [
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": "What is 2+2?"},
+            {"role": "assistant", "content": "4"},
+            {"role": "user", "content": "And 3+3?"},
+        ], True),
+        ("no system", [
+            {"role": "user", "content": "Hello!"},
+        ], True),
+        ("training", [
+            {"role": "user", "content": "Hello!"},
+            {"role": "assistant", "content": "Hi there!"},
+        ], False),
+        ("multi turn training", [
+            {"role": "system", "content": "You are helpful."},
+            {"role": "user", "content": "Hi"},
+            {"role": "assistant", "content": "Hello!"},
+            {"role": "user", "content": "Bye"},
+            {"role": "assistant", "content": "Goodbye!"},
+        ], False),
+    ]
+
+    @pytest.mark.parametrize("desc,messages,gen_prompt", CHAT_TEMPLATE_TESTS,
+                             ids=[t[0] for t in CHAT_TEMPLATE_TESTS])
+    def test_apply_chat_template_matches(self, desc, messages, gen_prompt):
+        native_text = self.native.apply_chat_template(messages, add_generation_prompt=gen_prompt)
+        hf_text = self.hf.apply_chat_template(messages, tokenize=False, add_generation_prompt=gen_prompt)
+        assert native_text == hf_text, (
+            f"Chat template mismatch for {desc}:\n"
+            f"  native: {native_text!r}\n"
+            f"  hf:     {hf_text!r}"
+        )
+
+    def test_apply_chat_template_and_encode(self):
+        messages = [{"role": "user", "content": "Hello!"}]
+        native_ids = self.native.apply_chat_template_and_encode(messages, add_generation_prompt=True)
+        hf_text = self.hf.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        hf_ids = self.hf.encode(hf_text, add_special_tokens=False)
+        assert native_ids == hf_ids
