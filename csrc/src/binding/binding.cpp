@@ -1862,7 +1862,11 @@ NB_MODULE(_surogate, m) {
                      cpp_batch.push_back(std::move(msgs));
                  }
 
-                 auto results = self.encode_for_training_batch(cpp_batch, strategy);
+                 std::vector<tokenizer::TrainingEncoded> results;
+                 {
+                     nb::gil_scoped_release release;
+                     results = self.encode_for_training_batch(cpp_batch, strategy);
+                 }
                  nb::list out;
                  for (auto& r : results) {
                      nb::dict d;

@@ -490,65 +490,90 @@ def debug_labels(example, tokenizer, text_only=False):
 
     return output
 
-class NativeEncodePreprocessor:
-    """Fast dataset encoder using the C++ tokenizer's encode_for_training.
+def _encode_and_prepare_native(
+    native_tokenizer,
+    dataset,
+    loss_strategy: str = 'default',
+    batch_size: int = 10000,
+    desc: str = "Encoding",
+) -> tuple[list[np.ndarray], list[np.ndarray], list[int]]:
+    """Single-pass encode + prepare: messages → numpy arrays ready for writing.
 
-    Drop-in replacement for EncodePreprocessor that bypasses the Python
-    ChatTemplateProcessor entirely. Uses the Jinja chat template + BPE
-    tokenizer in C++ with multi-threaded batch encoding.
-
-    Iterates the dataset directly instead of using dataset.map() to avoid
-    pickling the C++ tokenizer object across process boundaries.
+    Pipelines C++ encoding (GIL-released) with Python numpy conversion using
+    a background thread. Returns (all_tokens, all_masks, doc_lengths) directly,
+    skipping the intermediate HfDataset.
     """
+    from tqdm import tqdm
+    from concurrent.futures import ThreadPoolExecutor
 
-    def __init__(self, native_tokenizer: 'NativeTokenizer', loss_strategy: str = 'default'):
-        self.native_tokenizer = native_tokenizer
-        self.loss_strategy = loss_strategy
+    all_tokens = []
+    all_masks = []
+    doc_lengths = []
+    n_skipped = 0
+    n_total = len(dataset)
 
-    def __call__(self, dataset, batch_size: int = 10000, desc: str = "Encoding", **kwargs):
-        from datasets import Dataset as HfDataset
-        from tqdm import tqdm
+    def encode_batch(messages_batch):
+        """Submit to C++ encoder (releases GIL internally)."""
+        try:
+            return native_tokenizer.encode_for_training_batch(
+                messages_batch, strategy=loss_strategy)
+        except Exception as e:
+            logger.warning(f"Batch encoding failed ({e}), falling back to row-by-row")
+            results = []
+            for msgs in messages_batch:
+                try:
+                    results.append(native_tokenizer.encode_for_training(
+                        msgs, strategy=loss_strategy))
+                except Exception:
+                    results.append(None)
+            return results
 
-        all_input_ids = []
-        all_labels = []
-        n_skipped = 0
-        n_total = len(dataset)
+    def collect_results(results):
+        """Convert encoding results to numpy arrays."""
+        nonlocal n_skipped
+        for result in results:
+            if result is None:
+                n_skipped += 1
+                continue
+            ids = result['input_ids']
+            if len(ids) == 0:
+                continue
+            tokens = np.asarray(ids, dtype=np.int32)
+            labels = np.asarray(result['labels'], dtype=np.int32)
+            mask = _to_input_mask((labels != -100).astype(np.int32))
+            all_tokens.append(tokens)
+            all_masks.append(mask)
+            doc_lengths.append(tokens.size)
 
-        with tqdm(total=n_total, desc=desc, unit=" examples") as pbar:
+    with tqdm(total=n_total, desc=desc, unit=" examples") as pbar:
+        # Pipeline: encode batch N+1 in background while collecting batch N
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            pending_future = None
+            pending_count = 0
+
             for batch in dataset.iter(batch_size=batch_size):
                 messages_batch = batch['messages']
 
-                try:
-                    results = self.native_tokenizer.encode_for_training_batch(
-                        messages_batch, strategy=self.loss_strategy)
-                except Exception as e:
-                    # Fall back to one-by-one to isolate bad examples
-                    logger.warning(f"Batch encoding failed ({e}), falling back to row-by-row")
-                    results = []
-                    for msgs in messages_batch:
-                        try:
-                            results.append(self.native_tokenizer.encode_for_training(
-                                msgs, strategy=self.loss_strategy))
-                        except Exception:
-                            n_skipped += 1
-                            results.append({'input_ids': [], 'labels': []})
+                # Submit encoding to thread (C++ releases GIL)
+                future = executor.submit(encode_batch, messages_batch)
 
-                for result in results:
-                    ids = result['input_ids']
-                    if len(ids) == 0:
-                        continue
-                    all_input_ids.append(ids)
-                    all_labels.append(result['labels'])
+                # While C++ encodes current batch, collect previous results
+                if pending_future is not None:
+                    collect_results(pending_future.result())
+                    pbar.update(pending_count)
 
-                pbar.update(len(messages_batch))
+                pending_future = future
+                pending_count = len(messages_batch)
 
-        if n_skipped > 0:
-            logger.warning(f"Skipped {n_skipped} examples due to encoding errors")
+            # Collect last batch
+            if pending_future is not None:
+                collect_results(pending_future.result())
+                pbar.update(pending_count)
 
-        return HfDataset.from_dict({
-            'input_ids': all_input_ids,
-            'labels': all_labels,
-        })
+    if n_skipped > 0:
+        logger.warning(f"Skipped {n_skipped} examples due to encoding errors")
+
+    return all_tokens, all_masks, doc_lengths
 
 
 class TokenizeDatasets(SurogateCommand):
@@ -573,8 +598,8 @@ class TokenizeDatasets(SurogateCommand):
         
         self.template_processor = template_processor
 
-    def _load_and_encode_datasets(self):
-        """Load, preprocess, and encode datasets. Returns (train_dataset, val_dataset)."""
+    def _load_raw_datasets(self):
+        """Load and preprocess datasets. Returns raw (train_dataset, val_dataset) with 'messages' column."""
         import time
         train_datasets, val_datasets = [], []
         train_seed = np.random.RandomState(self.config.train_seed)
@@ -630,12 +655,11 @@ class TokenizeDatasets(SurogateCommand):
             train_dataset = shuffle_dataset(
                 train_dataset, seed=get_seed(train_seed), buffer_size=1000)
 
+            val_dataset = None
             if len(val_datasets) > 0:
                 val_dataset = concat_datasets(val_datasets)
                 val_dataset = shuffle_dataset(
                     val_dataset, seed=get_seed(eval_seed), buffer_size=1000)
-            
-            train_dataset, val_dataset = self._encode_dataset(train_dataset, val_dataset)
 
         return train_dataset, val_dataset
 
@@ -652,8 +676,9 @@ class TokenizeDatasets(SurogateCommand):
             for ds_config in self.config.datasets:
                 ds_config.samples = 10
 
-            # If debug flag is set, always load and process datasets            
-            train_dataset, _ = self._load_and_encode_datasets()
+            # If debug flag is set, always load and process datasets
+            train_dataset, _ = self._load_raw_datasets()
+            train_dataset, _ = self._encode_dataset_python(train_dataset, None)
             logger.info("Debug: printing labels for first 5 train dataset rows")
             for i, row in enumerate(train_dataset):
                 if i >= 5:
@@ -675,15 +700,20 @@ class TokenizeDatasets(SurogateCommand):
         elif not files_exist:
             logger.info(f"Tokenized files not found, tokenizing dataset (hash={current_hash})...")
 
-        # Load and encode datasets
-        train_dataset, val_dataset = self._load_and_encode_datasets()
+        # Load, encode and write datasets
+        train_dataset, val_dataset = self._load_raw_datasets()
 
-        # Write BIN.TOK files
-        logger.info("Writing tokenized train files...")
-        self._write_bin_tok(train_dataset, os.path.join(self.config.output_dir, 'train.bin'), packing=self.config.sample_packing)
-        if val_dataset is not None:
-            logger.info("Writing tokenized validation files...")
-            self._write_bin_tok(val_dataset, os.path.join(self.config.output_dir, 'eval.bin'), packing=False)
+        if self._can_use_native_encoder():
+            # Native path: single-pass encode → numpy → pack → write
+            self._encode_and_write_native(train_dataset, val_dataset)
+        else:
+            # Python fallback: encode to HfDataset, then write separately
+            train_dataset, val_dataset = self._encode_dataset_python(train_dataset, val_dataset)
+            logger.info("Writing tokenized train files...")
+            self._write_bin_tok(train_dataset, os.path.join(self.config.output_dir, 'train.bin'), packing=self.config.sample_packing)
+            if val_dataset is not None:
+                logger.info("Writing tokenized validation files...")
+                self._write_bin_tok(val_dataset, os.path.join(self.config.output_dir, 'eval.bin'), packing=False)
 
         # Write the hash after successful tokenization
         write_tokenize_hash(self.config.output_dir, current_hash)
@@ -701,30 +731,56 @@ class TokenizeDatasets(SurogateCommand):
             return False
         return True
 
-    def _encode_dataset(self, train_dataset, val_dataset):
-        if self._can_use_native_encoder():
-            return self._encode_dataset_native(train_dataset, val_dataset)
-        return self._encode_dataset_python(train_dataset, val_dataset)
+    def _encode_and_write_native(self, train_dataset, val_dataset):
+        """Encode and write datasets using the fast C++ tokenizer.
 
-    def _encode_dataset_native(self, train_dataset, val_dataset):
-        """Encode datasets using the fast C++ tokenizer."""
+        Single-pass pipeline: encode → numpy → pack → write.
+        No intermediate HfDataset, no double iteration.
+        """
         import time
         native_tok = NativeTokenizer.from_pretrained(self.config.model_dir)
-
         loss_strategy = getattr(self.config, 'loss_scale', 'default')
-        preprocessor = NativeEncodePreprocessor(native_tok, loss_strategy=loss_strategy)
 
-        datasets = [train_dataset, val_dataset]
-        for i, dataset in enumerate(datasets):
+        seq_len = self.config.sequence_len or self.config.max_model_len
+        vocab_size = self.config.tokenizer.vocab_size
+        pad_token_id = self.config.tokenizer.pad_token_id if self.config.tokenizer.pad_token_id is not None else 0
+        max_tokens_per_file = DEFAULT_MAX_TOKENS_PER_FILE
+
+        for dataset, split_name, packing in [
+            (train_dataset, 'train', self.config.sample_packing),
+            (val_dataset, 'validation', False),
+        ]:
             if dataset is None:
                 continue
-            split_name = 'train' if i == 0 else 'validation'
+
             t0 = time.perf_counter()
-            datasets[i] = preprocessor(dataset, batch_size=10000, desc=f"Encoding {split_name}")
+            all_tokens, all_masks, doc_lengths = _encode_and_prepare_native(
+                native_tok, dataset, loss_strategy=loss_strategy,
+                batch_size=10000, desc=f"Encoding {split_name}",
+            )
             t1 = time.perf_counter()
-            n = len(datasets[i])
+            n = len(all_tokens)
             logger.info(f"Encoded {split_name}: {n} examples in {t1-t0:.2f}s ({n/(t1-t0):.0f} examples/s)")
-        return datasets
+
+            if n == 0:
+                continue
+
+            out_dir = self.config.output_dir
+            name_prefix = 'train' if split_name == 'train' else 'eval'
+            non_overlapping = not packing
+
+            if packing:
+                self._write_packed_vectorized(
+                    all_tokens, all_masks, doc_lengths,
+                    out_dir, name_prefix, vocab_size, seq_len,
+                    pad_token_id, max_tokens_per_file, non_overlapping,
+                )
+            else:
+                self._write_padded_vectorized(
+                    all_tokens, all_masks, doc_lengths,
+                    out_dir, name_prefix, vocab_size, seq_len,
+                    pad_token_id, max_tokens_per_file, non_overlapping,
+                )
 
     def _encode_dataset_python(self, train_dataset, val_dataset):
         """Encode datasets using the Python ChatTemplateProcessor (fallback)."""
