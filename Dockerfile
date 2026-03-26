@@ -56,13 +56,13 @@ ENV PATH="/root/.venv/bin:$PATH" \
     VIRTUAL_ENV="/root/.venv"
 
 # Install wheel from URL
-RUN ~/.local/bin/uv pip install vllm==0.18.0 --index-strategy unsafe-best-match --torch-backend=${CUDA_TAG}}
-RUN ~/.local/bin/uv pip install ${CUDA_TAG}
+RUN ~/.local/bin/uv pip install vllm==0.18.0 --index-strategy unsafe-best-match --torch-backend=${CUDA_TAG}
+RUN ~/.local/bin/uv pip install ${WHEEL_URL}
 
 RUN VIRTUAL_ENV=~/sky_runtime/skypilot-runtime UV_LINK_MODE=copy UV_SYSTEM_PYTHON=false \
     ~/.local/bin/uv pip install "setuptools<70" \
     "ray[default]==2.9.3" "skypilot[kubernetes,remote]"
 
 # Default entrypoint
-ENTRYPOINT [".venv/bin/surogate"]
+ENTRYPOINT ["/root/.venv/bin/surogate"]
 CMD ["--help"]
