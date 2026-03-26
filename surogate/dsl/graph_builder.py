@@ -221,10 +221,12 @@ class GraphBuilder:
         weight: str | GraphRef,
         *,
         eps: float = 1e-6,
+        y_name: str | None = None,
+        rstd_name: str | None = None,
     ) -> tuple[GraphRef, GraphRef]:
         """RMS normalization. Returns (y, rstd)."""
-        y = self._fresh_name("rms")
-        rstd = self._fresh_name("rstd")
+        y = y_name if y_name else self._fresh_name("rms")
+        rstd = rstd_name if rstd_name else self._fresh_name("rstd")
         self._add_node(GraphNode(
             op="rmsnorm",
             inputs=[self._resolve_input(x), self._resolve_input(weight)],
@@ -808,9 +810,11 @@ class GraphBuilder:
         self,
         indices: str | GraphRef,
         weight: str | GraphRef,
+        *,
+        out_name: str | None = None,
     ) -> GraphRef:
         """Embedding lookup."""
-        out = self._fresh_name("embed")
+        out = out_name if out_name else self._fresh_name("embed")
         self._add_node(GraphNode(
             op="embedding",
             inputs=[self._resolve_input(indices), self._resolve_input(weight)],
@@ -827,9 +831,10 @@ class GraphBuilder:
         *,
         shape: Sequence[ShapeDim],
         dtype: str = "bf16",
+        out_name: str | None = None,
     ) -> GraphRef:
         """Create zero-filled tensor."""
-        out = self._fresh_name("zeros")
+        out = out_name if out_name else self._fresh_name("zeros")
         self._add_node(GraphNode(
             op="zeros",
             inputs=[],

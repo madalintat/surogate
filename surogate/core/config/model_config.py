@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 from abc import ABC
 from dataclasses import dataclass
-from typing import Optional, Union, Any, TYPE_CHECKING
+from typing import Optional, Union, TYPE_CHECKING
 
 if TYPE_CHECKING:
     import torch

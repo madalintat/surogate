@@ -2,16 +2,16 @@
 
 from __future__ import annotations
 
-from ..tensor_type import Tensor, Array
-from ..decorators import model, forward, hf_config, Param, Activation, Gradient
-from ..graph_builder import graph
+from .. import nn
+from ..nn import STANDARD_MODEL_NAME_REMAP
+from ..specs import ActivationScope
 from ..hf import build_norm_mappings, build_attn_mappings, build_moe_mappings
-from ..modules.attention import GptOssAttention
+from ..modules.attention import GptOssAttention as GptOssAttentionOld
 from ..modules.moe import GptOssMoE
+from ..blocks.gpt_oss import GptOssBlock
 
 
-@model
-@hf_config(
+@nn.hf_config(
     architecture="GptOssForCausalLM",
     model_type="gpt_oss",
     d_model="hidden_size",
@@ -19,8 +19,6 @@ from ..modules.moe import GptOssMoE
     num_query_heads="num_attention_heads",
     num_kv_heads="num_key_value_heads",
     d_ff="intermediate_size",
-    vocab_size="vocab_size",
-    max_seq="max_position_embeddings",
     head_size="head_dim",
     eps="rms_norm_eps",
     use_qkv_bias="attention_bias",
@@ -29,8 +27,19 @@ from ..modules.moe import GptOssMoE
     sliding_window="sliding_window",
     layer_types="layer_types",
 )
-class GptOssModel:
-    """GPT-OSS Mixture of Experts model."""
+class GptOssModel(nn.Model):
+    """GPT-OSS model with MoE experts and sink attention."""
+
+    _name_remap_ = STANDARD_MODEL_NAME_REMAP
+    _hf_block_mappings_ = {
+        **build_norm_mappings(),
+        **build_attn_mappings(attn_module=GptOssAttentionOld),
+        **build_moe_mappings(moe_module=GptOssMoE),
+        # Model-level weight mappings
+        "embedding": "model.embed_tokens.weight",
+        "final_norm": "model.norm.weight",
+        "lm_head": "lm_head.weight",
+    }
 
     def __init__(
         self,
@@ -48,7 +57,9 @@ class GptOssModel:
         num_experts_per_tok: int = 4,
         sliding_window: int = 128,
         layer_types: list[str] | None = None,
+        ep_size: int = 1,
     ):
+        super().__init__()
         self.vocab_size = vocab_size
         self.d_model = d_model
         self.n_layers = n_layers
@@ -61,117 +72,55 @@ class GptOssModel:
         self.use_qkv_bias = use_qkv_bias
         self.num_experts = num_experts
         self.num_experts_per_tok = num_experts_per_tok
-        self.sliding_window = sliding_window
-        self.layer_types = layer_types
 
-        # Derived
         self.D = head_size if head_size > 0 else d_model // num_query_heads
 
-    # Model weights
-    embedding = Param(Tensor["vocab_size", "d_model"], hf_mapping="model.embed_tokens.weight")
-    blocks = Param(Array["n_layers", "GptOssBlock"])
-    final_norm = Param(Tensor["d_model"], hf_mapping="model.norm.weight")
-    lm_head = Param(Tensor["vocab_size", "d_model"], hf_mapping="lm_head.weight")
+        self.embedding = nn.Embedding(vocab_size, d_model)
+        self.blocks = nn.BlockStack(
+            n_layers, GptOssBlock,
+            d_model=d_model,
+            num_query_heads=num_query_heads,
+            num_kv_heads=num_kv_heads,
+            head_size=head_size,
+            d_ff=d_ff,
+            max_seq=max_seq,
+            num_experts=num_experts,
+            num_experts_per_tok=num_experts_per_tok,
+            eps=eps,
+            use_qkv_bias=use_qkv_bias,
+            ep_size=ep_size,
+        )
+        self.final_norm = nn.RMSNorm(d_model, eps=eps)
+        self.lm_head = nn.LMHead(vocab_size, d_model)
 
-    # =========================================================================
-    # IO slots (runtime-provided inputs/outputs)
-    # =========================================================================
+    def forward(self, token_ids, position_ids, targets):
+        G = ActivationScope.GLOBAL
 
-    token_ids = Activation(Tensor["B", "T"], dtype="int32", scope="global",
-                           description="Input token IDs")
-    position_ids = Activation(Tensor["T"], dtype="int32", scope="global",
-                              description="Position IDs for RoPE")
-    targets = Activation(Tensor["B", "T"], dtype="int32", scope="global",
-                         aliases=["labels"], description="Target labels for loss")
+        # IO slots
+        self._register_activation("token_ids", ("B", "T"), dtype="int32", scope=G)
+        self._register_activation("position_ids", ("T",), dtype="int32", scope=G)
+        self._register_activation("targets", ("B", "T"), dtype="int32", scope=G,
+                                  aliases=["labels"])
+        self._register_activation("freq_cis", ("max_seq", "D", 2), dtype="fp32",
+                                  scope=G, aliases=["rope_freqs"])
 
-    # Precomputed constants
-    freq_cis = Activation(Tensor["max_seq", "D", 2], dtype="fp32", scope="global",
-                          aliases=["rope_freqs"], description="Precomputed RoPE frequencies")
+        # Global intermediate slots
+        _h = ("B", "T", "d_model")
+        self._register_activation("residual0", _h, scope=G)
+        self._register_activation("x0", _h, aliases=["encoded"], scope=G)
+        self._register_activation("xN", _h, scope=G)
+        self._register_activation("residualN", _h, scope=G)
+        self._register_activation("residual_final", _h, scope=G)
+        self._register_activation("xF", _h, aliases=["ln_final"], scope=G)
+        self._register_activation("xF_flat", ("B * T", "d_model"), scope=G)
+        self._register_activation("ln_final_rstd", ("B", "T"), dtype="fp32",
+                                  save=True, scope=G)
+        self._register_activation("loss", ("B * T",), dtype="fp32",
+                                  aliases=["losses"], scope=G)
 
-    # =========================================================================
-    # Global activation slots (model-level, not per-block)
-    # =========================================================================
-
-    # Embedding output
-    x0 = Activation(Tensor["B", "T", "d_model"], aliases=["encoded"], scope="global",
-                    description="Embedded input (after embedding lookup)")
-    residual0 = Activation(Tensor["B", "T", "d_model"], scope="global",
-                           description="Initial residual stream (zeros)")
-
-    # After stacked blocks
-    xN = Activation(Tensor["B", "T", "d_model"], scope="global",
-                    description="Output from stacked blocks")
-    residualN = Activation(Tensor["B", "T", "d_model"], scope="global",
-                           description="Residual after stacked blocks")
-
-    # Final normalization
-    residual_final = Activation(Tensor["B", "T", "d_model"], scope="global",
-                                description="Final residual (before norm)")
-    xF = Activation(Tensor["B", "T", "d_model"], aliases=["ln_final"],
-                    scope="global", description="After final layer norm")
-    xF_flat = Activation(Tensor["B * T", "d_model"], scope="global",
-                         description="Flattened for LM head")
-    ln_final_rstd = Activation(Tensor["B", "T"], dtype="fp32", save=True,
-                               scope="global", description="Final LN rstd")
-
-    # Loss
-    loss = Activation(Tensor["B * T"], dtype="fp32", scope="global",
-                      aliases=["losses"], description="Cross-entropy loss per token")
-
-    # =========================================================================
-    # Global gradient slots
-    # =========================================================================
-
-    d_loss = Gradient(Tensor["B * T"], dtype="fp32", gradient_of="loss", scope="global",
-                      description="Gradient seed for backward pass")
-    d_xF = Gradient(Tensor["B", "T", "d_model"], gradient_of="xF", scope="global")
-    d_xN = Gradient(Tensor["B", "T", "d_model"], gradient_of="xN", scope="global")
-    d_residualN = Gradient(Tensor["B", "T", "d_model"], gradient_of="residualN", scope="global")
-    d_x0 = Gradient(Tensor["B", "T", "d_model"], gradient_of="x0", scope="global")
-
-    # HF mappings: composed from module-level defaults.
-    _hf_block_mappings_ = {
-        **build_norm_mappings(),
-        **build_attn_mappings(attn_module=GptOssAttention),
-        **build_moe_mappings(moe_module=GptOssMoE),
-    }
-
-    @forward
-    def forward(
-        self,
-        token_ids: Tensor["B", "T", "int32"],
-        position_ids: Tensor["T", "int32"],
-        targets: Tensor["B", "T", "int32"],
-    ) -> Tensor["B * T", "fp32"]:
-        with graph() as g:
-            # Embedding lookup
-            x0 = g.embedding(token_ids, "embedding")
-
-            # Initialize residual stream
-            residual0 = g.zeros(shape=["B", "T", "d_model"], dtype="bf16")
-
-            # Stacked MoE blocks (handled by runtime)
-            xN, residualN = g.call(
-                "StackedBlocks",
-                x0,
-                residual0,
-                position_ids,
-                num_outputs=2,
-                blocks="blocks",
-                n_layers=self.n_layers,
-            )
-
-            # Final norm - use explicit names for outputs to map to C++ activation slots
-            residual_final, xF, ln_final_rstd = g.fused_residual_rmsnorm(
-                residualN, xN, "final_norm", eps=self.eps,
-                res_out_name="residual_final",
-                y_name="xF",
-                rstd_name="ln_final_rstd",
-            )
-
-            # Fused LM head + loss
-            xF_flat = g.view(xF, shape=["B * T", "d_model"], out_name="xF_flat")
-            loss = g.fused_lm_head_loss(xF_flat, "lm_head", targets,
-                                        compute_accuracy=True, out_name="loss")
-
-            return loss
+        x = self.embedding(token_ids)
+        residual = self._zeros(["B", "T", "d_model"])
+        x, residual = self.blocks(x, residual, position_ids)
+        residual, x = self.final_norm(residual, x)
+        loss = self.lm_head(x, targets)
+        return loss

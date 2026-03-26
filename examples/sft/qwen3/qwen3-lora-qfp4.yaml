@@ -7,13 +7,14 @@ gradient_accumulation_steps: 4
 sample_packing: true
 sequence_len: 2048
 
-num_epochs: 2
+max_steps: 100
 eval_steps: 25
 
 learning_rate: 2e-4
+warmup_ratio: 0.15
 
 recipe: fp8-hybrid
-qlora_fp8: true
+qlora_fp4: true
 
 lora: true
 lora_rank: 16
@@ -31,4 +32,3 @@ dataloader_num_workers: 4
 datasets:
   - path: "OpenLLM-Ro/ro_gsm8k"
     type: auto
-

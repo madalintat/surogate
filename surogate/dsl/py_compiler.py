@@ -1352,6 +1352,35 @@ def compile_model_spec(
     warnings: WarningCollector | None = None,
 ) -> ModuleIR:
     """Compile a ModelSpec to ModuleIR."""
+    # nn.Model subclasses carry _nn_model_class — instantiate and compile them
+    # to get a fully-populated spec, then continue with normal compilation.
+    if hasattr(spec, "_nn_model_class"):
+        import inspect as _inspect
+        nn_cls = spec._nn_model_class
+        # Filter config to only include params the __init__ accepts
+        init_sig = _inspect.signature(nn_cls.__init__)
+        init_params = set(init_sig.parameters.keys()) - {"self"}
+        filtered_config = {k: v for k, v in config.items() if k in init_params}
+        instance = nn_cls(**filtered_config)
+        compiled_spec = instance.compile()
+        # Capture computed attributes from the nn instance into config
+        # (e.g., self.D = head_size) so the C++ runtime can resolve dims.
+        for attr_name in dir(instance):
+            if attr_name.startswith("_"):
+                continue
+            if attr_name in config:
+                continue
+            try:
+                val = getattr(instance, attr_name)
+                if isinstance(val, int) and val >= 0:
+                    config[attr_name] = val
+                elif isinstance(val, bool):
+                    config[attr_name] = val
+            except Exception:
+                pass
+        # Recurse with the fully-populated spec
+        return compile_model_spec(compiled_spec, config, warnings=warnings)
+
     if spec.name in _primitive_registry:
         _warn(warnings, WarningCode.W001, f"model '{spec.name}' shadows a registered primitive of the same name")
 
@@ -1472,27 +1501,32 @@ def compile_model_spec(
 
     # Forward graph
     if spec.forward:
-        forward_fn = spec.forward.graph_fn
-        if forward_fn and instance:
-            # Capture the graph by patching graph()
-            builder = _capture_forward_graph(forward_fn, instance, spec.forward.inputs)
-            if builder is None:
-                raise DSLSyntaxError(
-                    f"could not capture forward graph for model '{spec.name}'",
-                    hint="Ensure @forward uses 'with graph() as g:' and returns GraphRef(s).",
-                )
+        # nn.Model.compile() attaches the pre-built graph as _traced_graph
+        builder = getattr(spec.forward, "_traced_graph", None)
 
-            graph = _compile_graph_builder(builder, spec.forward, config, spec.params, dim_map=dim_map, warnings=warnings)
-            # Expand StackedBlocks into per-layer block graphs
-            graph = _inline_stacked_blocks(graph, spec, config, warnings=warnings)
-            ir.forward_graph = graph
+        if builder is None:
+            forward_fn = spec.forward.graph_fn
+            if forward_fn and instance:
+                # Capture the graph by patching graph()
+                builder = _capture_forward_graph(forward_fn, instance, spec.forward.inputs)
 
-            # For hybrid models, expand block-level HF mappings with physical layer
-            # indices so the C++ weight loader resolves typed block indices correctly.
-            if (instance and hasattr(instance, "block_types") and
-                    spec.python_class and hasattr(spec.python_class, "_hf_block_mappings_")):
-                _expand_hybrid_hf_mappings(
-                    ir, instance.block_types, spec.python_class._hf_block_mappings_)
+        if builder is None:
+            raise DSLSyntaxError(
+                f"could not capture forward graph for model '{spec.name}'",
+                hint="Ensure @forward uses 'with graph() as g:' and returns GraphRef(s).",
+            )
+
+        graph = _compile_graph_builder(builder, spec.forward, config, spec.params, dim_map=dim_map, warnings=warnings)
+        # Expand StackedBlocks into per-layer block graphs
+        graph = _inline_stacked_blocks(graph, spec, config, warnings=warnings)
+        ir.forward_graph = graph
+
+        # For hybrid models, expand block-level HF mappings with physical layer
+        # indices so the C++ weight loader resolves typed block indices correctly.
+        if (instance and hasattr(instance, "block_types") and
+                spec.python_class and hasattr(spec.python_class, "_hf_block_mappings_")):
+            _expand_hybrid_hf_mappings(
+                ir, instance.block_types, spec.python_class._hf_block_mappings_)
 
     # Save/recompute
     if spec.forward:
@@ -1521,6 +1555,17 @@ def compile_block_spec(
     warnings: WarningCollector | None = None,
 ) -> ModuleIR:
     """Compile a BlockSpec to ModuleIR."""
+    # nn.Block subclasses carry _nn_block_class — instantiate and compile them
+    if hasattr(spec, "_nn_block_class"):
+        import inspect as _inspect
+        nn_cls = spec._nn_block_class
+        init_sig = _inspect.signature(nn_cls.__init__)
+        init_params = set(init_sig.parameters.keys()) - {"self"}
+        filtered_config = {k: v for k, v in config.items() if k in init_params}
+        instance = nn_cls(**filtered_config)
+        compiled_spec = instance.compile()
+        return compile_block_spec(compiled_spec, config, warnings=warnings)
+
     if spec.name in _primitive_registry:
         _warn(warnings, WarningCode.W001, f"block '{spec.name}' shadows a registered primitive of the same name")
 
@@ -1571,14 +1616,15 @@ def compile_block_spec(
 
     # Forward graph
     if spec.forward:
-        forward_fn = spec.forward.graph_fn
-        if forward_fn and instance:
-            builder = _capture_forward_graph(forward_fn, instance, spec.forward.inputs)
-            if builder is None:
-                raise DSLSyntaxError(
-                    f"could not capture forward graph for block '{spec.name}'",
-                    hint="Ensure @forward uses 'with graph() as g:' and returns GraphRef(s).",
-                )
+        # nn.Block.compile() attaches the pre-built graph as _traced_graph
+        builder = getattr(spec.forward, "_traced_graph", None)
+
+        if builder is None:
+            forward_fn = spec.forward.graph_fn
+            if forward_fn and instance:
+                builder = _capture_forward_graph(forward_fn, instance, spec.forward.inputs)
+
+        if builder is not None:
             ir.forward_graph = _compile_graph_builder(builder, spec.forward, config, spec.params, dim_map=dim_map, warnings=warnings)
 
     # Compile activation layout if present

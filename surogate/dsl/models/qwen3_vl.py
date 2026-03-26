@@ -2,15 +2,15 @@
 
 from __future__ import annotations
 
-from ..tensor_type import Tensor, Array
-from ..decorators import model, forward, hf_config, Param, Activation, Gradient
-from ..graph_builder import graph
+from .. import nn
+from ..nn import VL_MODEL_NAME_REMAP
+from ..specs import ActivationScope
 from ..hf import build_dense_block_mappings
 from ..modules.attention import Qwen3Attention
+from ..blocks.qwen3_vl import Qwen3VLBlock
 
 
-@model
-@hf_config(
+@nn.hf_config(
     architecture="Qwen3VLForConditionalGeneration",
     model_type="qwen3_vl",
     d_model="text_config.hidden_size",
@@ -26,8 +26,20 @@ from ..modules.attention import Qwen3Attention
     mrope_section="text_config.rope_scaling.mrope_section",
     deepstack_visual_indexes="vision_config.deepstack_visual_indexes",
 )
-class Qwen3VLModel:
+class Qwen3VLModel(nn.Model):
     """Qwen3-VL text model using Qwen3VLBlock (MRoPE)."""
+
+    _name_remap_ = VL_MODEL_NAME_REMAP
+    _hf_block_mappings_ = {
+        **build_dense_block_mappings(
+            attn_module=Qwen3Attention,
+            layer_prefix="model.language_model.layers.{layer}",
+        ),
+        # Model-level weight mappings
+        "embedding": "model.language_model.embed_tokens.weight",
+        "final_norm": "model.language_model.norm.weight",
+        "lm_head": "lm_head.weight",
+    }
 
     def __init__(
         self,
@@ -44,6 +56,7 @@ class Qwen3VLModel:
         mrope_section: tuple[int, int, int] | list[int] | None = None,
         deepstack_visual_indexes: list[int] | None = None,
     ):
+        super().__init__()
         self.vocab_size = vocab_size
         self.d_model = d_model
         self.n_layers = n_layers
@@ -64,128 +77,80 @@ class Qwen3VLModel:
         else:
             self.deepstack_layers = 3
 
-        # Derived
         self.D = head_size if head_size > 0 else d_model // num_query_heads
 
-    # Model weights
-    embedding = Param(Tensor["vocab_size", "d_model"], hf_mapping="model.language_model.embed_tokens.weight")
-    blocks = Param(Array["n_layers", "Qwen3VLBlock"])
-    final_norm = Param(Tensor["d_model"], hf_mapping="model.language_model.norm.weight")
-    lm_head = Param(Tensor["vocab_size", "d_model"], hf_mapping="lm_head.weight")
+        self.embedding = nn.Embedding(vocab_size, d_model)
+        self.blocks = nn.BlockStack(
+            n_layers, Qwen3VLBlock,
+            d_model=d_model,
+            num_query_heads=num_query_heads,
+            num_kv_heads=num_kv_heads,
+            head_size=head_size,
+            d_ff=d_ff,
+            max_seq=max_seq,
+            eps=eps,
+            use_qkv_bias=use_qkv_bias,
+            mrope_section=mrope_section,
+        )
+        self.final_norm = nn.RMSNorm(d_model, eps=eps)
+        self.lm_head = nn.LMHead(vocab_size, d_model)
 
-    # =========================================================================
-    # IO slots (runtime-provided inputs/outputs)
-    # =========================================================================
-
-    token_ids = Activation(Tensor["B", "T"], dtype="int32", scope="global",
-                           description="Input token IDs")
-    position_ids = Activation(Tensor[3, "B", "T"], dtype="int32", scope="global",
-                              description="3D position IDs for MRoPE")
-    targets = Activation(Tensor["B", "T"], dtype="int32", scope="global",
-                         aliases=["labels"], description="Target labels for loss")
-    visual_pos_masks = Activation(Tensor["B", "T"], dtype="int32", scope="global",
-                                  description="Mask for visual token positions")
-    visual_embeds = Activation(Tensor["B * T", "d_model"], scope="global",
-                               description="Visual embeddings (packed by mask)")
-    deepstack_visual_embeds_0 = Activation(Tensor["B * T", "d_model"], scope="global",
-                                           description="Deepstack visual embeddings layer 0")
-    deepstack_visual_embeds_1 = Activation(Tensor["B * T", "d_model"], scope="global",
-                                           description="Deepstack visual embeddings layer 1")
-    deepstack_visual_embeds_2 = Activation(Tensor["B * T", "d_model"], scope="global",
-                                           description="Deepstack visual embeddings layer 2")
-
-    # Precomputed constants
-    freq_cis = Activation(Tensor["max_seq", "D", 2], dtype="fp32", scope="global",
-                          aliases=["rope_freqs"], description="Precomputed RoPE frequencies")
-
-    # =========================================================================
-    # Global activation slots (model-level, not per-block)
-    # =========================================================================
-
-    x0 = Activation(Tensor["B", "T", "d_model"], aliases=["encoded"], scope="global",
-                    description="Embedded input (after embedding lookup)")
-    residual0 = Activation(Tensor["B", "T", "d_model"], scope="global",
-                           description="Initial residual stream (zeros)")
-
-    xN = Activation(Tensor["B", "T", "d_model"], scope="global",
-                    description="Output from stacked blocks")
-    residualN = Activation(Tensor["B", "T", "d_model"], scope="global",
-                           description="Residual after stacked blocks")
-
-    residual_final = Activation(Tensor["B", "T", "d_model"], scope="global",
-                                description="Final residual (before norm)")
-    xF = Activation(Tensor["B", "T", "d_model"], aliases=["ln_final"],
-                    scope="global", description="After final layer norm")
-    xF_flat = Activation(Tensor["B * T", "d_model"], scope="global",
-                         description="Flattened for LM head")
-    ln_final_rstd = Activation(Tensor["B", "T"], dtype="fp32", save=True,
-                               scope="global", description="Final LN rstd")
-
-    loss = Activation(Tensor["B * T"], dtype="fp32", scope="global",
-                      aliases=["losses"], description="Cross-entropy loss per token")
-
-    # =========================================================================
-    # Global gradient slots
-    # =========================================================================
-
-    d_loss = Gradient(Tensor["B * T"], dtype="fp32", gradient_of="loss", scope="global",
-                      description="Gradient seed for backward pass")
-    d_xF = Gradient(Tensor["B", "T", "d_model"], gradient_of="xF", scope="global")
-    d_xN = Gradient(Tensor["B", "T", "d_model"], gradient_of="xN", scope="global")
-    d_residualN = Gradient(Tensor["B", "T", "d_model"], gradient_of="residualN", scope="global")
-    d_x0 = Gradient(Tensor["B", "T", "d_model"], gradient_of="x0", scope="global")
-
-    # Block mappings composed from module-level defaults (Qwen3Attention + SwiGLUMLP + RMSNorm).
-    _hf_block_mappings_ = build_dense_block_mappings(attn_module=Qwen3Attention,
-                                                     layer_prefix="model.language_model.layers.{layer}")
-
-    @forward
     def forward(
         self,
-        token_ids: Tensor["B", "T", "int32"],
-        position_ids: Tensor[3, "B", "T", "int32"],
-        visual_pos_masks: Tensor["B", "T", "int32"],
-        visual_embeds: Tensor["B * T", "d_model"],
-        deepstack_visual_embeds_0: Tensor["B * T", "d_model"],
-        deepstack_visual_embeds_1: Tensor["B * T", "d_model"],
-        deepstack_visual_embeds_2: Tensor["B * T", "d_model"],
-        targets: Tensor["B", "T", "int32"],
-    ) -> Tensor["B * T", "fp32"]:
-        with graph() as g:
-            # Embedding lookup
-            x0 = g.embedding(token_ids, "embedding")
-            x0 = g.mask_scatter(x0, visual_pos_masks, visual_embeds, out_name="x0")
+        token_ids,
+        position_ids,
+        visual_pos_masks,
+        visual_embeds,
+        deepstack_visual_embeds_0,
+        deepstack_visual_embeds_1,
+        deepstack_visual_embeds_2,
+        targets,
+    ):
+        G = ActivationScope.GLOBAL
 
-            # Initialize residual stream
-            residual0 = g.zeros(shape=["B", "T", "d_model"], dtype="bf16")
+        # IO slots
+        self._register_activation("token_ids", ("B", "T"), dtype="int32", scope=G)
+        self._register_activation("position_ids", (3, "B", "T"), dtype="int32", scope=G)
+        self._register_activation("targets", ("B", "T"), dtype="int32", scope=G,
+                                  aliases=["labels"])
+        self._register_activation("visual_pos_masks", ("B", "T"), dtype="int32", scope=G)
+        self._register_activation("visual_embeds", ("B * T", "d_model"), scope=G)
+        self._register_activation("deepstack_visual_embeds_0", ("B * T", "d_model"), scope=G)
+        self._register_activation("deepstack_visual_embeds_1", ("B * T", "d_model"), scope=G)
+        self._register_activation("deepstack_visual_embeds_2", ("B * T", "d_model"), scope=G)
+        self._register_activation("freq_cis", ("max_seq", "D", 2), dtype="fp32",
+                                  scope=G, aliases=["rope_freqs"])
 
-            # Stacked blocks (handled by runtime)
-            xN, residualN = g.call(
-                "StackedBlocks",
-                x0,
-                residual0,
-                position_ids,
-                visual_pos_masks,
-                deepstack_visual_embeds_0,
-                deepstack_visual_embeds_1,
-                deepstack_visual_embeds_2,
-                num_outputs=2,
-                blocks="blocks",
-                n_layers=self.n_layers,
-                deepstack_layers=self.deepstack_layers,
-            )
+        # Global intermediate slots
+        _h = ("B", "T", "d_model")
+        self._register_activation("residual0", _h, scope=G)
+        self._register_activation("x0", _h, aliases=["encoded"], scope=G)
+        self._register_activation("xN", _h, scope=G)
+        self._register_activation("residualN", _h, scope=G)
+        self._register_activation("residual_final", _h, scope=G)
+        self._register_activation("xF", _h, aliases=["ln_final"], scope=G)
+        self._register_activation("xF_flat", ("B * T", "d_model"), scope=G)
+        self._register_activation("ln_final_rstd", ("B", "T"), dtype="fp32",
+                                  save=True, scope=G)
+        self._register_activation("loss", ("B * T",), dtype="fp32",
+                                  aliases=["losses"], scope=G)
 
-            # Final norm
-            residual_final, xF, ln_final_rstd = g.fused_residual_rmsnorm(
-                residualN, xN, "final_norm", eps=self.eps,
-                res_out_name="residual_final",
-                y_name="xF",
-                rstd_name="ln_final_rstd",
-            )
+        # Embedding + visual injection
+        x = self.embedding(token_ids)
+        x = self._mask_scatter(x, visual_pos_masks, visual_embeds, name="x0")
 
-            # Fused LM head + loss
-            xF_flat = g.view(xF, shape=["B * T", "d_model"], out_name="xF_flat")
-            loss = g.fused_lm_head_loss(xF_flat, "lm_head", targets,
-                                        compute_accuracy=True, out_name="loss")
+        residual = self._zeros(["B", "T", "d_model"])
 
-            return loss
+        # Stacked blocks with deepstack visual args
+        x, residual = self.blocks(
+            x, residual, position_ids,
+            visual_pos_masks,
+            deepstack_visual_embeds_0,
+            deepstack_visual_embeds_1,
+            deepstack_visual_embeds_2,
+            deepstack_layers=self.deepstack_layers,
+        )
+
+        residual, x = self.final_norm(residual, x)
+        loss = self.lm_head(x, targets)
+        return loss

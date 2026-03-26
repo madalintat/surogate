@@ -1211,6 +1211,7 @@ void DslModel::validate_config_mapping(const Module& module) const {
 
 void DslModel::validate_param_shapes(const Module& module) const {
     auto env = make_shape_env(module, /*B=*/1, /*T=*/1);
+    augment_shape_env(env, module.config);
     for (const auto& kv : module.params) {
         const auto& info = kv.second;
         if (info.shape.empty()) {
