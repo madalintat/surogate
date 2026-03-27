@@ -158,6 +158,21 @@ void CompiledExecutor::dispatch_matmul(const CompiledOp& op, const modules::Forw
                 if (ctx.allow_fp8) {
                     ctx.inp_quant = fp8_forward_buffer(mRunState, *op.attrs.matmul_op);
                     ctx.delayed_quantizer_idx = fp8_quantizer_index(mRunState, *op.attrs.matmul_op, op.attrs.layer_idx);
+
+                    // Check if the upstream activation dispatch has already pre-quantized
+                    // the input into the FP8 buffer (co-located quantization).
+                    DslRunState::FP8BufferReady ready_flag = DslRunState::FP8Ready_None;
+                    switch (*op.attrs.matmul_op) {
+                        case modules::MatmulOp::QKV:     ready_flag = DslRunState::FP8Ready_LN1; break;
+                        case modules::MatmulOp::MLPUp:   ready_flag = DslRunState::FP8Ready_LN2; break;
+                        case modules::MatmulOp::MLPDown: ready_flag = DslRunState::FP8Ready_SwiGLU; break;
+                        default: break;
+                    }
+                    if (ready_flag != DslRunState::FP8Ready_None &&
+                        mRunState.consume_fp8_buffer_ready(ready_flag)) {
+                        ctx.inp_quant_ready = true;
+                    }
+
                     if (b.DType == ETensorDType::FP8_E4M3) {
                         ctx.cached_weight = &b;
                     } else if (mFP8Cache) {

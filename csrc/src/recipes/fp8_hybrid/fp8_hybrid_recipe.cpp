@@ -66,33 +66,38 @@ void FP8HybridRecipe::forward_matmul(modules::MatmulContext& ctx) const {
     }
 
     // Step 1: Quantize input to FP8 E4M3
-    if (ctx.delayed_quantizer_idx >= 0 && rs.has_fp8_delayed_scaling()) {
-        // Delayed scaling: use pre-computed scale from history
-        auto* scaling_state = rs.get_fp8_scaling_state();
-        if (scaling_state) {
-            auto qidx = static_cast<modules::QuantizerIndex>(ctx.delayed_quantizer_idx);
-            // Verify input dtype before calling typed function
-            if (ctx.inp->DType != ETensorDType::BF16) {
-                throw std::runtime_error(std::string(
-                    "FP8HybridRecipe::forward_matmul: delayed scaling requires BF16 input, got ") +
-                    dtype_to_str(ctx.inp->DType));
+    // Skip if the caller has already pre-quantized the input (e.g., fused activation+quant).
+    // When inp_quant_ready is set, the caller is responsible for having filled inp_fp8
+    // with valid FP8 data, a valid scale, and (if delayed scaling) recording the amax.
+    if (!ctx.inp_quant_ready) {
+        if (ctx.delayed_quantizer_idx >= 0 && rs.has_fp8_delayed_scaling()) {
+            // Delayed scaling: use pre-computed scale from history
+            auto* scaling_state = rs.get_fp8_scaling_state();
+            if (scaling_state) {
+                auto qidx = static_cast<modules::QuantizerIndex>(ctx.delayed_quantizer_idx);
+                // Verify input dtype before calling typed function
+                if (ctx.inp->DType != ETensorDType::BF16) {
+                    throw std::runtime_error(std::string(
+                        "FP8HybridRecipe::forward_matmul: delayed scaling requires BF16 input, got ") +
+                        dtype_to_str(ctx.inp->DType));
+                }
+                quantize_with_delayed_scale(
+                    inp_fp8.get<__nv_fp8_e4m3>(),
+                    scaling_state->get_recorded_amax_ptr(qidx),  // Record amax for next iteration
+                    inp_fp8.scale(),
+                    ctx.inp->get<nv_bfloat16>(),
+                    scaling_state->get_scale(qidx),
+                    num_elements, rs.DeviceProp, ctx.stream);
+            } else {
+                // Fallback to JIT scaling
+                quantize_with_abs_max(inp_fp8, inp_fp8.scale(), *ctx.inp, inp_fp8.abs_max(),
+                                      num_elements, rs.DeviceProp, ctx.stream);
             }
-            quantize_with_delayed_scale(
-                inp_fp8.get<__nv_fp8_e4m3>(),
-                scaling_state->get_recorded_amax_ptr(qidx),  // Record amax for next iteration
-                inp_fp8.scale(),
-                ctx.inp->get<nv_bfloat16>(),
-                scaling_state->get_scale(qidx),
-                num_elements, rs.DeviceProp, ctx.stream);
         } else {
-            // Fallback to JIT scaling
+            // JIT scaling: compute abs_max and scale on-the-fly
             quantize_with_abs_max(inp_fp8, inp_fp8.scale(), *ctx.inp, inp_fp8.abs_max(),
                                   num_elements, rs.DeviceProp, ctx.stream);
         }
-    } else {
-        // JIT scaling: compute abs_max and scale on-the-fly
-        quantize_with_abs_max(inp_fp8, inp_fp8.scale(), *ctx.inp, inp_fp8.abs_max(),
-                              num_elements, rs.DeviceProp, ctx.stream);
     }
 
     // Step 2: Prepare weight and perform matmul

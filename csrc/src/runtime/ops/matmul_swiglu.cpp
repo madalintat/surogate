@@ -54,6 +54,21 @@ void CompiledExecutor::dispatch_matmul_swiglu(const CompiledOp& op, const module
         if (ctx.allow_fp8) {
             ctx.inp_quant = fp8_forward_buffer(mRunState, *op.attrs.matmul_op);
             ctx.delayed_quantizer_idx = fp8_quantizer_index(mRunState, *op.attrs.matmul_op, op.attrs.layer_idx);
+
+            // Check if the upstream rmsnorm dispatch has already pre-quantized
+            // the LN2 output into the FP8 buffer.
+            DslRunState::FP8BufferReady ready_flag = DslRunState::FP8Ready_None;
+            switch (*op.attrs.matmul_op) {
+                case modules::MatmulOp::QKV:     ready_flag = DslRunState::FP8Ready_LN1; break;
+                case modules::MatmulOp::MLPUp:   ready_flag = DslRunState::FP8Ready_LN2; break;
+                case modules::MatmulOp::MLPDown: ready_flag = DslRunState::FP8Ready_SwiGLU; break;
+                default: break;
+            }
+            if (ready_flag != DslRunState::FP8Ready_None &&
+                mRunState.consume_fp8_buffer_ready(ready_flag)) {
+                ctx.inp_quant_ready = true;
+            }
+
             if (b.DType == ETensorDType::FP8_E4M3) {
                 ctx.cached_weight = &b;
             } else if (mFP8Cache) {
@@ -100,6 +115,21 @@ void CompiledExecutor::dispatch_matmul_swiglu(const CompiledOp& op, const module
     Tensor out_3d = view_tensor(out, {mB, mT, D});
     swiglu_forward(out_3d, up_3d, nullptr, static_cast<int>(mB),
                    static_cast<int>(mT), static_cast<int>(D), mRunState.MainStream);
+
+    // Pre-quantize swiglu output into FP8 buffer for the downstream MLPDown matmul.
+    // This co-locates quantization with the data producer (better L2 locality)
+    // and allows the matmul recipe to skip its own quantization pass.
+    if (mRecipe && mRecipe->uses_fp8_forward() && mRunState.has_fp8_forward() &&
+        !mRunState.has_fp8_delayed_scaling()) {
+        auto& fp8_buf = mRunState.fp8_forward_quants().swiglu;
+        if (fp8_buf.Data && fp8_buf.abs_max() && fp8_buf.scale()) {
+            const long num_elements = mB * mT * D;
+            Tensor swiglu_flat = view_tensor(out_3d, {mB * mT, D});
+            quantize_with_abs_max(fp8_buf, fp8_buf.scale(), swiglu_flat, fp8_buf.abs_max(),
+                                  num_elements, mRunState.DeviceProp, mRunState.MainStream);
+            mRunState.set_fp8_buffer_ready(DslRunState::FP8Ready_SwiGLU);
+        }
+    }
 
     // Record forward plan for recompute (treat matmul_swiglu as the MLPUp projection).
     if (mForwardPlan && op.attrs.matmul_op.has_value() && op.attrs.layer_idx >= 0 &&

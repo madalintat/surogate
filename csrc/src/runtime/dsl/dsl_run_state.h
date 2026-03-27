@@ -50,6 +50,24 @@ public:
     modules::SimplifiedQuantGradients& simplified_quant_grads() { return mSimplifiedQuantGrads; }
     modules::FP8ForwardQuantActivations& fp8_forward_quants() { return mFP8ForwardQuants; }
 
+    /// @brief FP8 forward buffer freshness tracking.
+    /// When an activation dispatch (swiglu, rmsnorm) pre-quantizes its output
+    /// into the FP8 buffer, it sets the corresponding bit. The matmul dispatch
+    /// checks and clears the bit to skip redundant quantization.
+    enum FP8BufferReady : uint8_t {
+        FP8Ready_None    = 0,
+        FP8Ready_LN1     = 1 << 0,  ///< fp8_forward_quants().ln1 is pre-quantized
+        FP8Ready_LN2     = 1 << 1,  ///< fp8_forward_quants().ln2 is pre-quantized
+        FP8Ready_Att     = 1 << 2,  ///< fp8_forward_quants().att is pre-quantized
+        FP8Ready_SwiGLU  = 1 << 3,  ///< fp8_forward_quants().swiglu is pre-quantized
+    };
+    void set_fp8_buffer_ready(FP8BufferReady flag) { mFP8BufferReadyFlags |= flag; }
+    bool consume_fp8_buffer_ready(FP8BufferReady flag) {
+        if (mFP8BufferReadyFlags & flag) { mFP8BufferReadyFlags &= ~flag; return true; }
+        return false;
+    }
+    void reset_fp8_buffer_ready() { mFP8BufferReadyFlags = FP8Ready_None; }
+
     void reset_simplified_gradients();
 
     /// @brief Zero all activation gradient buffers (d_res_ffn, d_res_att) for all layers.
@@ -221,6 +239,7 @@ private:
     Tensor mSharedDLn1{};
     modules::SimplifiedQuantGradients mSimplifiedQuantGrads;
     modules::FP8ForwardQuantActivations mFP8ForwardQuants;
+    uint8_t mFP8BufferReadyFlags = 0;
     Tensor mFP8ForwardStats{};
     Tensor mGradQuantStats{};
 

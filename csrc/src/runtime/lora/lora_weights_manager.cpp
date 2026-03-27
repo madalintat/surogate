@@ -28,6 +28,7 @@ ModularLoRAWeightsManager::ModularLoRAWeightsManager(const Config& config, Tenso
     auto ctx = mAllocator->with_context("Modular_LoRA_Weights");
     mMaster.blocks.resize(config.num_layers);
     mWork.blocks.resize(config.num_layers);
+    mBlockSyncGen.resize(config.num_layers, 0);
     for (int l = 0; l < config.num_layers; ++l) {
         allocate_block_weights(l);
     }
@@ -375,6 +376,13 @@ void ModularLoRAWeightsManager::export_to_file(const std::string& file_name, NCC
 LoRABlockWeights<Tensor>& ModularLoRAWeightsManager::get_block(int layer_idx, cudaStream_t stream) {
     auto& work = mWork.blocks[layer_idx];
     if (!enabled()) return work;
+
+    // Skip sync if this block was already synced during the current generation.
+    auto& block_gen = mBlockSyncGen[static_cast<std::size_t>(layer_idx)];
+    if (block_gen == mSyncGeneration) {
+        return work;
+    }
+    block_gen = mSyncGeneration;
 
     auto& master = mMaster.blocks[layer_idx];
 

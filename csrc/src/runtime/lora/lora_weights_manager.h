@@ -5,6 +5,7 @@
 #ifndef SUROGATE_SRC_MODULES_LORA_LORA_WEIGHTS_MANAGER_H
 #define SUROGATE_SRC_MODULES_LORA_LORA_WEIGHTS_MANAGER_H
 
+#include <cstdint>
 #include <string>
 #include <vector>
 #include <functional>
@@ -79,6 +80,9 @@ public:
 
     /**
      * @brief Get block weights for forward/backward pass
+     *
+     * Syncs master → work weights. Redundant calls within the same sync
+     * generation (see advance_sync_generation) are skipped automatically.
      */
     LoRABlockWeights<Tensor>& get_block(int layer_idx, cudaStream_t stream);
 
@@ -86,6 +90,14 @@ public:
      * @brief Get master block weights for optimizer
      */
     LoRABlockWeights<TensorShard>& get_master_block(int layer_idx, cudaStream_t stream);
+
+    /**
+     * @brief Advance the sync generation counter.
+     *
+     * Call once per training step (after the optimizer updates master weights)
+     * so that the next get_block() call per layer will re-sync.
+     */
+    void advance_sync_generation() { ++mSyncGeneration; }
 
     /**
      * @brief Get LoRA scaling factor
@@ -124,6 +136,12 @@ private:
 
     // Working weights (full precision for compute)
     LoRAWeightsSet<Tensor> mWork;
+
+    // Sync deduplication: skip redundant master→work copies within a training step.
+    // Generation starts at 1 so the default-initialized per-block gen (0) triggers
+    // the first sync.
+    std::uint64_t mSyncGeneration = 1;
+    std::vector<std::uint64_t> mBlockSyncGen;  // Per-block last-synced generation
 
     void allocate_layer_weights(LoRALayerWeights<TensorShard>& shard,
                                  LoRALayerWeights<Tensor>& work,

@@ -630,17 +630,20 @@ void DslModel::update_with_config(NCCLCommunicator& comm, const optimizers::Opti
             case optimizers::OptimizerType::ADAMW:
                 update_lora_adamw(comm, config.learning_rate, config.adamw_beta1, config.adamw_beta2,
                                   step, config.adamw_epsilon, config.weight_decay, config.grad_clip);
-                return;
+                break;
             case optimizers::OptimizerType::ADAMW_8BIT:
                 update_lora_adamw_8bit(comm, config.learning_rate, config.adamw_beta1, config.adamw_beta2,
                                        step, config.adamw_epsilon, config.weight_decay, config.grad_clip);
-                return;
+                break;
             case optimizers::OptimizerType::NORMUON:
                 update_lora_normuon(comm, config, step);
-                return;
+                break;
             default:
                 throw std::logic_error("DslModel::update_with_config: unsupported optimizer type for LoRA");
         }
+        // Invalidate cached work weights so get_block() re-syncs from updated master.
+        mLoRAWeights->advance_sync_generation();
+        return;
     }
     switch (config.type) {
         case optimizers::OptimizerType::ADAMW:
@@ -675,9 +678,10 @@ void DslModel::update_with_graph_params(NCCLCommunicator& comm, const optimizers
         }
         if (config.type == optimizers::OptimizerType::ADAMW) {
             update_lora_adamw_graph(comm, config.grad_clip, opt_params, opt_step);
-            return;
+        } else {
+            update_lora_adamw_8bit_graph(comm, config.grad_clip, opt_params, opt_step);
         }
-        update_lora_adamw_8bit_graph(comm, config.grad_clip, opt_params, opt_step);
+        mLoRAWeights->advance_sync_generation();
         return;
     }
     if (config.type == optimizers::OptimizerType::NORMUON) {

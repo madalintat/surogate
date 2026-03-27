@@ -120,6 +120,7 @@ struct MatmulContext {
     unsigned int seed = 0;           ///< Random seed for stochastic rounding (FP4 backward)
     bool allow_fp4 = true;           ///< Allow FP4 quantization (false for skip_quant layers)
     bool allow_fp8 = true;           ///< Allow FP8 quantization (false for skip_quant layers)
+    bool inp_quant_ready = false;    ///< If true, inp_quant already contains valid quantized data (skip quantize)
 
     // =========================================================================
     // Quantization buffers (set by caller for FP8/FP4 recipes)

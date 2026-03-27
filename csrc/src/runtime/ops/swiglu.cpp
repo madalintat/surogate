@@ -47,6 +47,21 @@ void CompiledExecutor::dispatch_swiglu(const CompiledOp& op) {
         const long D = inp.Sizes[2] / 2;
         swiglu_forward(out, inp, nullptr, static_cast<int>(B),
                        static_cast<int>(T), static_cast<int>(D), mRunState.MainStream);
+
+        // Pre-quantize swiglu output into FP8 buffer for the downstream MLPDown matmul.
+        // This co-locates quantization with the data producer (better L2 locality)
+        // and allows the matmul recipe to skip its own quantization pass.
+        if (mRecipe && mRecipe->uses_fp8_forward() && mRunState.has_fp8_forward() &&
+            !mRunState.has_fp8_delayed_scaling()) {
+            auto& fp8_buf = mRunState.fp8_forward_quants().swiglu;
+            if (fp8_buf.Data && fp8_buf.abs_max() && fp8_buf.scale()) {
+                const long num_elements = B * T * D;
+                Tensor out_flat = view_tensor(out, {B * T, D});
+                quantize_with_abs_max(fp8_buf, fp8_buf.scale(), out_flat, fp8_buf.abs_max(),
+                                      num_elements, mRunState.DeviceProp, mRunState.MainStream);
+                mRunState.set_fp8_buffer_ready(DslRunState::FP8Ready_SwiGLU);
+            }
+        }
     }
 
 }

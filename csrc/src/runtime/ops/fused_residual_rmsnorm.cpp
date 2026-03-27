@@ -116,6 +116,32 @@ void CompiledExecutor::dispatch_fused_residual_rmsnorm(const CompiledOp& op) {
     fused_residual_rmsnorm_forward(residual_out, y, rstd, residual_in, input, weight, nullptr,
                                    op.attrs.eps, static_cast<int>(mB * mT),
                                    mConfig.HiddenSize, mRunState.MainStream);
+
+    // Pre-quantize normalized output into FP8 buffer for the downstream matmul.
+    // LN1 output → QKV matmul input (fp8_quants.ln1)
+    // LN2 output → MLPUp matmul input (fp8_quants.ln2)
+    if (mRecipe && mRecipe->uses_fp8_forward() && mRunState.has_fp8_forward() &&
+        !mRunState.has_fp8_delayed_scaling() && fwd_layer_idx >= 0) {
+        auto& quants = mRunState.fp8_forward_quants();
+        Tensor* fp8_buf = nullptr;
+        DslRunState::FP8BufferReady flag = DslRunState::FP8Ready_None;
+
+        if (is_ln2_fwd) {
+            fp8_buf = &quants.ln2;
+            flag = DslRunState::FP8Ready_LN2;
+        } else {
+            fp8_buf = &quants.ln1;
+            flag = DslRunState::FP8Ready_LN1;
+        }
+
+        if (fp8_buf && fp8_buf->Data && fp8_buf->abs_max() && fp8_buf->scale()) {
+            const long num_elements = mB * mT * mConfig.HiddenSize;
+            Tensor y_flat = view_tensor(y, {mB * mT, static_cast<long>(mConfig.HiddenSize)});
+            quantize_with_abs_max(*fp8_buf, fp8_buf->scale(), y_flat, fp8_buf->abs_max(),
+                                  num_elements, mRunState.DeviceProp, mRunState.MainStream);
+            mRunState.set_fp8_buffer_ready(flag);
+        }
+    }
 }
 
 void CompiledExecutor::dispatch_fused_residual_rmsnorm_backward(const CompiledOp& op) {
