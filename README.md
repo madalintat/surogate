@@ -80,10 +80,27 @@ Surogate is built for developers and enterprises that need fast experimentation 
 - [**🧬 Adaptive Training**](https://docs.surogate.ai/about/adaptive-training): built-in automated training monitoring with automatic phase detection, multi-criteria early stopping (convergence, compute-efficiency, divergence, plateau), auto LR management, MoE imbalance detection, Chinchilla token budgeting and dynamic epoch adjustment
 - [**🎨 Dedicated MoE Features**](https://docs.surogate.ai/guides/moe): Expert Parallelism, Least-Loaded EP load-balancing, MoE training metrics, Imbalance detection
 - **🥞 Stacked LoRA training**: Train a LoRA adapter on top of another LoRA adapter to skip offline merging into base model.
-- **🧠 Supported models**: Qwen2.5, Qwen3, Qwen3 MoE, Llama 3+, Nemotron Nano. Models can be added easily, please create a PR if you need a specific model.
 - **[Surogate Studio](https://github.com/invergent-ai/surogate-studio)**: Unified no-code platform for managing your AI infrastructure and operations: Training, Fine-Tuning, Inference and Quantization
-  
+
 ---
+
+## 🧠 Supported Models:
+We support the following models. Please create a PR if you need a specific model
+
+| Model              | Architecture                                            | Model Sizes                   |
+| ------------------ | ------------------------------------------------------- | ----------------------------- |
+| Qwen3              | Qwen3ForCausalLM                                        | 0.6B, 1.7B, 4B, 8B, 14B, 35B  |
+| Qwen3VL            | Qwen3VLForConditionalGeneration                         | 2B, 4B, 8B, 32B               |
+| Qwen3 MoE          | Qwen3MoeForCausalLM                                     | 30B-A3B, 235B-A22B            |
+| Qwen3.5            | Qwen3_5ForCausalLM, Qwen3_5ForConditionalGeneration     | 0.8B, 2B 4B, 9B, 27B          |
+| Qwen3.5 Moe        | Qwen3MoeForCausalLM, Qwen3_5MoeForConditionalGeneration | 35B-A3B, 122B-A10B, 397B-A17B |
+| Nemotron Nano v3   | NemotronHForCausalLM                                    | 30B-A3B                       |
+| Nemotron Super v3  | NemotronHForCausalLM                                    | 120B-A12B                     |
+| Nemotron Cascade 2 | NemotronHForCausalLM                                    | 30B-A3B                       |
+| GPT-OSS            | GptOssForCausalLM                                       | 20B, 120B                     |
+| Llama 3.1          | LlamaForCausalLM                                        | 8B, 70B, 405B                     |
+| Llama 3.2          | LlamaForCausalLM                                        | 1B, 3B                      |
+
 
 ## 🚀 Quickstart
 You can interact with the Surogate High-Performance Training Engine at the framework level via the CLI, or spin up the full Studio for a visual AgentOps experience. (See the [Surogate Studio](https://github.com/invergent-ai/surogate-studio) repo for deployment options).

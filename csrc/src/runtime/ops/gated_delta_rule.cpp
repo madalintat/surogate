@@ -332,10 +332,12 @@ void CompiledExecutor::dispatch_chunk_gated_delta_rule_backward(const CompiledOp
     const long K = q.Sizes[3];
     const long V = v.Sizes[3];
 
-    // Allocate gradient outputs
-    auto ensure_or_temp = [&](std::size_t out_idx,
-                              ETensorDType dtype,
-                              const std::vector<long>& shape) -> Tensor* {
+    // Allocate gradient outputs.
+    // IMPORTANT: Do NOT store pointers into mTemps — subsequent push_back() calls
+    // can reallocate the vector, invalidating any prior pointers. Store as values.
+    auto ensure_or_temp_val = [&](std::size_t out_idx,
+                                  ETensorDType dtype,
+                                  const std::vector<long>& shape) -> Tensor {
         if (op.outputs.size() > out_idx && !op.outputs[out_idx].name.empty()) {
             Tensor& out_ref = ensure_output_tensor(op.outputs[out_idx]);
             bool ok = true;
@@ -343,26 +345,32 @@ void CompiledExecutor::dispatch_chunk_gated_delta_rule_backward(const CompiledOp
             if (shape.size() == 4 && !tensor_shape_matches(out_ref, shape[0], shape[1], shape[2], shape[3])) ok = false;
             if (shape.size() == 3 && (out_ref.Rank != 3 || out_ref.Sizes[0] != shape[0] ||
                 out_ref.Sizes[1] != shape[1] || out_ref.Sizes[2] != shape[2])) ok = false;
-            if (ok) return &out_ref;
+            if (ok) return out_ref;
         }
         Tensor temp = mRunState.temp_alloc(dtype, shape);
         mTemps.push_back(temp);
-        return &mTemps.back();
+        return temp;
     };
 
     if (debug_replay) fprintf(stderr, "[GDR_BWD] allocating outputs B=%ld T=%ld H=%ld K=%ld V=%ld\n", B, T, H, K, V);
-    Tensor* d_q = ensure_or_temp(0, q.DType, {B, T, H, K});
+    Tensor d_q_val = ensure_or_temp_val(0, q.DType, {B, T, H, K});
     if (debug_replay) fprintf(stderr, "[GDR_BWD] d_q done\n");
-    Tensor* d_k = ensure_or_temp(1, k.DType, {B, T, H, K});
+    Tensor d_k_val = ensure_or_temp_val(1, k.DType, {B, T, H, K});
     if (debug_replay) fprintf(stderr, "[GDR_BWD] d_k done\n");
-    Tensor* d_v = ensure_or_temp(2, v.DType, {B, T, H, V});
+    Tensor d_v_val = ensure_or_temp_val(2, v.DType, {B, T, H, V});
     if (debug_replay) fprintf(stderr, "[GDR_BWD] d_v done\n");
-    Tensor* d_g = ensure_or_temp(3, g_input.DType, {B, T, H});
+    Tensor d_g_val = ensure_or_temp_val(3, g_input.DType, {B, T, H});
     if (debug_replay) fprintf(stderr, "[GDR_BWD] d_g done\n");
-    Tensor* d_beta = ensure_or_temp(4, beta.DType, {B, T, H});
+    Tensor d_beta_val = ensure_or_temp_val(4, beta.DType, {B, T, H});
     if (debug_replay) fprintf(stderr, "[GDR_BWD] d_beta done\n");
-    Tensor* d_initial = ensure_or_temp(5, ETensorDType::FP32, {B, H, K, V});
+    Tensor d_initial_val = ensure_or_temp_val(5, ETensorDType::FP32, {B, H, K, V});
     if (debug_replay) fprintf(stderr, "[GDR_BWD] d_initial done, about to launch kernels\n");
+    Tensor* d_q = &d_q_val;
+    Tensor* d_k = &d_k_val;
+    Tensor* d_v = &d_v_val;
+    Tensor* d_g = &d_g_val;
+    Tensor* d_beta = &d_beta_val;
+    Tensor* d_initial = &d_initial_val;
 
     float scale = op.attrs.delta_rule_scale;
     if (!(scale > 0.0f)) {
