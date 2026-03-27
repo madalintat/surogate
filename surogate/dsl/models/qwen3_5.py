@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-from ..tensor_type import Tensor, Array
-from ..decorators import model, forward, hf_config, Param, Activation, Gradient
-from ..graph_builder import graph
+from .. import nn
+from ..nn import QWEN3_5_MODEL_NAME_REMAP, QWEN3_5_VL_MODEL_NAME_REMAP
+from ..specs import ActivationScope
 from ..hf import build_norm_mappings, build_mlp_mappings
+from ..blocks.qwen3_5 import Qwen3_5AttentionBlock, Qwen3_5LinearBlock
 
 
 def _parse_qwen3_5_layer_types(
@@ -62,11 +63,74 @@ def _build_qwen3_5_block_mappings(layer_prefix: str) -> dict[str, object]:
         "lin_dt_bias": f"{layer_prefix}.linear_attn.dt_bias",
         "lin_norm_weight": f"{layer_prefix}.linear_attn.norm.weight",
         "lin_out_weight": f"{layer_prefix}.linear_attn.out_proj.weight",
+        # Model-level weight mappings
+        "embedding": "model.embed_tokens.weight",
+        "final_norm": "model.norm.weight",
+        "lm_head": "lm_head.weight",
     }
 
 
-class _Qwen3_5DenseBase:
-    """Shared implementation for Qwen3.5 dense text backbones."""
+def _build_qwen3_5_conditional_block_mappings(layer_prefix: str) -> dict[str, object]:
+    """HF mappings for Qwen3.5 conditional generation model."""
+    return {
+        **build_norm_mappings(layer_prefix),
+        **build_mlp_mappings(layer_prefix),
+        # Full-attention params
+        "full_q_proj_weight": f"{layer_prefix}.self_attn.q_proj.weight",
+        "full_q_proj_bias": f"{layer_prefix}.self_attn.q_proj.bias",
+        "full_k_proj_weight": f"{layer_prefix}.self_attn.k_proj.weight",
+        "full_k_proj_bias": f"{layer_prefix}.self_attn.k_proj.bias",
+        "full_v_proj_weight": f"{layer_prefix}.self_attn.v_proj.weight",
+        "full_v_proj_bias": f"{layer_prefix}.self_attn.v_proj.bias",
+        "full_out_weight": f"{layer_prefix}.self_attn.o_proj.weight",
+        "full_out_bias": f"{layer_prefix}.self_attn.o_proj.bias",
+        "q_norm_weight": f"{layer_prefix}.self_attn.q_norm.weight",
+        "k_norm_weight": f"{layer_prefix}.self_attn.k_norm.weight",
+        # Linear-attention params
+        "lin_in_proj_qkv_weight": f"{layer_prefix}.linear_attn.in_proj_qkv.weight",
+        "lin_in_proj_z_weight": f"{layer_prefix}.linear_attn.in_proj_z.weight",
+        "lin_in_proj_b_weight": f"{layer_prefix}.linear_attn.in_proj_b.weight",
+        "lin_in_proj_a_weight": f"{layer_prefix}.linear_attn.in_proj_a.weight",
+        "lin_conv_weight": f"{layer_prefix}.linear_attn.conv1d.weight",
+        "lin_A_log": f"{layer_prefix}.linear_attn.A_log",
+        "lin_dt_bias": f"{layer_prefix}.linear_attn.dt_bias",
+        "lin_norm_weight": f"{layer_prefix}.linear_attn.norm.weight",
+        "lin_out_weight": f"{layer_prefix}.linear_attn.out_proj.weight",
+        # Model-level weight mappings
+        "embedding": "model.language_model.embed_tokens.weight",
+        "final_norm": "model.language_model.norm.weight",
+        "lm_head": "lm_head.weight",
+    }
+
+
+@nn.hf_config(
+    architecture="Qwen3_5ForCausalLM",
+    model_type="qwen3_5_text",
+    d_model="hidden_size",
+    n_layers="num_hidden_layers",
+    num_query_heads="num_attention_heads",
+    num_kv_heads="num_key_value_heads",
+    d_ff="intermediate_size",
+    vocab_size="vocab_size",
+    max_seq="max_position_embeddings",
+    head_size="head_dim",
+    eps="rms_norm_eps",
+    use_qkv_bias="attention_bias",
+    partial_rotary_factor="rope_parameters.partial_rotary_factor",
+    mrope_section="rope_parameters.mrope_section",
+    linear_conv_kernel_dim="linear_conv_kernel_dim",
+    linear_key_head_dim="linear_key_head_dim",
+    linear_value_head_dim="linear_value_head_dim",
+    linear_num_key_heads="linear_num_key_heads",
+    linear_num_value_heads="linear_num_value_heads",
+    layer_types="layer_types",
+    full_attention_interval="full_attention_interval",
+)
+class Qwen3_5CausalModel(nn.Model):
+    """Qwen3.5 dense text model for ``Qwen3_5ForCausalLM``."""
+
+    _name_remap_ = QWEN3_5_MODEL_NAME_REMAP
+    _hf_block_mappings_ = _build_qwen3_5_block_mappings("model.layers.{layer}")
 
     def __init__(
         self,
@@ -91,6 +155,7 @@ class _Qwen3_5DenseBase:
         full_attention_interval: int = 4,
         chunk_size: int = 64,
     ):
+        super().__init__()
         self.vocab_size = vocab_size
         self.d_model = d_model
         self.n_layers = n_layers
@@ -134,124 +199,88 @@ class _Qwen3_5DenseBase:
         self.has_linear_blocks = self.n_linear_blocks > 0
         self.has_attn_blocks = self.n_attn_blocks > 0
 
-    # Block arrays
-    linear_blocks = Param(Array["n_linear_blocks", "Qwen3_5LinearBlock"], when="has_linear_blocks")
-    attn_blocks = Param(Array["n_attn_blocks", "Qwen3_5AttentionBlock"], when="has_attn_blocks")
+        # Use mamba_blocks / attn_blocks naming for HybridBlockStack
+        # (mamba = linear_attention, attention = full_attention)
+        self.n_mamba_blocks = self.n_linear_blocks
+        self.n_attention_blocks = self.n_attn_blocks
 
-    # IO
-    token_ids = Activation(Tensor["B", "T"], dtype="int32", scope="global", description="Input token IDs")
-    position_ids = Activation(Tensor[3, "B", "T"], dtype="int32", scope="global", description="Position IDs")
-    targets = Activation(Tensor["B", "T"], dtype="int32", scope="global", aliases=["labels"])
+        # Build block configs for HybridBlockStack
+        block_configs = []
+        if self.n_linear_blocks > 0:
+            block_configs.append((
+                "mamba_blocks", Qwen3_5LinearBlock, self.n_linear_blocks,
+                dict(
+                    d_model=d_model,
+                    d_ff=d_ff,
+                    linear_conv_kernel_dim=linear_conv_kernel_dim,
+                    linear_key_head_dim=linear_key_head_dim,
+                    linear_value_head_dim=linear_value_head_dim,
+                    linear_num_key_heads=linear_num_key_heads,
+                    linear_num_value_heads=linear_num_value_heads,
+                    chunk_size=chunk_size,
+                    eps=eps,
+                ),
+            ))
+        if self.n_attn_blocks > 0:
+            block_configs.append((
+                "attn_blocks", Qwen3_5AttentionBlock, self.n_attn_blocks,
+                dict(
+                    d_model=d_model,
+                    num_query_heads=num_query_heads,
+                    num_kv_heads=num_kv_heads,
+                    head_size=head_size,
+                    d_ff=d_ff,
+                    max_seq=max_seq,
+                    eps=eps,
+                    use_qkv_bias=use_qkv_bias,
+                    partial_rotary_factor=partial_rotary_factor,
+                    mrope_section=mrope_section,
+                ),
+            ))
 
-    # Precomputed constants
-    freq_cis = Activation(
-        Tensor["max_seq", "rotary_dim // 2", 2],
-        dtype="fp32",
-        scope="global",
-        aliases=["rope_freqs"],
-        description="Precomputed RoPE frequencies",
-    )
+        self.embedding = nn.Embedding(vocab_size, d_model)
+        self.hybrid_blocks = nn.HybridBlockStack(
+            block_configs=block_configs,
+            block_types=self.block_types,
+            n_layers=n_layers,
+        )
+        self.final_norm = nn.RMSNormPlus1(d_model, eps=eps)
+        self.lm_head = nn.LMHead(vocab_size, d_model)
 
-    # Global activations
-    x0 = Activation(Tensor["B", "T", "d_model"], aliases=["encoded"], scope="global")
-    residual0 = Activation(Tensor["B", "T", "d_model"], scope="global")
-    xN = Activation(Tensor["B", "T", "d_model"], scope="global")
-    residualN = Activation(Tensor["B", "T", "d_model"], scope="global")
-    residual_final = Activation(Tensor["B", "T", "d_model"], scope="global")
-    xF = Activation(Tensor["B", "T", "d_model"], aliases=["ln_final"], scope="global")
-    xF_flat = Activation(Tensor["B * T", "d_model"], scope="global")
-    ln_final_rstd = Activation(Tensor["B", "T"], dtype="fp32", save=True, scope="global")
-    loss = Activation(Tensor["B * T"], dtype="fp32", scope="global", aliases=["losses"])
+    def forward(self, token_ids, position_ids, targets):
+        G = ActivationScope.GLOBAL
 
-    # Global gradients
-    d_loss = Gradient(Tensor["B * T"], dtype="fp32", gradient_of="loss", scope="global")
-    d_xF = Gradient(Tensor["B", "T", "d_model"], gradient_of="xF", scope="global")
-    d_xN = Gradient(Tensor["B", "T", "d_model"], gradient_of="xN", scope="global")
-    d_residualN = Gradient(Tensor["B", "T", "d_model"], gradient_of="residualN", scope="global")
-    d_x0 = Gradient(Tensor["B", "T", "d_model"], gradient_of="x0", scope="global")
+        # IO slots
+        self._register_activation("token_ids", ("B", "T"), dtype="int32", scope=G)
+        self._register_activation("position_ids", (3, "B", "T"), dtype="int32", scope=G)
+        self._register_activation("targets", ("B", "T"), dtype="int32", scope=G,
+                                  aliases=["labels"])
+        self._register_activation("freq_cis", ("max_seq", "rotary_dim // 2", 2),
+                                  dtype="fp32", scope=G, aliases=["rope_freqs"])
 
-    @forward
-    def forward(
-        self,
-        token_ids: Tensor["B", "T", "int32"],
-        position_ids: Tensor[3, "B", "T", "int32"],
-        targets: Tensor["B", "T", "int32"],
-    ) -> Tensor["B * T", "fp32"]:
-        with graph() as g:
-            x0 = g.embedding(token_ids, "embedding")
-            residual0 = g.zeros(shape=["B", "T", "d_model"], dtype="bf16")
+        # Global intermediate slots
+        _h = ("B", "T", "d_model")
+        self._register_activation("residual0", _h, scope=G)
+        self._register_activation("x0", _h, aliases=["encoded"], scope=G)
+        self._register_activation("xN", _h, scope=G)
+        self._register_activation("residualN", _h, scope=G)
+        self._register_activation("residual_final", _h, scope=G)
+        self._register_activation("xF", _h, aliases=["ln_final"], scope=G)
+        self._register_activation("xF_flat", ("B * T", "d_model"), scope=G)
+        self._register_activation("ln_final_rstd", ("B", "T"), dtype="fp32",
+                                  save=True, scope=G)
+        self._register_activation("loss", ("B * T",), dtype="fp32",
+                                  aliases=["losses"], scope=G)
 
-            xN, residualN = g.call(
-                "HybridStackedBlocks",
-                x0,
-                residual0,
-                position_ids,
-                num_outputs=2,
-                mamba_blocks="linear_blocks",
-                attn_blocks="attn_blocks",
-                block_types=self.block_types,
-                n_layers=self.n_layers,
-            )
-
-            final_ones = g.ones(shape=["d_model"], dtype="bf16")
-            final_norm_eff = g.add("final_norm", final_ones, out_name="final_norm_eff")
-            residual_final, xF, ln_final_rstd = g.fused_residual_rmsnorm(
-                residualN,
-                xN,
-                final_norm_eff,
-                eps=self.eps,
-                res_out_name="residual_final",
-                y_name="xF",
-                rstd_name="ln_final_rstd",
-            )
-
-            xF_flat = g.view(xF, shape=["B * T", "d_model"], out_name="xF_flat")
-            loss = g.fused_lm_head_loss(
-                xF_flat,
-                "lm_head",
-                targets,
-                compute_accuracy=True,
-                out_name="loss",
-            )
-            return loss
-
-
-@model
-@hf_config(
-    architecture="Qwen3_5ForCausalLM",
-    model_type="qwen3_5_text",
-    d_model="hidden_size",
-    n_layers="num_hidden_layers",
-    num_query_heads="num_attention_heads",
-    num_kv_heads="num_key_value_heads",
-    d_ff="intermediate_size",
-    vocab_size="vocab_size",
-    max_seq="max_position_embeddings",
-    head_size="head_dim",
-    eps="rms_norm_eps",
-    use_qkv_bias="attention_bias",
-    partial_rotary_factor="rope_parameters.partial_rotary_factor",
-    mrope_section="rope_parameters.mrope_section",
-    linear_conv_kernel_dim="linear_conv_kernel_dim",
-    linear_key_head_dim="linear_key_head_dim",
-    linear_value_head_dim="linear_value_head_dim",
-    linear_num_key_heads="linear_num_key_heads",
-    linear_num_value_heads="linear_num_value_heads",
-    layer_types="layer_types",
-    full_attention_interval="full_attention_interval",
-)
-class Qwen3_5CausalModel(_Qwen3_5DenseBase):
-    """Qwen3.5 dense text model for `Qwen3_5ForCausalLM`."""
-
-    embedding = Param(Tensor["vocab_size", "d_model"], hf_mapping="model.embed_tokens.weight")
-    final_norm = Param(Tensor["d_model"], hf_mapping="model.norm.weight")
-    lm_head = Param(Tensor["vocab_size", "d_model"], hf_mapping="lm_head.weight")
-
-    _hf_block_mappings_ = _build_qwen3_5_block_mappings("model.layers.{layer}")
+        x = self.embedding(token_ids)
+        residual = self._zeros(["B", "T", "d_model"])
+        x, residual = self.hybrid_blocks(x, residual, position_ids)
+        residual, x = self.final_norm(residual, x)
+        loss = self.lm_head(x, targets)
+        return loss
 
 
-@model
-@hf_config(
+@nn.hf_config(
     architecture="Qwen3_5ForConditionalGeneration",
     model_type="qwen3_5",
     d_model="text_config.hidden_size",
@@ -274,72 +303,170 @@ class Qwen3_5CausalModel(_Qwen3_5DenseBase):
     layer_types="text_config.layer_types",
     full_attention_interval="text_config.full_attention_interval",
 )
-class Qwen3_5ConditionalModel(_Qwen3_5DenseBase):
-    """Qwen3.5 dense text model for `Qwen3_5ForConditionalGeneration`."""
+class Qwen3_5ConditionalModel(nn.Model):
+    """Qwen3.5 dense text model for ``Qwen3_5ForConditionalGeneration``."""
 
-    embedding = Param(Tensor["vocab_size", "d_model"], hf_mapping="model.language_model.embed_tokens.weight")
-    final_norm = Param(Tensor["d_model"], hf_mapping="model.language_model.norm.weight")
-    lm_head = Param(Tensor["vocab_size", "d_model"], hf_mapping="lm_head.weight")
-
-    _hf_block_mappings_ = _build_qwen3_5_block_mappings("model.language_model.layers.{layer}")
-
-    # Multimodal external inputs (for vision-enabled Qwen3.5 conditional models).
-    visual_pos_masks = Activation(
-        Tensor["B", "T"],
-        dtype="int32",
-        scope="global",
-        description="Mask for visual token positions",
-    )
-    visual_embeds = Activation(
-        Tensor["B * T", "d_model"],
-        scope="global",
-        description="Visual embeddings (packed by mask)",
+    _name_remap_ = QWEN3_5_VL_MODEL_NAME_REMAP
+    _hf_block_mappings_ = _build_qwen3_5_conditional_block_mappings(
+        "model.language_model.layers.{layer}",
     )
 
-    @forward
+    def __init__(
+        self,
+        vocab_size: int = 248320,
+        d_model: int = 4096,
+        n_layers: int = 32,
+        num_query_heads: int = 16,
+        num_kv_heads: int = 4,
+        d_ff: int = 12288,
+        max_seq: int = 32768,
+        head_size: int = 256,
+        eps: float = 1e-6,
+        use_qkv_bias: bool = False,
+        partial_rotary_factor: float = 0.25,
+        mrope_section: tuple[int, int, int] | list[int] | None = None,
+        linear_conv_kernel_dim: int = 4,
+        linear_key_head_dim: int = 128,
+        linear_value_head_dim: int = 128,
+        linear_num_key_heads: int = 16,
+        linear_num_value_heads: int = 32,
+        layer_types: list[str] | None = None,
+        full_attention_interval: int = 4,
+        chunk_size: int = 64,
+    ):
+        super().__init__()
+        self.vocab_size = vocab_size
+        self.d_model = d_model
+        self.n_layers = n_layers
+        self.num_query_heads = num_query_heads
+        self.num_kv_heads = num_kv_heads
+        self.d_ff = d_ff
+        self.max_seq = max_seq
+        self.head_size = head_size
+        self.eps = eps
+        self.use_qkv_bias = use_qkv_bias
+
+        self.partial_rotary_factor = partial_rotary_factor
+        if mrope_section is None or len(mrope_section) < 3:
+            mrope_section = (11, 11, 10)
+        self.mrope_section = list(mrope_section)
+        self.linear_conv_kernel_dim = linear_conv_kernel_dim
+        self.linear_key_head_dim = linear_key_head_dim
+        self.linear_value_head_dim = linear_value_head_dim
+        self.linear_num_key_heads = linear_num_key_heads
+        self.linear_num_value_heads = linear_num_value_heads
+        self.full_attention_interval = full_attention_interval
+        self.chunk_size = chunk_size
+
+        # Derived
+        self.D = head_size if head_size > 0 else d_model // num_query_heads
+        self.rotary_dim = max(2, int(round(self.D * self.partial_rotary_factor)))
+        if self.rotary_dim % 2 != 0:
+            self.rotary_dim -= 1
+        self.rotary_dim = max(2, min(self.rotary_dim, self.D))
+
+        self.block_types = _parse_qwen3_5_layer_types(
+            layer_types=layer_types,
+            n_layers=n_layers,
+            full_attention_interval=full_attention_interval,
+        )
+        self.layer_types = layer_types if layer_types is not None else [
+            "linear_attention" if t == "mamba" else "full_attention" for t in self.block_types
+        ]
+        self.n_linear_blocks = sum(1 for t in self.block_types if t == "mamba")
+        self.n_attn_blocks = sum(1 for t in self.block_types if t == "attention")
+        self.has_linear_blocks = self.n_linear_blocks > 0
+        self.has_attn_blocks = self.n_attn_blocks > 0
+
+        # Use mamba_blocks / attn_blocks naming for HybridBlockStack
+        self.n_mamba_blocks = self.n_linear_blocks
+        self.n_attention_blocks = self.n_attn_blocks
+
+        # Build block configs for HybridBlockStack
+        block_configs = []
+        if self.n_linear_blocks > 0:
+            block_configs.append((
+                "mamba_blocks", Qwen3_5LinearBlock, self.n_linear_blocks,
+                dict(
+                    d_model=d_model,
+                    d_ff=d_ff,
+                    linear_conv_kernel_dim=linear_conv_kernel_dim,
+                    linear_key_head_dim=linear_key_head_dim,
+                    linear_value_head_dim=linear_value_head_dim,
+                    linear_num_key_heads=linear_num_key_heads,
+                    linear_num_value_heads=linear_num_value_heads,
+                    chunk_size=chunk_size,
+                    eps=eps,
+                ),
+            ))
+        if self.n_attn_blocks > 0:
+            block_configs.append((
+                "attn_blocks", Qwen3_5AttentionBlock, self.n_attn_blocks,
+                dict(
+                    d_model=d_model,
+                    num_query_heads=num_query_heads,
+                    num_kv_heads=num_kv_heads,
+                    head_size=head_size,
+                    d_ff=d_ff,
+                    max_seq=max_seq,
+                    eps=eps,
+                    use_qkv_bias=use_qkv_bias,
+                    partial_rotary_factor=partial_rotary_factor,
+                    mrope_section=mrope_section,
+                ),
+            ))
+
+        self.embedding = nn.Embedding(vocab_size, d_model)
+        self.hybrid_blocks = nn.HybridBlockStack(
+            block_configs=block_configs,
+            block_types=self.block_types,
+            n_layers=n_layers,
+        )
+        self.final_norm = nn.RMSNormPlus1(d_model, eps=eps)
+        self.lm_head = nn.LMHead(vocab_size, d_model)
+
     def forward(
         self,
-        token_ids: Tensor["B", "T", "int32"],
-        position_ids: Tensor[3, "B", "T", "int32"],
-        visual_pos_masks: Tensor["B", "T", "int32"],
-        visual_embeds: Tensor["B * T", "d_model"],
-        targets: Tensor["B", "T", "int32"],
-    ) -> Tensor["B * T", "fp32"]:
-        with graph() as g:
-            x0 = g.embedding(token_ids, "embedding")
-            x0 = g.mask_scatter(x0, visual_pos_masks, visual_embeds, out_name="x0")
-            residual0 = g.zeros(shape=["B", "T", "d_model"], dtype="bf16")
+        token_ids,
+        position_ids,
+        visual_pos_masks,
+        visual_embeds,
+        targets,
+    ):
+        G = ActivationScope.GLOBAL
 
-            xN, residualN = g.call(
-                "HybridStackedBlocks",
-                x0,
-                residual0,
-                position_ids,
-                num_outputs=2,
-                mamba_blocks="linear_blocks",
-                attn_blocks="attn_blocks",
-                block_types=self.block_types,
-                n_layers=self.n_layers,
-            )
+        # IO slots
+        self._register_activation("token_ids", ("B", "T"), dtype="int32", scope=G)
+        self._register_activation("position_ids", (3, "B", "T"), dtype="int32", scope=G)
+        self._register_activation("targets", ("B", "T"), dtype="int32", scope=G,
+                                  aliases=["labels"])
+        self._register_activation("visual_pos_masks", ("B", "T"), dtype="int32", scope=G,
+                                  description="Mask for visual token positions")
+        self._register_activation("visual_embeds", ("B * T", "d_model"), scope=G,
+                                  description="Visual embeddings (packed by mask)")
+        self._register_activation("freq_cis", ("max_seq", "rotary_dim // 2", 2),
+                                  dtype="fp32", scope=G, aliases=["rope_freqs"])
 
-            final_ones = g.ones(shape=["d_model"], dtype="bf16")
-            final_norm_eff = g.add("final_norm", final_ones, out_name="final_norm_eff")
-            residual_final, xF, ln_final_rstd = g.fused_residual_rmsnorm(
-                residualN,
-                xN,
-                final_norm_eff,
-                eps=self.eps,
-                res_out_name="residual_final",
-                y_name="xF",
-                rstd_name="ln_final_rstd",
-            )
+        # Global intermediate slots
+        _h = ("B", "T", "d_model")
+        self._register_activation("residual0", _h, scope=G)
+        self._register_activation("x0", _h, aliases=["encoded"], scope=G)
+        self._register_activation("xN", _h, scope=G)
+        self._register_activation("residualN", _h, scope=G)
+        self._register_activation("residual_final", _h, scope=G)
+        self._register_activation("xF", _h, aliases=["ln_final"], scope=G)
+        self._register_activation("xF_flat", ("B * T", "d_model"), scope=G)
+        self._register_activation("ln_final_rstd", ("B", "T"), dtype="fp32",
+                                  save=True, scope=G)
+        self._register_activation("loss", ("B * T",), dtype="fp32",
+                                  aliases=["losses"], scope=G)
 
-            xF_flat = g.view(xF, shape=["B * T", "d_model"], out_name="xF_flat")
-            loss = g.fused_lm_head_loss(
-                xF_flat,
-                "lm_head",
-                targets,
-                compute_accuracy=True,
-                out_name="loss",
-            )
-            return loss
+        # Embedding + visual injection
+        x = self.embedding(token_ids)
+        x = self._mask_scatter(x, visual_pos_masks, visual_embeds, name="x0")
+
+        residual = self._zeros(["B", "T", "d_model"])
+        x, residual = self.hybrid_blocks(x, residual, position_ids)
+        residual, x = self.final_norm(residual, x)
+        loss = self.lm_head(x, targets)
+        return loss

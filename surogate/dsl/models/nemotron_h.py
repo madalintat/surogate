@@ -18,12 +18,18 @@ from __future__ import annotations
 
 import math
 
-from ..tensor_type import Tensor, Array
-from ..decorators import model, forward, hf_config, Param, Activation, Gradient
-from ..graph_builder import graph
+from .. import nn
+from ..nn import NEMOTRON_MODEL_NAME_REMAP
+from ..specs import ActivationScope
 from ..hf import (
     build_mamba_mappings, build_simple_mlp_mappings, build_attn_mappings,
     stack_experts,
+)
+from ..blocks.nemotron_h import (
+    NemotronHMamba2Block,
+    NemotronHAttentionBlock,
+    NemotronHMLPBlock,
+    NemotronHMoEBlock,
 )
 
 
@@ -71,8 +77,7 @@ def to_standard_hybrid_pattern(nemotron_pattern: str) -> str:
     return nemotron_pattern.translate(_NEMOTRON_TO_STANDARD)
 
 
-@model
-@hf_config(
+@nn.hf_config(
     architecture="NemotronHForCausalLM",
     model_type="nemotron_h",
     d_model="hidden_size",
@@ -109,7 +114,7 @@ def to_standard_hybrid_pattern(nemotron_pattern: str) -> str:
     # Activation (for mlp_up_factor determination)
     mlp_activation="mlp_hidden_act",
 )
-class NemotronHModel:
+class NemotronHModel(nn.Model):
     """Nemotron-H hybrid model with interleaved Mamba2, Attention, MLP, and MoE blocks.
 
     Architecture:
@@ -124,6 +129,56 @@ class NemotronHModel:
         - - (MLP): Dense feed-forward only
         - E (MoE): Mixture of Experts
     """
+
+    _name_remap_ = NEMOTRON_MODEL_NAME_REMAP
+
+    # HuggingFace weight mappings for each block type.
+    # Composed from module-level _hf_mapping_defaults_ where possible.
+    # Note: Nemotron uses 'backbone.layers' prefix and 'mixer' submodule
+    # (not 'model.layers' / 'self_attn' / 'mlp').
+    _hf_block_mappings_ = {
+        # Common to all blocks - Nemotron uses 'norm.weight' directly
+        "norm_weight": "backbone.layers.{layer}.norm.weight",
+
+        # Mamba2 block weights (from Mamba2Mixer._hf_mapping_defaults_)
+        **build_mamba_mappings(
+            layer_prefix="backbone.layers.{layer}",
+            mamba_suffix="mixer",
+        ),
+
+        # Attention block weights (from GQAAttention._hf_mapping_defaults_)
+        **build_attn_mappings(
+            layer_prefix="backbone.layers.{layer}",
+            attn_suffix="mixer",
+        ),
+        # Nemotron attention also has output bias (beyond GQAAttention defaults)
+        "out_bias": "backbone.layers.{layer}.mixer.o_proj.bias",
+
+        # MLP block weights (from SimpleMLP._hf_mapping_defaults_)
+        **build_simple_mlp_mappings(
+            layer_prefix="backbone.layers.{layer}",
+            mlp_suffix="mixer",
+        ),
+
+        # MoE block weights (NemotronMoEBlock uses experts_up, not experts_gate_up)
+        # Nemotron MoE uses relu2 activation (no gate), so only up_proj and down_proj
+        "router_weight": "backbone.layers.{layer}.mixer.gate.weight",
+        "e_score_correction_bias": "backbone.layers.{layer}.mixer.gate.e_score_correction_bias",
+        "experts_up": stack_experts(
+            "backbone.layers.{layer}.mixer.experts.{expert}.up_proj.weight",
+        ),
+        "experts_down": stack_experts(
+            "backbone.layers.{layer}.mixer.experts.{expert}.down_proj.weight",
+        ),
+        # Shared expert (optional, present when use_shared_expert=True)
+        "shared_expert_up": "backbone.layers.{layer}.mixer.shared_experts.up_proj.weight",
+        "shared_expert_down": "backbone.layers.{layer}.mixer.shared_experts.down_proj.weight",
+
+        # Model-level weight mappings
+        "embedding": "backbone.embeddings.weight",
+        "final_norm": "backbone.norm_f.weight",
+        "lm_head": "lm_head.weight",
+    }
 
     def __init__(
         self,
@@ -167,6 +222,7 @@ class NemotronHModel:
         # Activation
         mlp_activation: str = "relu2",
     ):
+        super().__init__()
         self.vocab_size = vocab_size
         self.d_model = d_model
         self.n_layers = n_layers
@@ -240,157 +296,109 @@ class NemotronHModel:
         self.mamba_conv_dim = self.mamba_intermediate + 2 * n_groups * ssm_state_size
         self.mamba_proj_size = self.mamba_intermediate + self.mamba_conv_dim + mamba_num_heads
 
-    # Model weights
-    embedding = Param(Tensor["vocab_size", "d_model"], hf_mapping="backbone.embeddings.weight", quantizable=False)
-    final_norm = Param(Tensor["d_model"], hf_mapping="backbone.norm_f.weight", quantizable=False)
-    lm_head = Param(Tensor["vocab_size", "d_model"], hf_mapping="lm_head.weight", quantizable=False)
+        # Build block configs for HybridBlockStack
+        block_configs = []
+        if self.has_mamba_blocks:
+            block_configs.append((
+                "mamba_blocks", NemotronHMamba2Block, self.n_mamba_blocks,
+                dict(
+                    d_model=d_model,
+                    mamba_num_heads=mamba_num_heads,
+                    mamba_head_dim=mamba_head_dim,
+                    ssm_state_size=ssm_state_size,
+                    n_groups=n_groups,
+                    conv_kernel=conv_kernel,
+                    chunk_size=chunk_size,
+                    eps=eps,
+                    dt_min=time_step_min,
+                    dt_max=time_step_max,
+                    time_step_limit=time_step_limit,
+                    use_conv_bias=use_conv_bias,
+                    use_bias=use_mamba_bias,
+                ),
+            ))
+        if self.has_attn_blocks:
+            block_configs.append((
+                "attn_blocks", NemotronHAttentionBlock, self.n_attn_blocks,
+                dict(
+                    d_model=d_model,
+                    num_query_heads=num_query_heads,
+                    num_kv_heads=num_kv_heads,
+                    head_dim=head_dim,
+                    max_seq=max_seq,
+                    eps=eps,
+                    attention_bias=attention_bias,
+                    use_rope=use_rope,
+                ),
+            ))
+        if self.has_mlp_blocks:
+            block_configs.append((
+                "mlp_blocks", NemotronHMLPBlock, self.n_mlp_blocks,
+                dict(
+                    d_model=d_model,
+                    d_ff=d_ff,
+                    eps=eps,
+                    activation=mlp_activation,
+                    mlp_bias=mlp_bias,
+                ),
+            ))
+        if self.has_moe_blocks:
+            block_configs.append((
+                "moe_blocks", NemotronHMoEBlock, self.n_moe_blocks,
+                dict(
+                    d_model=d_model,
+                    moe_intermediate_size=moe_intermediate_size,
+                    num_experts=num_experts,
+                    num_experts_per_tok=num_experts_per_tok,
+                    shared_expert_intermediate_size=shared_expert_intermediate_size,
+                    eps=eps,
+                    mlp_bias=mlp_bias,
+                    activation=mlp_activation,
+                    routed_scaling_factor=routed_scaling_factor,
+                ),
+            ))
 
-    # Block arrays - using specialized block types based on pattern
-    # The runtime will handle dispatching to correct block based on layer index
-    # Each array is conditional on having at least one block of that type
-    mamba_blocks = Param(Array["n_mamba_blocks", "NemotronHMamba2Block"], when="has_mamba_blocks")
-    attn_blocks = Param(Array["n_attn_blocks", "NemotronHAttentionBlock"], when="has_attn_blocks")
-    mlp_blocks = Param(Array["n_mlp_blocks", "NemotronHMLPBlock"], when="has_mlp_blocks")
-    moe_blocks = Param(Array["n_moe_blocks", "NemotronHMoEBlock"], when="has_moe_blocks")
+        self.embedding = nn.Embedding(vocab_size, d_model)
+        self.hybrid_blocks = nn.HybridBlockStack(
+            block_configs=block_configs,
+            block_types=self.block_types,
+            n_layers=n_layers,
+        )
+        self.final_norm = nn.RMSNorm(d_model, eps=eps)
+        self.lm_head = nn.LMHead(vocab_size, d_model)
 
-    # =========================================================================
-    # IO slots
-    # =========================================================================
+    def forward(self, token_ids, position_ids, targets):
+        G = ActivationScope.GLOBAL
 
-    token_ids = Activation(Tensor["B", "T"], dtype="int32", scope="global",
-                           description="Input token IDs")
-    position_ids = Activation(Tensor["T"], dtype="int32", scope="global",
-                              description="Position IDs for RoPE")
-    targets = Activation(Tensor["B", "T"], dtype="int32", scope="global",
-                         aliases=["labels"], description="Target labels for loss")
+        # IO slots
+        self._register_activation("token_ids", ("B", "T"), dtype="int32", scope=G)
+        self._register_activation("position_ids", ("T",), dtype="int32", scope=G)
+        self._register_activation("targets", ("B", "T"), dtype="int32", scope=G,
+                                  aliases=["labels"])
+        if self.use_rope:
+            self._register_activation("freq_cis", ("max_seq", "D", 2), dtype="fp32",
+                                      scope=G, aliases=["rope_freqs"])
 
-    # Precomputed constants (for attention blocks that use RoPE)
-    freq_cis = Activation(Tensor["max_seq", "D", 2], dtype="fp32", scope="global",
-                          aliases=["rope_freqs"], description="Precomputed RoPE frequencies",
-                          when="use_rope")
+        # Global intermediate slots
+        _h = ("B", "T", "d_model")
+        self._register_activation("residual0", _h, scope=G)
+        self._register_activation("x0", _h, aliases=["encoded"], scope=G)
+        self._register_activation("xN", _h, scope=G)
+        self._register_activation("residualN", _h, scope=G)
+        self._register_activation("residual_final", _h, scope=G)
+        self._register_activation("xF", _h, aliases=["ln_final"], scope=G)
+        self._register_activation("xF_flat", ("B * T", "d_model"), scope=G)
+        self._register_activation("ln_final_rstd", ("B", "T"), dtype="fp32",
+                                  save=True, scope=G)
+        self._register_activation("loss", ("B * T",), dtype="fp32",
+                                  aliases=["losses"], scope=G)
 
-    # =========================================================================
-    # Global activation slots
-    # =========================================================================
-
-    x0 = Activation(Tensor["B", "T", "d_model"], aliases=["encoded"], scope="global",
-                    description="Embedded input")
-    residual0 = Activation(Tensor["B", "T", "d_model"], scope="global",
-                           description="Initial residual stream (zeros)")
-
-    xN = Activation(Tensor["B", "T", "d_model"], scope="global",
-                    description="Output from stacked blocks")
-    residualN = Activation(Tensor["B", "T", "d_model"], scope="global",
-                           description="Residual after stacked blocks")
-
-    residual_final = Activation(Tensor["B", "T", "d_model"], scope="global",
-                                description="Final residual (before norm)")
-    xF = Activation(Tensor["B", "T", "d_model"], aliases=["ln_final"],
-                    scope="global", description="After final layer norm")
-    xF_flat = Activation(Tensor["B * T", "d_model"], scope="global",
-                         description="Flattened for LM head")
-    ln_final_rstd = Activation(Tensor["B", "T"], dtype="fp32", save=True,
-                               scope="global", description="Final LN rstd")
-
-    loss = Activation(Tensor["B * T"], dtype="fp32", scope="global",
-                      aliases=["losses"], description="Cross-entropy loss per token")
-
-    # =========================================================================
-    # Global gradient slots
-    # =========================================================================
-
-    d_loss = Gradient(Tensor["B * T"], dtype="fp32", gradient_of="loss", scope="global",
-                      description="Gradient seed for backward pass")
-    d_xF = Gradient(Tensor["B", "T", "d_model"], gradient_of="xF", scope="global")
-    d_xN = Gradient(Tensor["B", "T", "d_model"], gradient_of="xN", scope="global")
-    d_residualN = Gradient(Tensor["B", "T", "d_model"], gradient_of="residualN", scope="global")
-    d_x0 = Gradient(Tensor["B", "T", "d_model"], gradient_of="x0", scope="global")
-
-    # HuggingFace weight mappings for each block type.
-    # Composed from module-level _hf_mapping_defaults_ where possible.
-    # Note: Nemotron uses 'backbone.layers' prefix and 'mixer' submodule
-    # (not 'model.layers' / 'self_attn' / 'mlp').
-    _hf_block_mappings_ = {
-        # Common to all blocks - Nemotron uses 'norm.weight' directly
-        "norm_weight": "backbone.layers.{layer}.norm.weight",
-
-        # Mamba2 block weights (from Mamba2Mixer._hf_mapping_defaults_)
-        **build_mamba_mappings(
-            layer_prefix="backbone.layers.{layer}",
-            mamba_suffix="mixer",
-        ),
-
-        # Attention block weights (from GQAAttention._hf_mapping_defaults_)
-        **build_attn_mappings(
-            layer_prefix="backbone.layers.{layer}",
-            attn_suffix="mixer",
-        ),
-        # Nemotron attention also has output bias (beyond GQAAttention defaults)
-        "out_bias": "backbone.layers.{layer}.mixer.o_proj.bias",
-
-        # MLP block weights (from SimpleMLP._hf_mapping_defaults_)
-        **build_simple_mlp_mappings(
-            layer_prefix="backbone.layers.{layer}",
-            mlp_suffix="mixer",
-        ),
-
-        # MoE block weights (NemotronMoEBlock uses experts_up, not experts_gate_up)
-        # Nemotron MoE uses relu2 activation (no gate), so only up_proj and down_proj
-        "router_weight": "backbone.layers.{layer}.mixer.gate.weight",
-        "e_score_correction_bias": "backbone.layers.{layer}.mixer.gate.e_score_correction_bias",
-        "experts_up": stack_experts(
-            "backbone.layers.{layer}.mixer.experts.{expert}.up_proj.weight",
-        ),
-        "experts_down": stack_experts(
-            "backbone.layers.{layer}.mixer.experts.{expert}.down_proj.weight",
-        ),
-        # Shared expert (optional, present when use_shared_expert=True)
-        "shared_expert_up": "backbone.layers.{layer}.mixer.shared_experts.up_proj.weight",
-        "shared_expert_down": "backbone.layers.{layer}.mixer.shared_experts.down_proj.weight",
-    }
-
-    @forward
-    def forward(
-        self,
-        token_ids: Tensor["B", "T", "int32"],
-        position_ids: Tensor["T", "int32"],
-        targets: Tensor["B", "T", "int32"],
-    ) -> Tensor["B * T", "fp32"]:
-        with graph() as g:
-            # Embedding
-            x0 = g.embedding(token_ids, "embedding")
-            residual0 = g.zeros(shape=["B", "T", "d_model"], dtype="bf16")
-
-            # Stacked hybrid blocks
-            # The runtime handles dispatching to correct block type based on layer
-            xN, residualN = g.call(
-                "HybridStackedBlocks",
-                x0,
-                residual0,
-                position_ids,
-                num_outputs=2,
-                mamba_blocks="mamba_blocks",
-                attn_blocks="attn_blocks",
-                mlp_blocks="mlp_blocks",
-                moe_blocks="moe_blocks",
-                block_types=self.block_types,
-                n_layers=self.n_layers,
-            )
-
-            # Final norm
-            residual_final, xF, ln_final_rstd = g.fused_residual_rmsnorm(
-                residualN, xN, "final_norm", eps=self.eps,
-                res_out_name="residual_final",
-                y_name="xF",
-                rstd_name="ln_final_rstd",
-            )
-
-            # Fused LM head + loss
-            xF_flat = g.view(xF, shape=["B * T", "d_model"], out_name="xF_flat")
-            loss = g.fused_lm_head_loss(xF_flat, "lm_head", targets,
-                                        compute_accuracy=True, out_name="loss")
-
-            return loss
+        x = self.embedding(token_ids)
+        residual = self._zeros(["B", "T", "d_model"])
+        x, residual = self.hybrid_blocks(x, residual, position_ids)
+        residual, x = self.final_norm(residual, x)
+        loss = self.lm_head(x, targets)
+        return loss
 
 
 # Convenience function to create model from HuggingFace config

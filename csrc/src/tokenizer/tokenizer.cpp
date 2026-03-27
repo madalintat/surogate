@@ -521,6 +521,33 @@ Tokenizer Tokenizer::from_pretrained(const std::string& model_dir) {
         }
     }
 
+    // Base models often ship without a chat_template field.
+    // Templates below are verified against llama.cpp's llm_chat_apply_template().
+    if (!impl.chat_tmpl_root && !architecture.empty()) {
+        std::string fallback_tmpl;
+
+        if (architecture == "llama" || architecture == "smollm" || architecture == "smollm3") {
+            fallback_tmpl =
+                "{% for message in messages %}"
+                "<|start_header_id|>{{ message['role'] }}<|end_header_id|>\n\n"
+                "{{ message['content'] | trim }}<|eot_id|>"
+                "{% endfor %}"
+                "{% if add_generation_prompt %}"
+                "<|start_header_id|>assistant<|end_header_id|>\n\n"
+                "{% endif %}";
+        }
+
+        if (!fallback_tmpl.empty()) {
+            impl.chat_tmpl_root = minja::Parser::parse(fallback_tmpl, {
+                /* .trim_blocks = */ true,
+                /* .lstrip_blocks = */ true,
+                /* .keep_trailing_newline = */ false,
+            });
+            impl.bos_token_str = impl.named_special_tokens.count("bos_token") ? impl.named_special_tokens["bos_token"] : "";
+            impl.eos_token_str = impl.named_special_tokens.count("eos_token") ? impl.named_special_tokens["eos_token"] : "";
+        }
+    }
+
     // Build fast lookup table
     impl.build_lookup();
 

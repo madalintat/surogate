@@ -7,13 +7,13 @@ gradient_accumulation_steps: 4
 sample_packing: true
 sequence_len: 512
 
-max_steps: 50
-
+max_steps: 100
+eval_steps: 25
 learning_rate: 2e-4
+warmup_ratio: 0.1
 
 recipe: fp8-hybrid
 lmhead_chunks: 8
-warmup_ratio: 0.1
 
 lora: true
 lora_rank: 16
