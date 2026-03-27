@@ -5,6 +5,7 @@
 
 #include "runtime/dsl/dsl_grad_store.h"
 
+#include <cstdint>
 #include <stdexcept>
 #include <unordered_set>
 
@@ -85,6 +86,9 @@ DslGradStore::DslGradStore(const DslParamStore& params,
     }
     std::sort(mParamOrder.begin(), mParamOrder.end());
 
+    // Build bulk zero segments so zero_all() uses a single kernel launch
+    build_zero_segments();
+
     // Initialize double-buffer block states
     mBlockStates[0] = {-1, false, nullptr};
     mBlockStates[1] = {-1, false, nullptr};
@@ -161,6 +165,51 @@ void DslGradStore::build_layer_grad_map() {
     }
 }
 
+void DslGradStore::build_zero_segments() {
+    mZeroPtrs = {};
+    mZeroSizes = {};
+    mZeroCount = 0;
+
+    if (!mAllocator || mGrads.empty()) {
+        return;
+    }
+
+    std::vector<std::uint64_t> ptrs;
+    std::vector<std::uint64_t> sizes;
+    ptrs.reserve(mGrads.size());
+    sizes.reserve(mGrads.size());
+
+    // Deduplicate: tied embeddings share the same tensor
+    std::unordered_set<std::byte*> seen;
+    seen.reserve(mGrads.size());
+
+    for (const auto& kv : mGrads) {
+        const Tensor& t = kv.second;
+        if (!t.Data) continue;
+        const std::size_t bytes = static_cast<std::size_t>(t.bytes());
+        if (bytes == 0) continue;
+        if (!seen.insert(t.Data).second) continue;  // skip duplicate (tied weights)
+        ptrs.push_back(static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(t.Data)));
+        sizes.push_back(static_cast<std::uint64_t>(bytes));
+    }
+
+    mZeroCount = static_cast<int>(ptrs.size());
+    if (mZeroCount <= 0) {
+        return;
+    }
+
+    const long bytes = static_cast<long>(static_cast<std::size_t>(mZeroCount) * sizeof(std::uint64_t));
+    mZeroPtrs = mAllocator->allocate(ETensorDType::BYTE, "grad_zero_ptrs",
+                                     EAllocationType::ON_DEVICE, {bytes});
+    mZeroSizes = mAllocator->allocate(ETensorDType::BYTE, "grad_zero_sizes",
+                                      EAllocationType::ON_DEVICE, {bytes});
+
+    CUDA_CHECK(cudaMemcpy(mZeroPtrs.Data, ptrs.data(),
+                          static_cast<std::size_t>(bytes), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(mZeroSizes.Data, sizes.data(),
+                          static_cast<std::size_t>(bytes), cudaMemcpyHostToDevice));
+}
+
 void DslGradStore::create_layer_events(int num_layers) {
     destroy_layer_events();
     mLayerReduceEvents.resize(static_cast<std::size_t>(num_layers), nullptr);
@@ -227,8 +276,10 @@ Tensor* DslGradStore::get_param_grad(const std::string& name, bool& accumulate) 
 }
 
 void DslGradStore::zero_all(cudaStream_t stream) {
-    for (auto& kv : mGrads) {
-        fill_zero(kv.second, stream);
+    if (mZeroCount > 0 && mZeroPtrs.Data && mZeroSizes.Data) {
+        zero_device_segments(reinterpret_cast<const std::uint64_t*>(mZeroPtrs.Data),
+                             reinterpret_cast<const std::uint64_t*>(mZeroSizes.Data),
+                             mZeroCount, stream);
     }
 }
 

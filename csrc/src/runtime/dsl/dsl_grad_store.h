@@ -101,6 +101,7 @@ public:
 
 private:
     void build_layer_grad_map();
+    void build_zero_segments();
     void scatter_reduce_layer(int layer_idx, cudaStream_t stream, NCCLCommunicator& comm);
     void create_layer_events(int num_layers);
     void destroy_layer_events() noexcept;
@@ -126,6 +127,11 @@ private:
     std::vector<std::vector<std::string>> mLayerGradNames;  ///< Gradient names per layer
     std::vector<cudaEvent_t> mLayerReduceEvents;            ///< One event per layer
     bool mHasLayerGrads = false;  ///< True if we have any layer gradients (false for LoRA-only)
+
+    // Bulk gradient zeroing (single kernel launch instead of per-param memsets)
+    Tensor mZeroPtrs;    ///< Device array of gradient data pointers (uint64_t)
+    Tensor mZeroSizes;   ///< Device array of gradient byte sizes (uint64_t)
+    int mZeroCount = 0;  ///< Number of segments
 
     // ZeRO-2 double-buffering state (for deferred accumulation)
     struct BlockState {
