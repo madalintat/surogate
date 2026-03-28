@@ -967,6 +967,10 @@ bool DslModel::internal_graphs_enabled() const {
     return mExecutor ? mExecutor->internal_graphs_enabled() : false;
 }
 
+bool DslModel::has_capture_unsafe_ops() const {
+    return mExecutor ? mExecutor->has_capture_unsafe_ops() : false;
+}
+
 std::vector<float> DslModel::compute_logprobs(const std::int32_t* input_ids,
                                                const std::int32_t* targets,
                                                int B, int T, bool use_lora,

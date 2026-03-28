@@ -120,6 +120,7 @@ public:
     void zero_grads(cudaStream_t stream);
     void set_internal_graphs_enabled(bool enabled);
     [[nodiscard]] bool internal_graphs_enabled() const;
+    [[nodiscard]] bool has_capture_unsafe_ops() const;
 
     ITensorContainer& weights() override;
     ITensorContainer& opt_momentum() override;

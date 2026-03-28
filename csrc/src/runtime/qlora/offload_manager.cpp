@@ -18,6 +18,24 @@ namespace qlora {
 
 namespace {
 
+bool is_device_pointer(const std::byte* ptr) {
+    if (!ptr) {
+        return false;
+    }
+    cudaPointerAttributes attrs{};
+    const cudaError_t st = cudaPointerGetAttributes(&attrs, ptr);
+    if (st != cudaSuccess) {
+        // Pageable host memory often returns invalid-value here; treat as host.
+        (void)cudaGetLastError();
+        return false;
+    }
+#if CUDART_VERSION >= 10000
+    return attrs.type == cudaMemoryTypeDevice;
+#else
+    return attrs.memoryType == cudaMemoryTypeDevice;
+#endif
+}
+
 /// Concrete implementation of the OffloadManager interface.
 ///
 /// Manages groups of QuantizedTensors, supporting:
@@ -48,6 +66,7 @@ public:
         // Free GPU shadow buffers for all groups
         for (auto& [gid, group] : mGroups) {
             free_gpu_buffers(group);
+            free_owned_host_buffers(group);
         }
     }
 
@@ -71,6 +90,17 @@ public:
         entry.cpu_scales_bytes = tensor->scales.is_null() ? 0 : tensor->scales.bytes();
         entry.cpu_meta_bytes = tensor->meta.is_null() ? 0 : tensor->meta.bytes();
         entry.cpu_meta2_bytes = tensor->meta2.is_null() ? 0 : tensor->meta2.bytes();
+        entry.cpu_data = tensor->data.Data;
+        entry.cpu_scales = tensor->scales.Data;
+        entry.cpu_meta = tensor->meta.Data;
+        entry.cpu_meta2 = tensor->meta2.Data;
+
+        // Offload path requires a stable host copy. If the source tensor is
+        // device-backed (e.g. external import), stage one host copy now and
+        // keep it as canonical CPU storage for future load/unload cycles.
+        if (mConfig.max_resident_groups > 0) {
+            ensure_host_backing(*tensor, entry);
+        }
 
         group.total_bytes += entry.cpu_data_bytes + entry.cpu_scales_bytes
                            + entry.cpu_meta_bytes + entry.cpu_meta2_bytes;
@@ -298,6 +328,12 @@ private:
         std::byte* gpu_scales = nullptr;
         std::byte* gpu_meta = nullptr;
         std::byte* gpu_meta2 = nullptr;
+
+        // Host buffers allocated/staged by OffloadManager itself.
+        bool owns_cpu_data = false;
+        bool owns_cpu_scales = false;
+        bool owns_cpu_meta = false;
+        bool owns_cpu_meta2 = false;
     };
 
     /// Per-group tracking.
@@ -359,11 +395,13 @@ private:
         for (auto& entry : group.entries) {
             if (!entry.tensor) continue;
 
-            // Save current (CPU) pointers
-            entry.cpu_data = entry.tensor->data.Data;
-            entry.cpu_scales = entry.tensor->scales.Data;
-            entry.cpu_meta = entry.tensor->meta.Data;
-            entry.cpu_meta2 = entry.tensor->meta2.Data;
+            // Canonical CPU pointers are established at registration (and staged
+            // if needed). Do not overwrite them here from potentially transient
+            // device pointers.
+            if (!entry.cpu_data) entry.cpu_data = entry.tensor->data.Data;
+            if (!entry.cpu_scales) entry.cpu_scales = entry.tensor->scales.Data;
+            if (!entry.cpu_meta) entry.cpu_meta = entry.tensor->meta.Data;
+            if (!entry.cpu_meta2) entry.cpu_meta2 = entry.tensor->meta2.Data;
 
             // Allocate GPU buffers
             if (entry.cpu_data_bytes > 0) {
@@ -399,28 +437,28 @@ private:
             if (entry.gpu_data && entry.cpu_data && entry.cpu_data_bytes > 0) {
                 CUDA_CHECK(cudaMemcpyAsync(entry.gpu_data, entry.cpu_data,
                                             entry.cpu_data_bytes,
-                                            cudaMemcpyHostToDevice, stream));
+                                            cudaMemcpyDefault, stream));
                 entry.tensor->data.Data = entry.gpu_data;
                 entry.tensor->data.Device = mConfig.device_id;
             }
             if (entry.gpu_scales && entry.cpu_scales && entry.cpu_scales_bytes > 0) {
                 CUDA_CHECK(cudaMemcpyAsync(entry.gpu_scales, entry.cpu_scales,
                                             entry.cpu_scales_bytes,
-                                            cudaMemcpyHostToDevice, stream));
+                                            cudaMemcpyDefault, stream));
                 entry.tensor->scales.Data = entry.gpu_scales;
                 entry.tensor->scales.Device = mConfig.device_id;
             }
             if (entry.gpu_meta && entry.cpu_meta && entry.cpu_meta_bytes > 0) {
                 CUDA_CHECK(cudaMemcpyAsync(entry.gpu_meta, entry.cpu_meta,
                                             entry.cpu_meta_bytes,
-                                            cudaMemcpyHostToDevice, stream));
+                                            cudaMemcpyDefault, stream));
                 entry.tensor->meta.Data = entry.gpu_meta;
                 entry.tensor->meta.Device = mConfig.device_id;
             }
             if (entry.gpu_meta2 && entry.cpu_meta2 && entry.cpu_meta2_bytes > 0) {
                 CUDA_CHECK(cudaMemcpyAsync(entry.gpu_meta2, entry.cpu_meta2,
                                             entry.cpu_meta2_bytes,
-                                            cudaMemcpyHostToDevice, stream));
+                                            cudaMemcpyDefault, stream));
                 entry.tensor->meta2.Data = entry.gpu_meta2;
                 entry.tensor->meta2.Device = mConfig.device_id;
             }
@@ -435,30 +473,102 @@ private:
             if (entry.gpu_data && entry.cpu_data && entry.cpu_data_bytes > 0) {
                 CUDA_CHECK(cudaMemcpyAsync(entry.cpu_data, entry.gpu_data,
                                             entry.cpu_data_bytes,
-                                            cudaMemcpyDeviceToHost, stream));
+                                            cudaMemcpyDefault, stream));
                 entry.tensor->data.Data = entry.cpu_data;
                 entry.tensor->data.Device = -1;
             }
             if (entry.gpu_scales && entry.cpu_scales && entry.cpu_scales_bytes > 0) {
                 CUDA_CHECK(cudaMemcpyAsync(entry.cpu_scales, entry.gpu_scales,
                                             entry.cpu_scales_bytes,
-                                            cudaMemcpyDeviceToHost, stream));
+                                            cudaMemcpyDefault, stream));
                 entry.tensor->scales.Data = entry.cpu_scales;
                 entry.tensor->scales.Device = -1;
             }
             if (entry.gpu_meta && entry.cpu_meta && entry.cpu_meta_bytes > 0) {
                 CUDA_CHECK(cudaMemcpyAsync(entry.cpu_meta, entry.gpu_meta,
                                             entry.cpu_meta_bytes,
-                                            cudaMemcpyDeviceToHost, stream));
+                                            cudaMemcpyDefault, stream));
                 entry.tensor->meta.Data = entry.cpu_meta;
                 entry.tensor->meta.Device = -1;
             }
             if (entry.gpu_meta2 && entry.cpu_meta2 && entry.cpu_meta2_bytes > 0) {
                 CUDA_CHECK(cudaMemcpyAsync(entry.cpu_meta2, entry.gpu_meta2,
                                             entry.cpu_meta2_bytes,
-                                            cudaMemcpyDeviceToHost, stream));
+                                            cudaMemcpyDefault, stream));
                 entry.tensor->meta2.Data = entry.cpu_meta2;
                 entry.tensor->meta2.Device = -1;
+            }
+        }
+    }
+
+    std::byte* alloc_host_buffer(size_t bytes) {
+        if (bytes == 0) {
+            return nullptr;
+        }
+        if (mConfig.use_pinned_memory) {
+            void* ptr = nullptr;
+            CUDA_CHECK(cudaMallocHost(&ptr, bytes));
+            return static_cast<std::byte*>(ptr);
+        }
+        return new std::byte[bytes];
+    }
+
+    void free_host_buffer(std::byte* ptr) noexcept {
+        if (!ptr) return;
+        if (mConfig.use_pinned_memory) {
+            cudaFreeHost(ptr);
+        } else {
+            delete[] ptr;
+        }
+    }
+
+    void maybe_stage_one_component(std::byte*& cpu_ptr,
+                                   size_t bytes,
+                                   bool& owns_cpu_ptr,
+                                   Tensor& field) {
+        if (!cpu_ptr || bytes == 0 || !is_device_pointer(cpu_ptr)) {
+            return;
+        }
+        std::byte* host_ptr = alloc_host_buffer(bytes);
+        CUDA_CHECK(cudaMemcpy(host_ptr, cpu_ptr, bytes, cudaMemcpyDeviceToHost));
+        cpu_ptr = host_ptr;
+        owns_cpu_ptr = true;
+        field.Data = host_ptr;
+        field.Device = -1;
+    }
+
+    void ensure_host_backing(QuantizedTensor& tensor, TensorEntry& entry) {
+        maybe_stage_one_component(entry.cpu_data, entry.cpu_data_bytes,
+                                  entry.owns_cpu_data, tensor.data);
+        maybe_stage_one_component(entry.cpu_scales, entry.cpu_scales_bytes,
+                                  entry.owns_cpu_scales, tensor.scales);
+        maybe_stage_one_component(entry.cpu_meta, entry.cpu_meta_bytes,
+                                  entry.owns_cpu_meta, tensor.meta);
+        maybe_stage_one_component(entry.cpu_meta2, entry.cpu_meta2_bytes,
+                                  entry.owns_cpu_meta2, tensor.meta2);
+    }
+
+    void free_owned_host_buffers(Group& group) noexcept {
+        for (auto& entry : group.entries) {
+            if (entry.owns_cpu_data) {
+                free_host_buffer(entry.cpu_data);
+                entry.cpu_data = nullptr;
+                entry.owns_cpu_data = false;
+            }
+            if (entry.owns_cpu_scales) {
+                free_host_buffer(entry.cpu_scales);
+                entry.cpu_scales = nullptr;
+                entry.owns_cpu_scales = false;
+            }
+            if (entry.owns_cpu_meta) {
+                free_host_buffer(entry.cpu_meta);
+                entry.cpu_meta = nullptr;
+                entry.owns_cpu_meta = false;
+            }
+            if (entry.owns_cpu_meta2) {
+                free_host_buffer(entry.cpu_meta2);
+                entry.cpu_meta2 = nullptr;
+                entry.owns_cpu_meta2 = false;
             }
         }
     }

@@ -634,10 +634,15 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
                 f"Expert Parallelism distributes MoE experts across GPUs."
             )
 
-        # Get num_experts from model config
+        # Get num_experts from model config.
+        # Nemotron-H exposes this as n_routed_experts instead of num_experts.
         from surogate.core.model.hf_config import HfConfigFactory
         config = self.model_info.config
-        num_experts = HfConfigFactory.get_config_attr(config, 'num_experts') or 0
+        num_experts = (
+            HfConfigFactory.get_config_attr(config, 'num_experts')
+            or HfConfigFactory.get_config_attr(config, 'n_routed_experts')
+            or 0
+        )
         if num_experts > 0 and num_experts % self.ep_size != 0:
             raise ValueError(
                 f"num_experts ({num_experts}) must be divisible by ep_size ({self.ep_size}). "
@@ -860,7 +865,11 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
         if self.qlora_config is not None and self.model_info.is_moe_model:
             from surogate.core.model.hf_config import HfConfigFactory
             config = self.model_info.config
-            num_experts = HfConfigFactory.get_config_attr(config, 'num_experts') or 0
+            num_experts = (
+                HfConfigFactory.get_config_attr(config, 'num_experts')
+                or HfConfigFactory.get_config_attr(config, 'n_routed_experts')
+                or 0
+            )
             num_experts_per_tok = HfConfigFactory.get_config_attr(config, 'num_experts_per_tok') or 8
             moe_intermediate_size = HfConfigFactory.get_config_attr(config, 'moe_intermediate_size') or 0
             if num_experts > 0:
@@ -873,7 +882,11 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
         if self.model_info.is_moe_model:
             from surogate.core.model.hf_config import HfConfigFactory
             config = self.model_info.config
-            self.moe_num_experts = HfConfigFactory.get_config_attr(config, 'num_experts') or 0
+            self.moe_num_experts = (
+                HfConfigFactory.get_config_attr(config, 'num_experts')
+                or HfConfigFactory.get_config_attr(config, 'n_routed_experts')
+                or 0
+            )
             self.moe_num_experts_per_tok = HfConfigFactory.get_config_attr(config, 'num_experts_per_tok') or 1
         else:
             self.moe_num_experts = 0

@@ -102,6 +102,11 @@ public:
     virtual void set_internal_graphs_enabled(bool enabled) { (void)enabled; }
     virtual bool internal_graphs_enabled() const { return false; }
 
+    /// Whether the compiled graph contains ops that are not CUDA-graph-capture-safe
+    /// (e.g. JIT Triton kernels in ChunkGatedDeltaRule / Qwen3_5Decay).
+    /// When true, full-step graph capture must be skipped.
+    virtual bool has_capture_unsafe_ops() const { return false; }
+
     // Optional LoRA state wiring (no-op for implementations that don't support it).
     virtual void set_lora_state(const modules::ModularLoRAConfig*,
                                 modules::ModularLoRAWeightsManager*,
@@ -167,6 +172,7 @@ public:
     void set_rng_state(const std::vector<std::byte>& state);
     void set_internal_graphs_enabled(bool enabled) override;
     bool internal_graphs_enabled() const override;
+    bool has_capture_unsafe_ops() const override;
 
     size_t saved_buffers_total_bytes() const override;
     int saved_buffers_count() const override;

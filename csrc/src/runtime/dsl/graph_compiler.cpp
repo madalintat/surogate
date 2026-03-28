@@ -48,6 +48,43 @@ std::string strip_ssa_suffix(const std::string& field) {
 
 namespace {
 
+inline bool is_capture_unsafe_op_type(CompiledOpType type) {
+    switch (type) {
+        // Qwen3.5 / Triton JIT kernels
+        case CompiledOpType::ChunkGatedDeltaRule:
+        case CompiledOpType::ChunkGatedDeltaRuleBackward:
+        case CompiledOpType::Qwen3_5Decay:
+        case CompiledOpType::Qwen3_5DecayBackward:
+        // MoE routing / grouped GEMM rely on per-step host metadata and dynamic routing.
+        case CompiledOpType::MoESoftmax:
+        case CompiledOpType::MoESigmoid:
+        case CompiledOpType::MoETopK:
+        case CompiledOpType::MoEPermute:
+        case CompiledOpType::MoEGroupedGemm:
+        case CompiledOpType::MoEGroupedGemmGateUp:
+        case CompiledOpType::MoEGroupedGemmDown:
+        case CompiledOpType::MoEUnpermute:
+        case CompiledOpType::MoEExpertBiasAdd:
+        case CompiledOpType::MoESoftmaxBackward:
+        case CompiledOpType::MoESigmoidBackward:
+        case CompiledOpType::MoETopKBackward:
+        case CompiledOpType::MoEPermuteBackward:
+        case CompiledOpType::MoEGroupedGemmBackward:
+        case CompiledOpType::MoEGroupedGemmGateUpBackward:
+        case CompiledOpType::MoEGroupedGemmDownBackward:
+        case CompiledOpType::MoEUnpermuteBackward:
+        case CompiledOpType::MoEExpertBiasAddBackward:
+        // EP ops perform per-step host-side split/reorder bookkeeping.
+        case CompiledOpType::EpDispatch:
+        case CompiledOpType::EpCombine:
+        case CompiledOpType::EpDispatchBackward:
+        case CompiledOpType::EpCombineBackward:
+            return true;
+        default:
+            return false;
+    }
+}
+
 bool infer_known_tensor_shape(std::string_view name,
                               const modules::ModelConfig& config,
                               long B,
@@ -1193,14 +1230,11 @@ void CompiledGraph::compute_layer_segments() {
             const auto ty = ops[i].type;
             // Graph-breaking ops: must run eagerly because they are
             // capture-unsafe (dynamic cu_seqlens, JIT kernel loading,
-            // cuBLAS host-sync calls, etc.)
+            // MoE/EP per-step host bookkeeping, etc.)
             const bool graph_breaking =
                 ty == CompiledOpType::FlashAttention ||
                 ty == CompiledOpType::FlashAttentionBackward ||
-                ty == CompiledOpType::ChunkGatedDeltaRule ||
-                ty == CompiledOpType::ChunkGatedDeltaRuleBackward ||
-                ty == CompiledOpType::Qwen3_5Decay ||
-                ty == CompiledOpType::Qwen3_5DecayBackward;
+                is_capture_unsafe_op_type(ty);
 
             // Check if this op starts an MLP tile group
             auto tile_it = mlp_tile_starts.find(i);

@@ -96,21 +96,22 @@ void CompiledExecutor::dispatch_mamba_ssm_scan(const CompiledOp& op) {
         return prod == expected_nelem;
     };
 
-    Tensor* out_ptr = nullptr;
+    Tensor out_btd;
+    bool out_is_ref = false;
     if (shape_matches(op.outputs[0], expected)) {
         Tensor& out_ref = ensure_output_tensor(op.outputs[0]);
         if (out_ref.nelem() == expected) {
-            out_ptr = &out_ref;
+            out_btd = out_ref;
+            out_is_ref = true;
         }
     }
-    if (!out_ptr) {
-        Tensor out_btd = mRunState.temp_alloc(out.DType, {B, T, D});
+    if (!out_is_ref) {
+        out_btd = mRunState.temp_alloc(out.DType, {B, T, D});
         mTemps.push_back(out_btd);
-        out_ptr = &mTemps.back();
     }
 
-    mamba_transpose_bdt_to_btd(*out_ptr, out, B, T, D, mRunState.MainStream);
-    store_tensor(op.outputs[0], *out_ptr);
+    mamba_transpose_bdt_to_btd(out_btd, out, B, T, D, mRunState.MainStream);
+    store_tensor(op.outputs[0], out_btd);
 
     // Optionally save ssm_state for backward
     if (op.outputs.size() > 1) {

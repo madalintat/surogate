@@ -36,12 +36,6 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_down(const CompiledOp& op) {
         top_k = 1;
     }
 
-    int num_experts = static_cast<int>(mConfig.NumLocalExperts);
-    const int hidden_size = static_cast<int>(mConfig.HiddenSize);
-    // Use MoeIntermediateSize for MoE models (may differ from IntermediateSize)
-    const int intermediate_size = (mConfig.MoeIntermediateSize > 0)
-        ? static_cast<int>(mConfig.MoeIntermediateSize)
-        : static_cast<int>(mConfig.IntermediateSize);
     int layer_idx_any = op.attrs.layer_idx;
     if (layer_idx_any < 0 && !op.inputs.empty()) {
         std::string_view name = op.inputs[0].name;
@@ -51,6 +45,22 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_down(const CompiledOp& op) {
         std::string field;
         parse_block_param(name, layer_idx_any, field);
     }
+
+    // For EP, derive num_experts from the forward-cached offsets.
+    // LLEP may change num_merged per layer.
+    int num_experts_for_offsets = static_cast<int>(mConfig.NumLocalExperts);
+    if (mOptions.EPSize > 1 && layer_idx_any >= 0) {
+        auto ci = mMoEHostOffsetsCache.find(layer_idx_any);
+        if (ci != mMoEHostOffsetsCache.end() && ci->second.size() > 1) {
+            num_experts_for_offsets = static_cast<int>(ci->second.size()) - 1;
+        }
+    }
+    int num_experts = num_experts_for_offsets;
+    const int hidden_size = static_cast<int>(mConfig.HiddenSize);
+    // Use MoeIntermediateSize for MoE models (may differ from IntermediateSize)
+    const int intermediate_size = (mConfig.MoeIntermediateSize > 0)
+        ? static_cast<int>(mConfig.MoeIntermediateSize)
+        : static_cast<int>(mConfig.IntermediateSize);
     // Get expert offsets from per-layer saved buffers when available.
     Tensor expert_offsets_view;
     Tensor* expert_offsets_ptr = nullptr;
@@ -60,7 +70,7 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_down(const CompiledOp& op) {
         if (it_saved != mMoeSavedBuffers.end() && it_saved->second != nullptr) {
             expert_offsets_view.DType = ETensorDType::INT32;
             expert_offsets_view.Rank = 1;
-            expert_offsets_view.Sizes[0] = static_cast<long>(mConfig.NumLocalExperts + 1);
+            expert_offsets_view.Sizes[0] = static_cast<long>(num_experts_for_offsets + 1);
             expert_offsets_view.Data = static_cast<std::byte*>(it_saved->second);
             expert_offsets_ptr = &expert_offsets_view;
         }
@@ -233,18 +243,53 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_down(const CompiledOp& op) {
                                       "Set lora_dtype='bf16' in your config to match activation dtype.";
                     throw std::runtime_error(msg);
                 }
+                Tensor weight_view = weight_t;
+                int weight_rows = (weight_view.Rank > 0) ? static_cast<int>(weight_view.Sizes[0]) : num_experts;
+                if (mOptions.EPSize > 1 && layer_idx_any >= 0 && weight_view.Rank >= 3 && weight_rows > num_experts) {
+                    auto meta_it = mEPLayerMeta.find(layer_idx_any);
+                    if (meta_it != mEPLayerMeta.end()) {
+                        const auto& meta = meta_it->second;
+                        if (meta.num_local == num_experts &&
+                            meta.native_start >= 0 &&
+                            (meta.native_start + num_experts) <= weight_rows) {
+                            const std::size_t elem_sz = get_dtype_size(weight_view.DType);
+                            const std::size_t expert_elems =
+                                static_cast<std::size_t>(weight_view.Sizes[1]) *
+                                static_cast<std::size_t>(weight_view.Sizes[2]);
+                            weight_view.Data =
+                                static_cast<std::byte*>(weight_view.Data)
+                                + static_cast<std::size_t>(meta.native_start) * expert_elems * elem_sz;
+                            weight_view.Sizes[0] = num_experts;
+                            weight_rows = num_experts;
+                        }
+                    }
+                }
+                const bool lora_weight_is_compact = (weight_rows != num_experts);
+                const int* lora_active_ptr = active_ptr;
+                int lora_num_active = num_active;
+                std::vector<int> fallback_active;
+                if (lora_weight_is_compact &&
+                    (lora_active_ptr == nullptr || lora_num_active <= 0 || lora_num_active > weight_rows)) {
+                    const int fallback_count = std::max(0, std::min(weight_rows, num_experts));
+                    fallback_active.resize(static_cast<std::size_t>(fallback_count));
+                    for (int i = 0; i < fallback_count; ++i) {
+                        fallback_active[static_cast<std::size_t>(i)] = i;
+                    }
+                    lora_active_ptr = fallback_active.empty() ? nullptr : fallback_active.data();
+                    lora_num_active = fallback_count;
+                }
                 if (in_t.DType == ETensorDType::BF16) {
-                    moe_grouped_gemm(out_t.get<nv_bfloat16>(), in_t.get<nv_bfloat16>(), weight_t.get<nv_bfloat16>(),
+                    moe_grouped_gemm(out_t.get<nv_bfloat16>(), in_t.get<nv_bfloat16>(), weight_view.get<nv_bfloat16>(),
                                      expert_offsets.get<int>(), num_experts, M, K,
                                      mRunState.cublas_handle(), mRunState.MainStream,
-                                     host_offsets_ptr, alpha, beta, mode, active_ptr,
-                                     /*weight_is_compact=*/false, num_active);
+                                     host_offsets_ptr, alpha, beta, mode, lora_active_ptr,
+                                     lora_weight_is_compact, lora_num_active);
                 } else {
-                    moe_grouped_gemm(out_t.get<float>(), in_t.get<float>(), weight_t.get<float>(),
+                    moe_grouped_gemm(out_t.get<float>(), in_t.get<float>(), weight_view.get<float>(),
                                      expert_offsets.get<int>(), num_experts, M, K,
                                      mRunState.cublas_handle(), mRunState.MainStream,
-                                     host_offsets_ptr, alpha, beta, mode, active_ptr,
-                                     /*weight_is_compact=*/false, num_active);
+                                     host_offsets_ptr, alpha, beta, mode, lora_active_ptr,
+                                     lora_weight_is_compact, lora_num_active);
                 }
             };
 
@@ -571,18 +616,87 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_down_backward(const CompiledOp&
                                       "Set lora_dtype='bf16' in your config to match activation dtype.";
                     throw std::runtime_error(msg);
                 }
+                Tensor weight_view = weight_t;
+                int weight_rows = (weight_view.Rank > 0) ? static_cast<int>(weight_view.Sizes[0]) : num_experts;
+                if (mOptions.EPSize > 1 && layer_idx >= 0 && weight_view.Rank >= 3 && weight_rows > num_experts) {
+                    auto meta_it = mEPLayerMeta.find(layer_idx);
+                    if (meta_it != mEPLayerMeta.end()) {
+                        const auto& meta = meta_it->second;
+                        if (meta.num_local == num_experts &&
+                            meta.native_start >= 0 &&
+                            (meta.native_start + num_experts) <= weight_rows) {
+                            const std::size_t elem_sz = get_dtype_size(weight_view.DType);
+                            const std::size_t expert_elems =
+                                static_cast<std::size_t>(weight_view.Sizes[1]) *
+                                static_cast<std::size_t>(weight_view.Sizes[2]);
+                            weight_view.Data =
+                                static_cast<std::byte*>(weight_view.Data)
+                                + static_cast<std::size_t>(meta.native_start) * expert_elems * elem_sz;
+                            weight_view.Sizes[0] = num_experts;
+                            weight_rows = num_experts;
+                        }
+                    }
+                }
+                const bool lora_weight_is_compact = (weight_rows != num_experts);
+                const int* lora_active_ptr = active_ptr;
+                int lora_num_active = num_active;
+                std::vector<int> fallback_active;
+                if (lora_weight_is_compact &&
+                    (lora_active_ptr == nullptr || lora_num_active <= 0 || lora_num_active > weight_rows)) {
+                    const int fallback_count = std::max(0, std::min(weight_rows, num_experts));
+                    fallback_active.resize(static_cast<std::size_t>(fallback_count));
+                    for (int i = 0; i < fallback_count; ++i) {
+                        fallback_active[static_cast<std::size_t>(i)] = i;
+                    }
+                    lora_active_ptr = fallback_active.empty() ? nullptr : fallback_active.data();
+                    lora_num_active = fallback_count;
+                }
+                const int* lora_host_offsets_ptr = host_offsets_ptr;
+                std::vector<int> lora_host_offsets_sanitized;
+                if (host_offsets_ptr && num_experts > 0 && in_t.Rank >= 2 && out_t.Rank >= 2) {
+                    const int total_tokens_lora = static_cast<int>(std::min(in_t.Sizes[0], out_t.Sizes[0]));
+                    bool valid = (host_offsets_ptr[0] == 0);
+                    int prev = host_offsets_ptr[0];
+                    int last = prev;
+                    for (int e = 1; e <= num_experts && valid; ++e) {
+                        const int v = host_offsets_ptr[e];
+                        if (v < prev || v < 0 || v > total_tokens_lora) {
+                            valid = false;
+                            break;
+                        }
+                        prev = v;
+                        last = v;
+                    }
+                    if (valid && last != total_tokens_lora) {
+                        valid = false;
+                    }
+                    if (!valid) {
+                        lora_host_offsets_sanitized.assign(static_cast<std::size_t>(num_experts + 1), 0);
+                        int cur = 0;
+                        for (int e = 1; e <= num_experts; ++e) {
+                            int v = host_offsets_ptr[e];
+                            if (v < cur) v = cur;
+                            if (v < 0) v = 0;
+                            if (v > total_tokens_lora) v = total_tokens_lora;
+                            lora_host_offsets_sanitized[static_cast<std::size_t>(e)] = v;
+                            cur = v;
+                        }
+                        lora_host_offsets_sanitized[static_cast<std::size_t>(num_experts)] = total_tokens_lora;
+                        lora_host_offsets_ptr = lora_host_offsets_sanitized.data();
+                    }
+                }
                 if (in_t.DType == ETensorDType::BF16) {
-                    moe_grouped_gemm(out_t.get<nv_bfloat16>(), in_t.get<nv_bfloat16>(), weight_t.get<nv_bfloat16>(),
+                    moe_grouped_gemm(out_t.get<nv_bfloat16>(), in_t.get<nv_bfloat16>(), weight_view.get<nv_bfloat16>(),
                                      expert_offsets_ptr, num_experts, M, K,
                                      mRunState.cublas_handle(), mRunState.MainStream,
-                                     host_offsets_ptr, alpha, beta, mode, active_ptr,
-                                     /*weight_is_compact=*/false, num_active);
+                                     lora_host_offsets_ptr, alpha, beta, mode, lora_active_ptr,
+                                     lora_weight_is_compact, lora_num_active);
                 } else {
-                    moe_grouped_gemm(out_t.get<float>(), in_t.get<float>(), weight_t.get<float>(),
+                    moe_grouped_gemm(out_t.get<float>(), in_t.get<float>(), weight_view.get<float>(),
                                      expert_offsets_ptr, num_experts, M, K,
                                      mRunState.cublas_handle(), mRunState.MainStream,
-                                     host_offsets_ptr, alpha, beta, mode, active_ptr,
-                                     /*weight_is_compact=*/false, num_active);
+                                     lora_host_offsets_ptr, alpha, beta, mode, lora_active_ptr,
+                                     lora_weight_is_compact, lora_num_active);
                 }
             };
 
@@ -591,29 +705,98 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_down_backward(const CompiledOp&
                 if (grad_output.DType != in.DType) {
                     throw std::runtime_error("MoE LoRA backward: grad/output dtype mismatch.");
                 }
+                Tensor d_weight_view = d_weight;
+                int weight_rows = (d_weight_view.Rank > 0) ? static_cast<int>(d_weight_view.Sizes[0]) : num_experts;
+                if (mOptions.EPSize > 1 && layer_idx >= 0 && d_weight_view.Rank >= 3 && weight_rows > num_experts) {
+                    auto meta_it = mEPLayerMeta.find(layer_idx);
+                    if (meta_it != mEPLayerMeta.end()) {
+                        const auto& meta = meta_it->second;
+                        if (meta.num_local == num_experts &&
+                            meta.native_start >= 0 &&
+                            (meta.native_start + num_experts) <= weight_rows) {
+                            const std::size_t elem_sz = get_dtype_size(d_weight_view.DType);
+                            const std::size_t expert_elems =
+                                static_cast<std::size_t>(d_weight_view.Sizes[1]) *
+                                static_cast<std::size_t>(d_weight_view.Sizes[2]);
+                            d_weight_view.Data =
+                                static_cast<std::byte*>(d_weight_view.Data)
+                                + static_cast<std::size_t>(meta.native_start) * expert_elems * elem_sz;
+                            d_weight_view.Sizes[0] = num_experts;
+                            weight_rows = num_experts;
+                        }
+                    }
+                }
+                const bool lora_weight_is_compact = (weight_rows != num_experts);
+                const int* lora_active_ptr = active_ptr;
+                int lora_num_active = num_active;
+                std::vector<int> fallback_active;
+                if (lora_weight_is_compact &&
+                    (lora_active_ptr == nullptr || lora_num_active <= 0 || lora_num_active > weight_rows)) {
+                    const int fallback_count = std::max(0, std::min(weight_rows, num_experts));
+                    fallback_active.resize(static_cast<std::size_t>(fallback_count));
+                    for (int i = 0; i < fallback_count; ++i) {
+                        fallback_active[static_cast<std::size_t>(i)] = i;
+                    }
+                    lora_active_ptr = fallback_active.empty() ? nullptr : fallback_active.data();
+                    lora_num_active = fallback_count;
+                }
+                const int* lora_host_offsets_ptr = host_offsets_ptr;
+                std::vector<int> lora_host_offsets_sanitized;
+                if (host_offsets_ptr && num_experts > 0 && grad_output.Rank >= 2 && in.Rank >= 2) {
+                    const int total_tokens_lora = static_cast<int>(std::min(grad_output.Sizes[0], in.Sizes[0]));
+                    bool valid = (host_offsets_ptr[0] == 0);
+                    int prev = host_offsets_ptr[0];
+                    int last = prev;
+                    for (int e = 1; e <= num_experts && valid; ++e) {
+                        const int v = host_offsets_ptr[e];
+                        if (v < prev || v < 0 || v > total_tokens_lora) {
+                            valid = false;
+                            break;
+                        }
+                        prev = v;
+                        last = v;
+                    }
+                    if (valid && last != total_tokens_lora) {
+                        valid = false;
+                    }
+                    if (!valid) {
+                        lora_host_offsets_sanitized.assign(static_cast<std::size_t>(num_experts + 1), 0);
+                        int cur = 0;
+                        for (int e = 1; e <= num_experts; ++e) {
+                            int v = host_offsets_ptr[e];
+                            if (v < cur) v = cur;
+                            if (v < 0) v = 0;
+                            if (v > total_tokens_lora) v = total_tokens_lora;
+                            lora_host_offsets_sanitized[static_cast<std::size_t>(e)] = v;
+                            cur = v;
+                        }
+                        lora_host_offsets_sanitized[static_cast<std::size_t>(num_experts)] = total_tokens_lora;
+                        lora_host_offsets_ptr = lora_host_offsets_sanitized.data();
+                    }
+                }
                 if (grad_output.DType == ETensorDType::BF16) {
-                    if (d_weight.DType != ETensorDType::BF16) {
+                    if (d_weight_view.DType != ETensorDType::BF16) {
                         throw std::runtime_error("MoE LoRA backward: lora_dtype=fp32 with bf16 activations not supported. "
                                                  "Set lora_dtype='bf16' in your config.");
                     }
-                    moe_grouped_gemm_weight_grad(d_weight.get<nv_bfloat16>(),
+                    moe_grouped_gemm_weight_grad(d_weight_view.get<nv_bfloat16>(),
                                                  grad_output.get<nv_bfloat16>(),
                                                  in.get<nv_bfloat16>(),
                                                  expert_offsets_ptr, num_experts, M, N,
                                                  mRunState.cublas_handle(), mRunState.MainStream,
-                                                 host_offsets_ptr, /*alpha=*/1.0f, beta,
-                                                 active_ptr, /*weight_is_compact=*/false, num_active);
+                                                 lora_host_offsets_ptr, /*alpha=*/1.0f, beta,
+                                                 lora_active_ptr, lora_weight_is_compact, lora_num_active);
                 } else {
-                    if (d_weight.DType != ETensorDType::FP32) {
+                    if (d_weight_view.DType != ETensorDType::FP32) {
                         throw std::runtime_error("MoE LoRA backward: dtype mismatch in weight gradients.");
                     }
-                    moe_grouped_gemm_weight_grad(d_weight.get<float>(),
+                    moe_grouped_gemm_weight_grad(d_weight_view.get<float>(),
                                                  grad_output.get<float>(),
                                                  in.get<float>(),
                                                  expert_offsets_ptr, num_experts, M, N,
                                                  mRunState.cublas_handle(), mRunState.MainStream,
-                                                 host_offsets_ptr, /*alpha=*/1.0f, beta,
-                                                 active_ptr, /*weight_is_compact=*/false, num_active);
+                                                 lora_host_offsets_ptr, /*alpha=*/1.0f, beta,
+                                                 lora_active_ptr, lora_weight_is_compact, lora_num_active);
                 }
             };
 

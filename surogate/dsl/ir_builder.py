@@ -66,6 +66,29 @@ def build_dsl_ir_from_python(
         else:
             raise RuntimeError(f"DSL compilation failed for {architecture} (no error details)")
 
+    # EP sanity check: when ep_size > 1, the compiled graph must contain
+    # ep_dispatch ops. Otherwise runtime will initialize EP comms but execute
+    # a non-EP MoE path, which is unstable (expert gradients are not reduced
+    # across EP ranks in that mode).
+    ep_size = 1
+    if extra_config:
+        try:
+            ep_size = int(extra_config.get("ep_size", 1) or 1)
+        except Exception:
+            ep_size = 1
+    if ep_size > 1:
+        has_ep_dispatch = False
+        for module in result.get("modules", []):
+            ops = module.get("forward", {}).get("operations", [])
+            if any(op.get("kernel_type") == "ep_dispatch" for op in ops):
+                has_ep_dispatch = True
+                break
+        if not has_ep_dispatch:
+            raise RuntimeError(
+                f"DSL compilation for {architecture} with ep_size={ep_size} "
+                "produced no ep_dispatch ops. EP is not wired in this graph."
+            )
+
     return ir_json
 
 

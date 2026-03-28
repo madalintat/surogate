@@ -47,6 +47,11 @@ bool env_enabled(const char* name) {
     return true;
 }
 
+inline int host_batch_row_for_local_rank(int local_rank, int ep_size) {
+    (void)ep_size;
+    return local_rank;
+}
+
 }  // namespace
 
 namespace {
@@ -436,9 +441,10 @@ void MultiGPUPyTrainer::save_checkpoint(std::string directory, int step) {
  * then runs forward/backward for the current micro-step index.
  *
  * Buffer layout expectation:
- * - `inputs` contains `world_size * B * T` int32 tokens laid out contiguously.
- * - Rank `i` reads from `inputs + i * B * T`.
- * Same for `targets`.
+ * - `inputs` contains `local_gpus * B * T` int32 tokens laid out contiguously.
+ * - EP disabled: rank `i` reads row `i`.
+ * - EP enabled: each rank still reads its own row (row = local_rank).
+ * Same rule applies to `targets`.
  *
  * @param inputs Pointer to host int32 token IDs for all ranks (see layout above).
  * @param targets Pointer to host int32 target token IDs for all ranks (see layout above).
@@ -446,6 +452,7 @@ void MultiGPUPyTrainer::save_checkpoint(std::string directory, int step) {
  * @throws std::runtime_error If called more than `grad_accum` times without an update().
  */
 void MultiGPUPyTrainer::step(const std::int32_t* inputs, const std::int32_t* targets, const std::int32_t* position_ids) {
+    const int ep_size = std::max(1, mOptions.EPSize);
     for(int i = 0; i < mContexts.size(); ++i) {
         auto& ctx = mContexts.at(i);
         if (!ctx.Model) {
@@ -457,13 +464,14 @@ void MultiGPUPyTrainer::step(const std::int32_t* inputs, const std::int32_t* tar
         auto* pb = pos_buf.get<std::int32_t>();
         const int pos_planes = (pos_buf.Rank == 3) ? static_cast<int>(pos_buf.Sizes[0]) : 1;
         const std::size_t bt = static_cast<std::size_t>(B) * static_cast<std::size_t>(T);
+        const int src_row = host_batch_row_for_local_rank(i, ep_size);
 
-        std::memcpy(ib, inputs + i * B * T, B * T * sizeof(std::int32_t));
-        std::memcpy(tb, targets + i * B * T, B * T * sizeof(std::int32_t));
+        std::memcpy(ib, inputs + src_row * B * T, B * T * sizeof(std::int32_t));
+        std::memcpy(tb, targets + src_row * B * T, B * T * sizeof(std::int32_t));
         if (position_ids) {
             // Python binding provides 2D [B, T] position IDs (one plane per GPU).
             // For mRoPE models the buffer is [3, B, T] — replicate the single plane.
-            const auto* src = position_ids + static_cast<std::ptrdiff_t>(i) * static_cast<std::ptrdiff_t>(bt);
+            const auto* src = position_ids + static_cast<std::ptrdiff_t>(src_row) * static_cast<std::ptrdiff_t>(bt);
             for (int p = 0; p < pos_planes; ++p) {
                 std::memcpy(pb + p * bt, src, bt * sizeof(std::int32_t));
             }
@@ -511,15 +519,17 @@ void MultiGPUPyTrainer::set_visual_inputs(const std::int32_t* visual_pos_masks,
     }
 
     const int world = local_world_size();
+    const int ep_size = std::max(1, mOptions.EPSize);
     const std::size_t mask_stride = static_cast<std::size_t>(B) * static_cast<std::size_t>(T);
     const std::size_t embed_stride = mask_stride * static_cast<std::size_t>(mConfig->HiddenSize);
     for (int i = 0; i < world; ++i) {
-        const std::int32_t* mask_ptr = visual_pos_masks ? (visual_pos_masks + i * mask_stride) : nullptr;
-        const float* embed_ptr = visual_embeds ? (visual_embeds + i * embed_stride) : nullptr;
+        const int src_row = host_batch_row_for_local_rank(i, ep_size);
+        const std::int32_t* mask_ptr = visual_pos_masks ? (visual_pos_masks + src_row * mask_stride) : nullptr;
+        const float* embed_ptr = visual_embeds ? (visual_embeds + src_row * embed_stride) : nullptr;
         std::vector<const float*> deepstack_ptrs;
         deepstack_ptrs.reserve(deepstack_visual_embeds.size());
         for (const float* base_ptr : deepstack_visual_embeds) {
-            deepstack_ptrs.push_back(base_ptr ? (base_ptr + i * embed_stride) : nullptr);
+            deepstack_ptrs.push_back(base_ptr ? (base_ptr + src_row * embed_stride) : nullptr);
         }
         run_work([mask_ptr, embed_ptr, deepstack_ptrs](sThreadContext& ctx) {
             auto& rs = ctx.Model->get_run_state();
@@ -561,6 +571,7 @@ void MultiGPUPyTrainer::set_visual_inputs(const std::int32_t* visual_pos_masks,
  * @return Loss value computed on rank 0 for this validation micro-step.
  */
 float MultiGPUPyTrainer::validate(const std::int32_t* inputs, const std::int32_t* targets, const std::int32_t* position_ids) {
+    const int ep_size = std::max(1, mOptions.EPSize);
     for(int i = 0; i < mContexts.size(); ++i) {
         auto& ctx = mContexts.at(i);
         auto* ib = ctx.Model->get_input_buffer().get<std::int32_t>();
@@ -569,13 +580,14 @@ float MultiGPUPyTrainer::validate(const std::int32_t* inputs, const std::int32_t
         auto* pb = pos_buf.get<std::int32_t>();
         const int pos_planes = (pos_buf.Rank == 3) ? static_cast<int>(pos_buf.Sizes[0]) : 1;
         const std::size_t bt = static_cast<std::size_t>(B) * static_cast<std::size_t>(T);
+        const int src_row = host_batch_row_for_local_rank(i, ep_size);
 
-        std::memcpy(ib, inputs + i * B * T, B * T * sizeof(std::int32_t));
-        std::memcpy(tb, targets + i * B * T, B * T * sizeof(std::int32_t));
+        std::memcpy(ib, inputs + src_row * B * T, B * T * sizeof(std::int32_t));
+        std::memcpy(tb, targets + src_row * B * T, B * T * sizeof(std::int32_t));
         if (position_ids) {
             // Python binding provides 2D [B, T] position IDs (one plane per GPU).
             // For mRoPE models the buffer is [3, B, T] — replicate the single plane.
-            const auto* src = position_ids + static_cast<std::ptrdiff_t>(i) * static_cast<std::ptrdiff_t>(bt);
+            const auto* src = position_ids + static_cast<std::ptrdiff_t>(src_row) * static_cast<std::ptrdiff_t>(bt);
             for (int p = 0; p < pos_planes; ++p) {
                 std::memcpy(pb + p * bt, src, bt * sizeof(std::int32_t));
             }
@@ -727,9 +739,15 @@ std::pair<float, float> MultiGPUPyTrainer::train_step_graphed(const std::int32_t
 
         // Stage inputs/targets/position_ids for all micro-steps.
         const int rank = ctx.Communicator->local_rank();
+        const int ep_size = std::max(1, mOptions.EPSize);
+        const int src_row = host_batch_row_for_local_rank(rank, ep_size);
         for (int j = 0; j < micro_steps; ++j) {
-            const std::size_t offset = (static_cast<std::size_t>(j) * static_cast<std::size_t>(local_gpus) + static_cast<std::size_t>(rank)) * stride;
-            const std::size_t pos_offset = (static_cast<std::size_t>(j) * static_cast<std::size_t>(local_gpus) + static_cast<std::size_t>(rank)) * pos_stride;
+            const std::size_t offset =
+                (static_cast<std::size_t>(j) * static_cast<std::size_t>(local_gpus) +
+                 static_cast<std::size_t>(src_row)) * stride;
+            const std::size_t pos_offset =
+                (static_cast<std::size_t>(j) * static_cast<std::size_t>(local_gpus) +
+                 static_cast<std::size_t>(src_row)) * pos_stride;
             std::memcpy(gs.inputs[j].Data, inputs + offset, stride * sizeof(std::int32_t));
             std::memcpy(gs.targets[j].Data, targets + offset, stride * sizeof(std::int32_t));
             if (position_ids) {
@@ -860,6 +878,24 @@ std::pair<float, float> MultiGPUPyTrainer::train_step_graphed(const std::int32_t
             dsl_model->zero_grads(rs.MainStream);
             dsl_model->set_rng_state(rng_state);
             CUDA_CHECK(cudaStreamSynchronize(rs.MainStream));
+        }
+
+        // After warmup compiles the graph, check for capture-unsafe ops
+        // (e.g. JIT Triton GDR kernels). Full-step graph capture cannot wrap
+        // these ops, so fall back to the per-step eager path where
+        // GraphExecutor uses split-attention per-segment CUDA graphs internally.
+        if (dsl_model->has_capture_unsafe_ops()) {
+            if (prev_internal_graphs) {
+                dsl_model->set_internal_graphs_enabled(true);
+            }
+            for (int j = 0; j < micro_steps; ++j) {
+                rs.Targets_CPU = gs.targets[j];
+                dsl_model->forward(gs.inputs[j], gs.position_ids[j], *ctx.Communicator, j);
+                dsl_model->backward(gs.inputs[j], gs.targets[j], *ctx.Communicator, micro_steps, j);
+            }
+            dsl_model->update_with_config(*ctx.Communicator, config, opt_step_host);
+            CUDA_CHECK(cudaDeviceSynchronize());
+            return;
         }
 
         if (!gs.captured) {
@@ -1559,6 +1595,7 @@ void MultiGPUPyTrainer::step_with_custom_loss(
         const std::int32_t* position_ids,
         const float* temperatures) {
     // Distribute inputs, targets, and position_ids to each GPU's CPU-side buffers.
+    const int ep_size = std::max(1, mOptions.EPSize);
     for (int i = 0; i < (int)mContexts.size(); ++i) {
         auto& ctx = mContexts.at(i);
         if (!ctx.Model) {
@@ -1571,14 +1608,15 @@ void MultiGPUPyTrainer::step_with_custom_loss(
         const int pos_planes = (pos_buf.Rank == 3) ? static_cast<int>(pos_buf.Sizes[0]) : 1;
         const std::size_t pos_stride = static_cast<std::size_t>(pos_planes) *
                                        static_cast<std::size_t>(B) * static_cast<std::size_t>(T);
+        const int src_row = host_batch_row_for_local_rank(i, ep_size);
 
-        std::memcpy(ib, inputs + i * B * T, B * T * sizeof(std::int32_t));
-        std::memcpy(tb, targets + i * B * T, B * T * sizeof(std::int32_t));
+        std::memcpy(ib, inputs + src_row * B * T, B * T * sizeof(std::int32_t));
+        std::memcpy(tb, targets + src_row * B * T, B * T * sizeof(std::int32_t));
         if (position_ids) {
             // Python binding provides 2D [B, T] position IDs (one plane per GPU).
             // For mRoPE models the buffer is [3, B, T] — replicate the single plane.
             const std::size_t bt = static_cast<std::size_t>(B) * static_cast<std::size_t>(T);
-            const auto* src = position_ids + static_cast<std::ptrdiff_t>(i) * static_cast<std::ptrdiff_t>(bt);
+            const auto* src = position_ids + static_cast<std::ptrdiff_t>(src_row) * static_cast<std::ptrdiff_t>(bt);
             for (int p = 0; p < pos_planes; ++p) {
                 std::memcpy(pb + p * bt, src, bt * sizeof(std::int32_t));
             }
@@ -1605,11 +1643,13 @@ void MultiGPUPyTrainer::step_with_custom_loss(
 
         // Each GPU receives its own slice of the per_token_grads buffer.
         const int gpu_rank = ctx.Communicator->local_rank();
+        const int gpu_ep_size = ctx.Communicator->ep_size();
+        const int src_row = host_batch_row_for_local_rank(gpu_rank, gpu_ep_size);
         const float* grads_for_this_gpu = per_token_grads +
-                                          static_cast<std::ptrdiff_t>(gpu_rank) * B * T;
+                                          static_cast<std::ptrdiff_t>(src_row) * B * T;
         const float* temps_for_this_gpu = nullptr;
         if (temperatures) {
-            temps_for_this_gpu = temperatures + static_cast<std::ptrdiff_t>(gpu_rank) * B * T;
+            temps_for_this_gpu = temperatures + static_cast<std::ptrdiff_t>(src_row) * B * T;
         }
 
         dsl_model->step_with_custom_loss(inputs_tensor, position_ids_tensor, targets_tensor,
@@ -1626,6 +1666,7 @@ std::vector<float> MultiGPUPyTrainer::forward_for_grpo(
         const std::int32_t* position_ids,
         const float* temperatures) {
     // Distribute inputs, targets, and position_ids to each GPU's CPU-side buffers.
+    const int ep_size = std::max(1, mOptions.EPSize);
     for (int i = 0; i < (int)mContexts.size(); ++i) {
         auto& ctx = mContexts.at(i);
         if (!ctx.Model) {
@@ -1637,11 +1678,12 @@ std::vector<float> MultiGPUPyTrainer::forward_for_grpo(
         auto* pb = pos_buf.get<std::int32_t>();
         const int pos_planes = (pos_buf.Rank == 3) ? static_cast<int>(pos_buf.Sizes[0]) : 1;
         const std::size_t bt = static_cast<std::size_t>(B) * static_cast<std::size_t>(T);
+        const int src_row = host_batch_row_for_local_rank(i, ep_size);
 
-        std::memcpy(ib, inputs + i * B * T, B * T * sizeof(std::int32_t));
-        std::memcpy(tb, targets + i * B * T, B * T * sizeof(std::int32_t));
+        std::memcpy(ib, inputs + src_row * B * T, B * T * sizeof(std::int32_t));
+        std::memcpy(tb, targets + src_row * B * T, B * T * sizeof(std::int32_t));
         if (position_ids) {
-            const auto* src = position_ids + static_cast<std::ptrdiff_t>(i) * static_cast<std::ptrdiff_t>(bt);
+            const auto* src = position_ids + static_cast<std::ptrdiff_t>(src_row) * static_cast<std::ptrdiff_t>(bt);
             for (int p = 0; p < pos_planes; ++p) {
                 std::memcpy(pb + p * bt, src, bt * sizeof(std::int32_t));
             }
@@ -1668,9 +1710,11 @@ std::vector<float> MultiGPUPyTrainer::forward_for_grpo(
         Tensor targets_tensor = ctx.Model->get_target_buffer();
 
         const int gpu_rank = ctx.Communicator->local_rank();
+        const int gpu_ep_size = ctx.Communicator->ep_size();
+        const int src_row = host_batch_row_for_local_rank(gpu_rank, gpu_ep_size);
         const float* temps_for_this_gpu = nullptr;
         if (temperatures) {
-            temps_for_this_gpu = temperatures + static_cast<std::ptrdiff_t>(gpu_rank) * B * T;
+            temps_for_this_gpu = temperatures + static_cast<std::ptrdiff_t>(src_row) * B * T;
         }
 
         auto logprobs = dsl_model->forward_for_grpo(inputs_tensor, position_ids_tensor, targets_tensor,
@@ -1701,8 +1745,10 @@ void MultiGPUPyTrainer::backward_grpo(const float* per_token_grads) {
         Tensor targets_tensor = ctx.Model->get_target_buffer();
 
         const int gpu_rank = ctx.Communicator->local_rank();
+        const int gpu_ep_size = ctx.Communicator->ep_size();
+        const int src_row = host_batch_row_for_local_rank(gpu_rank, gpu_ep_size);
         const float* grads_for_this_gpu = per_token_grads +
-                                          static_cast<std::ptrdiff_t>(gpu_rank) * B * T;
+                                          static_cast<std::ptrdiff_t>(src_row) * B * T;
 
         dsl_model->backward_grpo(inputs_tensor, targets_tensor, grads_for_this_gpu,
                                   micro_batches, micro_idx, *ctx.Communicator);

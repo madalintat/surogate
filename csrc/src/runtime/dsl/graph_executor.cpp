@@ -90,13 +90,49 @@ inline bool stream_is_capturing(cudaStream_t stream) {
     return status != cudaStreamCaptureStatusNone;
 }
 
-inline bool graph_has_qwen35_ops(const CompiledGraph* g) {
+inline bool is_capture_unsafe_op_type(CompiledOpType type) {
+    switch (type) {
+        // Qwen3.5 / Triton JIT kernels
+        case CompiledOpType::ChunkGatedDeltaRule:
+        case CompiledOpType::ChunkGatedDeltaRuleBackward:
+        case CompiledOpType::Qwen3_5Decay:
+        case CompiledOpType::Qwen3_5DecayBackward:
+        // MoE routing / grouped GEMM rely on per-step host metadata and dynamic routing.
+        case CompiledOpType::MoESoftmax:
+        case CompiledOpType::MoESigmoid:
+        case CompiledOpType::MoETopK:
+        case CompiledOpType::MoEPermute:
+        case CompiledOpType::MoEGroupedGemm:
+        case CompiledOpType::MoEGroupedGemmGateUp:
+        case CompiledOpType::MoEGroupedGemmDown:
+        case CompiledOpType::MoEUnpermute:
+        case CompiledOpType::MoEExpertBiasAdd:
+        case CompiledOpType::MoESoftmaxBackward:
+        case CompiledOpType::MoESigmoidBackward:
+        case CompiledOpType::MoETopKBackward:
+        case CompiledOpType::MoEPermuteBackward:
+        case CompiledOpType::MoEGroupedGemmBackward:
+        case CompiledOpType::MoEGroupedGemmGateUpBackward:
+        case CompiledOpType::MoEGroupedGemmDownBackward:
+        case CompiledOpType::MoEUnpermuteBackward:
+        case CompiledOpType::MoEExpertBiasAddBackward:
+        // EP ops perform per-step host-side split/reorder bookkeeping.
+        case CompiledOpType::EpDispatch:
+        case CompiledOpType::EpCombine:
+        case CompiledOpType::EpDispatchBackward:
+        case CompiledOpType::EpCombineBackward:
+            return true;
+        default:
+            return false;
+    }
+}
+
+inline bool graph_has_capture_unsafe_ops(const CompiledGraph* g) {
     if (!g) {
         return false;
     }
     for (const auto& op : g->ops) {
-        if (op.type == CompiledOpType::Qwen3_5Decay ||
-            op.type == CompiledOpType::ChunkGatedDeltaRule) {
+        if (is_capture_unsafe_op_type(op.type)) {
             return true;
         }
     }
@@ -854,6 +890,10 @@ bool GraphExecutor::internal_graphs_enabled() const {
     return mGraphsEnabled;
 }
 
+bool GraphExecutor::has_capture_unsafe_ops() const {
+    return graph_has_capture_unsafe_ops(mCompiledForward.get());
+}
+
 size_t GraphExecutor::saved_buffers_total_bytes() const {
     return mCompiledExecutor ? mCompiledExecutor->saved_buffers_total_bytes() : 0;
 }
@@ -891,16 +931,12 @@ void GraphExecutor::execute_forward(long B, long T, NCCLCommunicator& comm, bool
     cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
     const bool in_capture = (cudaStreamIsCapturing(rs.MainStream, &capture_status) == cudaSuccess &&
                              capture_status != cudaStreamCaptureStatusNone);
-    // Qwen3.5 LoRA forward graph capture/replay is currently unstable (illegal address on
-    // launch for captured forward graph on 128x128 GDR path). Force eager forward for this
-    // case while keeping non-Qwen3.5 models and non-LoRA paths graphed.
-    const bool disable_fwd_graphs_for_qwen35_lora =
-        graph_has_qwen35_ops(mCompiledForward.get()) && mLoRAConfig && mLoRAConfig->enabled();
-    // When doc masking or capture-unsafe ops are present, use split-attention mode:
-    // capture-unsafe ops (FlashAttention varlen, ChunkGatedDeltaRule, Qwen3_5Decay)
-    // run eagerly while all other ops are graphed per-segment.
+    // Some ops are capture-unsafe due to JIT kernels and/or per-step host-side
+    // bookkeeping (MoE/EP routing metadata). Route through split mode so these
+    // ops run eagerly while other segments can still use CUDA graphs.
+    const bool has_capture_unsafe_ops = graph_has_capture_unsafe_ops(mCompiledForward.get());
+    // When doc masking or capture-unsafe ops are present, use split-attention mode.
     const bool doc_masking_active = (mCuSeqlensGpu != nullptr);
-    const bool has_capture_unsafe_ops = disable_fwd_graphs_for_qwen35_lora;
     const bool has_tiled_mlp = mCompiledForward && !mCompiledForward->mlp_tile_groups.empty();
     const bool needs_split = doc_masking_active || has_capture_unsafe_ops || has_tiled_mlp;
     const bool use_split_attention = needs_split && mOptions.UseCudaGraphs && !in_capture;
@@ -988,15 +1024,10 @@ void GraphExecutor::execute_backward(long B, long T, NCCLCommunicator& comm, int
     cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
     const bool in_capture = (cudaStreamIsCapturing(rs.MainStream, &capture_status) == cudaSuccess &&
                              capture_status != cudaStreamCaptureStatusNone);
-    const bool has_qwen35_ops =
-        graph_has_qwen35_ops(mCompiledForward ? mCompiledForward.get() : mCompiledBackward.get());
-    // Qwen3.5 LoRA backward currently routes through a cuBLAS fallback matmul path
-    // that is not capture-safe. Keep forward CUDA graphs enabled, but force eager
-    // backward execution for this case.
-    const bool disable_bwd_graphs_for_qwen35_lora =
-        has_qwen35_ops && mLoRAConfig && mLoRAConfig->enabled();
+    const bool has_capture_unsafe_ops =
+        graph_has_capture_unsafe_ops(mCompiledForward ? mCompiledForward.get() : mCompiledBackward.get());
     const bool doc_masking_active_bwd = (mCuSeqlensGpu != nullptr);
-    const bool has_capture_unsafe_bwd = disable_bwd_graphs_for_qwen35_lora;
+    const bool has_capture_unsafe_bwd = has_capture_unsafe_ops;
     const bool has_tiled_mlp_bwd = mCompiledBackward && !mCompiledBackward->mlp_tile_groups.empty();
     const bool needs_split_bwd = doc_masking_active_bwd || has_capture_unsafe_bwd || has_tiled_mlp_bwd;
     const bool use_split_attention_bwd = needs_split_bwd && mOptions.UseCudaGraphs && !in_capture;

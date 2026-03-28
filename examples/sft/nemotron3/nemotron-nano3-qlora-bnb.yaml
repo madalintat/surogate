@@ -1,5 +1,5 @@
 model: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
-output_dir: ./output_nemo
+output_dir: ./output_nemo_ep4
 
 per_device_train_batch_size: 1
 gradient_accumulation_steps: 4
@@ -7,16 +7,15 @@ gradient_accumulation_steps: 4
 sample_packing: true
 sequence_len: 512
 
-gpus: 1
-ep_size: 1
-ep_load_balance_threshold: 1.0
+gpus: 2
+ep_size: 2
 
-max_steps: 100
+max_steps: 20
 eval_steps: 25
 learning_rate: 2e-4
 warmup_ratio: 0.1
 
-recipe: fp8-hybrid
+recipe: bf16
 lmhead_chunks: 8
 
 lora: true
@@ -36,7 +35,7 @@ lora_target_modules:
 qlora_bnb: true
 qlora_offload_experts: true
 zero_level: 2
-offload_master: true
+offload_master: false
 offload_grads: true
 offload_optimizer: true
 use_zero_copy: true

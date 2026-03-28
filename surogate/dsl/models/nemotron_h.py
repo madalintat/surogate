@@ -219,6 +219,8 @@ class NemotronHModel(nn.Model):
         shared_expert_intermediate_size: int = 0,
         # Router scaling
         routed_scaling_factor: float = 1.0,
+        # Expert parallel
+        ep_size: int = 1,
         # Activation
         mlp_activation: str = "relu2",
     ):
@@ -265,6 +267,7 @@ class NemotronHModel(nn.Model):
         self.moe_intermediate_size = moe_intermediate_size
         self.shared_expert_intermediate_size = shared_expert_intermediate_size
         self.routed_scaling_factor = routed_scaling_factor
+        self.ep_size = ep_size
         self.mlp_activation = mlp_activation
 
         # Nemotron-H attention does not use RoPE (Mamba provides positional info)
@@ -355,6 +358,7 @@ class NemotronHModel(nn.Model):
                     mlp_bias=mlp_bias,
                     activation=mlp_activation,
                     routed_scaling_factor=routed_scaling_factor,
+                    ep_size=ep_size,
                 ),
             ))
 
@@ -455,5 +459,6 @@ def from_hf_config(config: dict) -> NemotronHModel:
         moe_intermediate_size=config.get("moe_intermediate_size", 7688),
         shared_expert_intermediate_size=config.get("moe_shared_expert_intermediate_size", 0),
         routed_scaling_factor=config.get("routed_scaling_factor", 1.0),
+        ep_size=config.get("ep_size", 1),
         mlp_activation=config.get("mlp_hidden_act", "relu2"),
     )

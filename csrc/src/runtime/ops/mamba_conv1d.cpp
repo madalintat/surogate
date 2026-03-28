@@ -45,25 +45,26 @@ void CompiledExecutor::dispatch_mamba_conv1d(const CompiledOp& op) {
         return prod == expected;
     };
 
-    Tensor* out_ptr = nullptr;
+    Tensor out_val;
+    bool out_is_ref = false;
     if (shape_matches(op.outputs[0])) {
         Tensor& out_ref = ensure_output_tensor(op.outputs[0]);
         if (out_ref.nelem() == expected) {
-            out_ptr = &out_ref;
+            out_val = out_ref;
+            out_is_ref = true;
         }
     }
-    if (!out_ptr) {
-        Tensor out = mRunState.temp_alloc(x.DType, {B, conv_dim, T}, "mamba_conv1d_out");
-        mTemps.push_back(out);
-        out_ptr = &mTemps.back();
+    if (!out_is_ref) {
+        out_val = mRunState.temp_alloc(x.DType, {B, conv_dim, T}, "mamba_conv1d_out");
+        mTemps.push_back(out_val);
     }
 
     // Call kernel
-    mamba_causal_conv1d_forward(*out_ptr, x, weight, bias,
+    mamba_causal_conv1d_forward(out_val, x, weight, bias,
                                  B, T, conv_dim, kernel, silu,
                                  mRunState.MainStream);
 
-    store_tensor(op.outputs[0], *out_ptr);
+    store_tensor(op.outputs[0], out_val);
 }
 
 void CompiledExecutor::dispatch_mamba_conv1d_backward(const CompiledOp& op) {
@@ -89,24 +90,25 @@ void CompiledExecutor::dispatch_mamba_conv1d_backward(const CompiledOp& op) {
     mTemps.push_back(dweight_fp32);
     fill_zero(dweight_fp32, mRunState.MainStream);
 
-    Tensor* dbias_fp32 = nullptr;
+    Tensor dbias_fp32;
+    bool has_dbias = false;
     if (op.outputs.size() > 2) {
-        Tensor dbias = mRunState.temp_alloc(ETensorDType::FP32, {conv_dim}, "mamba_conv1d_backward_dbias_fp32");
-        mTemps.push_back(dbias);
-        fill_zero(mTemps.back(), mRunState.MainStream);
-        dbias_fp32 = &mTemps.back();
+        dbias_fp32 = mRunState.temp_alloc(ETensorDType::FP32, {conv_dim}, "mamba_conv1d_backward_dbias_fp32");
+        mTemps.push_back(dbias_fp32);
+        fill_zero(dbias_fp32, mRunState.MainStream);
+        has_dbias = true;
     }
 
     // Call kernel
-    mamba_causal_conv1d_backward(dx, dweight_fp32, dbias_fp32,
+    mamba_causal_conv1d_backward(dx, dweight_fp32, has_dbias ? &dbias_fp32 : nullptr,
                                   x, weight, d_out,
                                   B, T, conv_dim, kernel, silu,
                                   mRunState.MainStream);
 
     store_tensor(op.outputs[0], dx);
     store_tensor(op.outputs[1], dweight_fp32);
-    if (op.outputs.size() > 2 && dbias_fp32) {
-        store_tensor(op.outputs[2], *dbias_fp32);
+    if (op.outputs.size() > 2 && has_dbias) {
+        store_tensor(op.outputs[2], dbias_fp32);
     }
 }
 

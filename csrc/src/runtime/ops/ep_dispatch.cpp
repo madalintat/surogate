@@ -142,6 +142,36 @@ void CompiledExecutor::dispatch_ep_dispatch(const CompiledOp& op) {
         parse_block_param(name, layer_idx, field);
     }
 
+    const std::string layer_prefix = "blocks[" + std::to_string(layer_idx) + "].";
+    // Detect up-projection weight name: fused "experts_gate_up" (Qwen3-MoE, GPT-OSS)
+    // or separate "experts_up" (Nemotron-H).
+    const std::string up_weight_name = mWeights.has(layer_prefix + "experts_gate_up")
+        ? "experts_gate_up" : "experts_up";
+    const bool separate_up_projection = (up_weight_name == "experts_up");
+    const bool force_llep_for_separate_up =
+        (std::getenv("SUROGATE_FORCE_LLEP_EXPERTS_UP") != nullptr);
+    const bool llep_supported_for_layer =
+        !separate_up_projection || force_llep_for_separate_up;
+    {
+        static bool printed_ep_dispatch_marker = false;
+        if (!printed_ep_dispatch_marker && mComm && mComm->rank() == 0) {
+            fprintf(stderr,
+                    "[EP] ep_dispatch active: layer=%d up_weight=%s ep_size=%d\n",
+                    layer_idx, up_weight_name.c_str(), ep_size);
+            printed_ep_dispatch_marker = true;
+        }
+    }
+    if (separate_up_projection && !force_llep_for_separate_up) {
+        static bool warned_experts_up_detected = false;
+        if (!warned_experts_up_detected && mComm && mComm->rank() == 0) {
+            fprintf(stderr,
+                    "[EP] Detected experts_up layer (Nemotron-style MoE); "
+                    "LLEP will remain disabled for this path unless "
+                    "SUROGATE_FORCE_LLEP_EXPERTS_UP=1 is set.\n");
+            warned_experts_up_detected = true;
+        }
+    }
+
     // ---- Get expert offsets from host cache (populated by moe_permute) ----
     auto offsets_it = mMoEHostOffsetsCache.find(layer_idx);
     if (offsets_it == mMoEHostOffsetsCache.end()) {
@@ -161,7 +191,7 @@ void CompiledExecutor::dispatch_ep_dispatch(const CompiledOp& op) {
     bool use_llep = false;
     std::vector<int> global_expert_counts;
 
-    if (threshold < 100.0f) {
+    if (llep_supported_for_layer && threshold < 100.0f) {
         // All-reduce expert counts across EP group
         Tensor counts_gpu = mRunState.temp_alloc(ETensorDType::INT32,
             {static_cast<long>(num_experts)}, "ep_expert_counts");
@@ -364,11 +394,6 @@ void CompiledExecutor::dispatch_ep_dispatch(const CompiledOp& op) {
     Tensor* native_gate_up_ptr = nullptr;
     Tensor* native_down_ptr = nullptr;
     bool wt_started = false;
-    const std::string layer_prefix = "blocks[" + std::to_string(layer_idx) + "].";
-    // Detect up-projection weight name: fused "experts_gate_up" (Qwen3-MoE, GPT-OSS)
-    // or separate "experts_up" (Nemotron-H).
-    const std::string up_weight_name = mWeights.has(layer_prefix + "experts_gate_up")
-        ? "experts_gate_up" : "experts_up";
     if (use_llep && (!plan.weights_to_send.empty() || !plan.weights_to_receive.empty())) {
         native_gate_up_ptr = &mWeights.get(layer_prefix + up_weight_name);
         native_down_ptr = &mWeights.get(layer_prefix + "experts_down");

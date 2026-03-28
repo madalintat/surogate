@@ -16,6 +16,98 @@
 
 namespace qlora {
 
+namespace {
+
+std::vector<long> tensor_shape(const Tensor& t) {
+    return std::vector<long>(t.Sizes.begin(), t.Sizes.begin() + t.Rank);
+}
+
+bool tensor_is_on_host(const Tensor& t) {
+    return !t.is_null() && t.Device < 0;
+}
+
+bool quantized_has_host_storage(const QuantizedTensor& qt) {
+    return tensor_is_on_host(qt.data) ||
+           tensor_is_on_host(qt.scales) ||
+           tensor_is_on_host(qt.meta) ||
+           tensor_is_on_host(qt.meta2);
+}
+
+struct DeviceQuantizedScratch {
+    QuantizedTensor tensor;
+    std::vector<void*> allocations;
+
+    ~DeviceQuantizedScratch() noexcept {
+        for (void* ptr : allocations) {
+            if (ptr) {
+                (void)cudaFree(ptr);
+            }
+        }
+    }
+};
+
+Tensor allocate_device_like(const Tensor& src,
+                            int device_id,
+                            std::vector<void*>& allocations) {
+    if (src.is_null()) {
+        return Tensor{};
+    }
+
+    void* ptr = nullptr;
+    CUDA_CHECK(cudaMalloc(&ptr, src.bytes()));
+    allocations.push_back(ptr);
+    return Tensor::from_pointer(
+        static_cast<std::byte*>(ptr),
+        device_id,
+        src.DType,
+        tensor_shape(src));
+}
+
+DeviceQuantizedScratch make_device_scratch_like(const QuantizedTensor& ref,
+                                                int device_id) {
+    DeviceQuantizedScratch scratch;
+    scratch.tensor.M = ref.M;
+    scratch.tensor.K = ref.K;
+    scratch.tensor.format = ref.format;
+    scratch.tensor.block_size = ref.block_size;
+    scratch.tensor.double_quant = ref.double_quant;
+    scratch.tensor.double_quant_group_size = ref.double_quant_group_size;
+    scratch.tensor.global_scale = ref.global_scale;
+
+    scratch.tensor.data = allocate_device_like(ref.data, device_id, scratch.allocations);
+    scratch.tensor.scales = allocate_device_like(ref.scales, device_id, scratch.allocations);
+    scratch.tensor.meta = allocate_device_like(ref.meta, device_id, scratch.allocations);
+    scratch.tensor.meta2 = allocate_device_like(ref.meta2, device_id, scratch.allocations);
+
+    return scratch;
+}
+
+void copy_quantized_storage(QuantizedTensor& dst,
+                            const QuantizedTensor& src,
+                            cudaStream_t stream) {
+    auto copy_one = [&](Tensor& out, const Tensor& in, const char* field) {
+        if (out.is_null() || in.is_null()) {
+            return;
+        }
+        if (out.bytes() != in.bytes()) {
+            throw std::runtime_error(
+                fmt::format("GenericWeightManager: quantized {} byte mismatch (dst={}, src={})",
+                            field, out.bytes(), in.bytes()));
+        }
+        CUDA_CHECK(cudaMemcpyAsync(out.Data, in.Data, in.bytes(), cudaMemcpyDefault, stream));
+    };
+
+    copy_one(dst.data, src.data, "data");
+    copy_one(dst.scales, src.scales, "scales");
+    copy_one(dst.meta, src.meta, "meta");
+    copy_one(dst.meta2, src.meta2, "meta2");
+
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    dst.global_scale = src.global_scale;
+}
+
+}  // namespace
+
 // =============================================================================
 // DequantBufferPool
 // =============================================================================
@@ -310,8 +402,17 @@ void GenericWeightManager::quantize_and_store(
                        "cannot quantize", name));
     }
 
-    // Quantize BF16 input into the pre-allocated QuantizedTensor
-    mQuantizer->quantize(bf16, entry.quantized, stream);
+    // Quantizers write their outputs from CUDA kernels and require device-backed
+    // destination buffers. When offloading is enabled, quantized storage can be
+    // host-backed; in that case stage quantization through temporary device
+    // buffers and copy the packed result back.
+    if (quantized_has_host_storage(entry.quantized)) {
+        auto scratch = make_device_scratch_like(entry.quantized, mConfig.device_id);
+        mQuantizer->quantize(bf16, scratch.tensor, stream);
+        copy_quantized_storage(entry.quantized, scratch.tensor, stream);
+    } else {
+        mQuantizer->quantize(bf16, entry.quantized, stream);
+    }
 
     // Invalidate dequant cache for this weight
     entry.dequant_valid = false;
@@ -418,8 +519,16 @@ void GenericWeightManager::quantize_expert_slice(
             std::vector<long>{groups_per_expert});
     }
 
-    // Quantize the single expert into the sub-view
-    mQuantizer->quantize(bf16, view, stream);
+    // Quantize the single expert into the sub-view.
+    if (quantized_has_host_storage(view)) {
+        auto scratch = make_device_scratch_like(view, mConfig.device_id);
+        mQuantizer->quantize(bf16, scratch.tensor, stream);
+        copy_quantized_storage(view, scratch.tensor, stream);
+    } else {
+        mQuantizer->quantize(bf16, view, stream);
+    }
+
+    entry.dequant_valid = false;
 }
 
 // =============================================================================
