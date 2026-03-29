@@ -1,0 +1,61 @@
+image:
+  repository: ghcr.io/invergent-ai/lakefs
+  tag: latest
+  pullPolicy: Always
+
+ingress:
+  enabled: true
+  ingressClassName: "traefik"
+  hosts:
+    - host: lakefs.k8s.localhost
+      paths:
+        - /
+    - host: lakefs-s3.k8s.localhost
+      paths:
+        - /
+
+extraVolumes:
+  - name: shared
+    persistentVolumeClaim:
+      claimName: lakefs-pvc
+
+extraVolumeMounts:
+  - name: shared
+    mountPath: /shared
+
+secrets:
+  authEncryptSecretKey: ${LAKEFS_SECRET_KEY}
+  
+lakefsConfig: |
+  auth:
+    ui_config:
+      rbac: internal
+    cache:
+      ttl: 1s
+  database:
+    type: local
+    local:
+      path: /shared/db
+      sync_writes: true
+  blockstore:
+    type: local
+    signing:
+      secret_key: ${LAKEFS_SECRET_KEY}
+    local:
+      path: /shared/data
+      import_enabled: true
+      allowed_external_prefixes:
+        - /shared/import
+  committed:
+    local_cache:
+      dir: /shared/cache
+  gateways:
+    s3:
+      domain_name:
+        - lakefs-s3.k8s.localhost
+        - lakefs-s3.k8s.svc
+  cors:
+    allowed_origins:
+      - 'https://*.k8s.localhost'
+      - 'https://*.k8s.localhost:4200'
+
