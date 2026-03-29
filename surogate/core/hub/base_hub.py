@@ -11,7 +11,7 @@ class HubOperation:
         yield
 
     @classmethod
-    def try_login(cls, token: Optional[str] = None) -> bool:
+    def try_login(cls, key: Optional[str] = None, secret: Optional[str] = None) -> bool:
         """Try to login to the hub
 
         Args:
@@ -23,7 +23,11 @@ class HubOperation:
         raise NotImplementedError
 
     @classmethod
-    def create_model_repo(cls, repo_id: str, token: Optional[str] = None, private: bool = False):
+    def create_model_repo(
+        cls, repo_id: str, 
+        private: bool = False,
+        key: Optional[str] = None, secret: Optional[str] = None, 
+    ):
         """Create a model repo on the hub
 
         Args:
@@ -34,17 +38,19 @@ class HubOperation:
         raise NotImplementedError
 
     @classmethod
-    def push_to_hub(cls,
-                    repo_id: str,
-                    folder_path: Union[str, Path],
-                    path_in_repo: Optional[str] = None,
-                    commit_message: Optional[str] = None,
-                    commit_description: Optional[str] = None,
-                    token: Optional[Union[str, bool]] = None,
-                    private: bool = False,
-                    revision: Optional[str] = 'master',
-                    ignore_patterns: Optional[Union[List[str], str]] = None,
-                    **kwargs):
+    def push_to_hub(
+        cls,
+        repo_id: str,
+        folder_path: Union[str, Path],
+        path_in_repo: Optional[str] = None,
+        commit_message: Optional[str] = None,
+        commit_description: Optional[str] = None,
+        private: bool = False,
+        revision: Optional[str] = 'master',
+        ignore_patterns: Optional[Union[List[str], str]] = None,
+        key: Optional[str] = None, secret: Optional[str] = None,
+        **kwargs
+    ):
         """Push a model-like folder to the hub
 
         Args:
@@ -61,12 +67,15 @@ class HubOperation:
         raise NotImplementedError
 
     @classmethod
-    def load_dataset(cls,
-                     dataset_id: str,
-                     subset_name: str,
-                     split: str,
-                     streaming: bool = False,
-                     revision: Optional[str] = None):
+    def load_dataset(
+        cls,
+        dataset_id: str,
+        subset_name: str,
+        split: str,
+        streaming: bool = False,
+        revision: Optional[str] = None,
+        key: Optional[str] = None, secret: Optional[str] = None,
+    ):
         """Load a dataset from the repo
 
         Args:
@@ -82,12 +91,14 @@ class HubOperation:
         raise NotImplementedError
 
     @classmethod
-    def download_model(cls,
-                       model_id_or_path: Optional[str] = None,
-                       revision: Optional[str] = None,
-                       download_model: bool = True,
-                       ignore_patterns: Optional[List[str]] = None,
-                       **kwargs):
+    def download_model(
+        cls,
+        model_id_or_path: Optional[str] = None,
+        revision: Optional[str] = None,
+        ignore_patterns: Optional[List[str]] = None,
+        key: Optional[str] = None, secret: Optional[str] = None,
+        **kwargs
+    ):
         """Download model from the hub
 
         Args:

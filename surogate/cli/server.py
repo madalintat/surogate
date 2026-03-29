@@ -9,7 +9,6 @@ import traceback
     
 from surogate.core.config.loader import load_config
 from surogate.core.config.server_config import ServerConfig
-from surogate.utils.dict import DictDefault
 from surogate.utils.logger import get_logger
 logger = get_logger()
 
@@ -50,8 +49,8 @@ def run_server(config: ServerConfig, frontend_path: Path = Path(__file__).resolv
     from surogate.server.app import app, setup_frontend
     from threading import Thread, Event
      
-    # Configure database URL before lifespan runs
-    app.state.database_url = config.database_url
+    # Make config available to routes via app.state
+    app.state.config = config
 
     # Setup frontend if path provided
     if frontend_path:
@@ -104,7 +103,18 @@ def _graceful_shutdown(server = None):
     
 if __name__ == '__main__':
     args = prepare_command_parser().parse_args(sys.argv[1:])
-    config = load_config(ServerConfig, args.config) if args.config else ServerConfig(cfg=DictDefault())
+    config_path = args.config
+    
+    if not config_path:
+        default_config = Path.home() / ".surogate" / "config.yaml"
+        if default_config.exists():
+            config_path = str(default_config)
+    
+    if not config_path:
+        print("Error: No config file provided and ~/.surogate/config.yaml not found.", file=sys.stderr)
+        sys.exit(1)
+
+    config = load_config(ServerConfig, config_path)
 
     try:
         run_server(config)

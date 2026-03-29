@@ -1,6 +1,7 @@
 {
     "python-envs.defaultEnvManager": "ms-python.python:venv",
     "python-envs.defaultPackageManager": "ms-python.python:pip",
+    "python.defaultInterpreterPath": "${workspace",
     "python-envs.pythonProjects": [],
     "files.associations": {
         "*.dbclient-js": "javascript",
@@ -9,6 +10,13 @@
         "optional": "cpp",
         "type_traits": "cpp",
         "limits": "cpp"
+    },
+    "files.watcherExclude": {
+        "**/build/**": true,
+        "**/.venv/**": true,
+        "**/__pycache__/**": true,
+        "**/frontend/node_modules/**": true,
+        "**/docs/build/**": true
     },
     "makefile.configureOnOpen": false,
     "C_Cpp.default.compilerPath": "/usr/bin/g++-13",
@@ -26,5 +34,4 @@
         "editor.defaultFormatter": "biomejs.biome"
     },
     "biome.lsp.bin": "/usr/local/bin/biome",
-    "python.defaultInterpreterPath": "/usr/bin/python3",
 }

@@ -2,20 +2,21 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
 import { cn } from "@/utils/cn";
-import type { ReactNode } from "react";
+import type { HTMLAttributes, ReactNode } from "react";
 
-interface CardProps {
+interface CardProps extends HTMLAttributes<HTMLElement> {
   children: ReactNode;
   className?: string;
 }
 
-export function Card({ children, className }: CardProps) {
+export function Card({ children, className, ...rest }: CardProps) {
   return (
     <section
       className={cn(
         "bg-muted border border-line rounded-lg overflow-hidden",
         className,
       )}
+      {...rest}
     >
       {children}
     </section>

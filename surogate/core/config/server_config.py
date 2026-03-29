@@ -12,6 +12,10 @@ class ServerConfig:
     workers: int = 1
     log_level: str = 'info'
     database_url: str = 'sqlite+aiosqlite:///surogate.db'
+    lakefs_endpoint: Optional[str] = None
+    lakefs_s3_endpoint: Optional[str] = None
+    lakefs_access_key: Optional[str] = None
+    lakefs_secret_key: Optional[str] = None
 
     def __init__(self, cfg: DictDefault):
         self.host = cfg.get('host', self.host)

@@ -79,6 +79,12 @@ const HubPage = lazy(() =>
   })),
 );
 
+const RepoDetailPage = lazy(() =>
+  import("@/features/hub/repo-detail-page").then((m) => ({
+    default: m.RepoDetailPage,
+  })),
+);
+
 function StudioLayout() {
   useInitialData();
   return <Outlet />;
@@ -160,5 +166,22 @@ export const trainingRoute = createRoute({
 export const hubRoute = createRoute({
   getParentRoute: () => Route,
   path: "/hub",
+  component: Outlet,
+});
+
+export const hubIndexRoute = createRoute({
+  getParentRoute: () => hubRoute,
+  path: "/",
   component: HubPage,
+});
+
+function RepoDetailWrapper() {
+  const { _splat } = repoDetailRoute.useParams();
+  return <RepoDetailPage repoId={_splat} />;
+}
+
+export const repoDetailRoute = createRoute({
+  getParentRoute: () => hubRoute,
+  path: "$",
+  component: RepoDetailWrapper,
 });

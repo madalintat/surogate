@@ -86,7 +86,7 @@ create_cluster() {
     done
     
     tmp_config=$(mktemp /tmp/k3d-config-XXXXXX.yaml)
-    envsubst < "${SCRIPT_DIR}/config.yaml" > "$tmp_config"
+    envsubst < "${SCRIPT_DIR}/cluster.yaml" > "$tmp_config"
     "$K3D" cluster create --config "$tmp_config"
     rm -f "$tmp_config"
 }
@@ -158,6 +158,18 @@ install_lakefs() {
     "$KUBECTL" apply -f ./lakefs/s3-service.yml
 }
 
+create_server_config() {
+    cat >"${SUROGATE_DIR}/config.yaml" <<EOF
+host: 127.0.0.1
+port: 8888
+database_url: sqlite+aiosqlite:///${SUROGATE_DIR}/surogate.db
+lakefs_endpoint: https://lakefs.k8s.localhost
+lakefs_s3_endpoint: https://lakefs-s3.k8s.localhost
+lakefs_access_key: $LAKEFS_ACCESS_KEY_ID
+lakefs_secret_key: $LAKEFS_SECRET_ACCESS_KEY
+EOF
+}
+
 # Check if any k3d clusters exist
 existing=$("$K3D" cluster list -o json | jq -r '.[].name')
 if [ -n "$existing" ]; then
@@ -178,3 +190,6 @@ export KUBECONFIG="$SUROGATE_DIR/kubeconfig"
 
 install_traefik
 install_lakefs
+create_server_config
+
+echo -e "${GREEN}✓ Cluster setup complete!${NC}"

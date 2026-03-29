@@ -39,6 +39,8 @@ class User(UUIDMixin, TimestampMixin, Base):
     password_hash: Mapped[str] = mapped_column(sa.String(512), default="")
     jwt_secret: Mapped[str] = mapped_column(sa.String(256), default="")
     must_change_password: Mapped[bool] = mapped_column(sa.Boolean, default=False)
+    hub_key: Mapped[str] = mapped_column(sa.String(128), default="")
+    hub_secret: Mapped[str] = mapped_column(sa.String(128), default="")
     avatar_url: Mapped[Optional[str]] = mapped_column(sa.String(2048), nullable=True)
     last_login_at: Mapped[Optional[datetime]] = mapped_column(
         sa.DateTime, nullable=True

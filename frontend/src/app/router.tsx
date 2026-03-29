@@ -20,6 +20,8 @@ import {
   datasetsRoute,
   trainingRoute,
   hubRoute,
+  hubIndexRoute,
+  repoDetailRoute,
 } from "./routes/studio";
 import { Route as indexRoute } from "./routes/index";
 
@@ -40,7 +42,7 @@ const routeTree = rootRoute.addChildren([
     playgroundRoute,
     datasetsRoute,
     trainingRoute,
-    hubRoute,
+    hubRoute.addChildren([hubIndexRoute, repoDetailRoute]),
   ]),
 ]);
 
