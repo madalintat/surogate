@@ -1,0 +1,53 @@
+// Copyright (c) 2026, Invergent SA, developed by Flavius Burca
+// SPDX-License-Identifier: AGPL-3.0-only
+//
+import { createRouter } from "@tanstack/react-router";
+import { Route as rootRoute } from "./routes/__root";
+import { Route as loginRoute } from "./routes/login";
+import { Route as onboardingRoute } from "./routes/onboarding";
+import { Route as changePasswordRoute } from "./routes/change-password";
+import {
+  Route as studioRoute,
+  studioIndexRoute,
+  agentsRoute,
+  modelsRoute,
+  skillsRoute,
+  computeRoute,
+  monitoringRoute,
+  conversationsRoute,
+  evaluationsRoute,
+  playgroundRoute,
+  datasetsRoute,
+  trainingRoute,
+  hubRoute,
+} from "./routes/studio";
+import { Route as indexRoute } from "./routes/index";
+
+const routeTree = rootRoute.addChildren([
+  indexRoute,
+  onboardingRoute,
+  loginRoute,
+  changePasswordRoute,
+  studioRoute.addChildren([
+    studioIndexRoute,
+    agentsRoute,
+    modelsRoute,
+    skillsRoute,
+    computeRoute,
+    monitoringRoute,
+    conversationsRoute,
+    evaluationsRoute,
+    playgroundRoute,
+    datasetsRoute,
+    trainingRoute,
+    hubRoute,
+  ]),
+]);
+
+export const router = createRouter({ routeTree });
+
+declare module "@tanstack/react-router" {
+  interface Register {
+    router: typeof router;
+  }
+}

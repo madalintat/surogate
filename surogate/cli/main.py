@@ -19,6 +19,7 @@ COMMAND_MAPPING: Dict[str, str] = {
     'vf-init': 'surogate.cli.vf_init',
     'vf-eval': 'surogate.cli.vf_eval',
     'tokenize': 'surogate.cli.tokenize_cmd',
+    'server': 'surogate.cli.server',
 }
 
 def _get_version() -> str:
@@ -75,6 +76,10 @@ def parse_args():
     # tokenize command
     from surogate.cli.tokenize_cmd import prepare_command_parser as tokenize_prepare_command_parser
     tokenize_prepare_command_parser(subparsers.add_parser('tokenize', help="Tokenize datasets for training"))
+
+    # server command
+    from surogate.cli.server import prepare_command_parser as serve_prepare_command_parser
+    serve_prepare_command_parser(subparsers.add_parser('server', help="Start the Surogate HTTP server"))
 
     args = parser.parse_args(sys.argv[1:])
     if args.command is None:

@@ -1,0 +1,161 @@
+"""
+Main FastAPI application for Surogate
+"""
+import os
+import sys
+from pathlib import Path as _Path
+
+from surogate.core.db.engine import get_session_factory
+from surogate.server.auth.authentication import get_current_subject
+from surogate.utils.logger import get_logger
+
+# Ensure backend dir is on sys.path so _platform_compat is importable when
+# main.py is launched directly (e.g. `uvicorn main:app`).
+_backend_dir = str(_Path(__file__).parent)
+if _backend_dir not in sys.path:
+    sys.path.insert(0, _backend_dir)
+
+from contextlib import asynccontextmanager
+
+from fastapi import Depends, FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse, Response
+from pathlib import Path
+
+from routes import auth_router, project_router
+
+logger = get_logger()
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    from surogate.core.db import init_engine, create_all_tables
+    from surogate.core.db.repository import auth as auth_repository
+
+    db_url = getattr(app.state, "database_url", "sqlite+aiosqlite:///surogate.db")
+    engine = init_engine(db_url)
+    await create_all_tables()
+
+    factory = get_session_factory()
+    async with factory() as session:
+        await auth_repository.seed_admin_user(session)
+        
+    logger.info(f"Database ready: {db_url}")
+    yield
+    await engine.dispose()
+
+
+# Create FastAPI app
+app = FastAPI(
+    title = "Surogate Server",
+    version = "1.0.0",
+    description = "Backend API for Surogate",
+    lifespan = lifespan,
+)
+
+
+# CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins = ["*"],  # In production, specify allowed origins
+    allow_credentials = True,
+    allow_methods = ["*"],
+    allow_headers = ["*"],
+)
+
+# ============ Register API Routes ============
+app.include_router(auth_router, prefix = "/api/auth", tags = ["auth"])
+app.include_router(project_router, prefix = "/api", tags = ["projects"])
+
+
+# ============ Health and System Endpoints ============
+@app.post("/api/shutdown")
+async def shutdown_server(
+    request: Request,
+    current_subject: str = Depends(get_current_subject),
+):
+    """Gracefully shut down the Surogate server.
+
+    Called by the frontend quit dialog so users can stop the server from the UI
+    without needing to use the CLI or kill the process manually.
+    """
+    import asyncio
+
+    async def _delayed_shutdown():
+        await asyncio.sleep(0.2)  # Let the HTTP response return first
+        trigger = getattr(request.app.state, "trigger_shutdown", None)
+        if trigger is not None:
+            trigger()
+        else:
+            # Fallback when not launched via run_server() (e.g. direct uvicorn)
+            import signal
+            import os
+
+            os.kill(os.getpid(), signal.SIGTERM)
+
+    request.app.state._shutdown_task = asyncio.create_task(_delayed_shutdown())
+    return {"status": "shutting_down"}
+
+
+
+# ============ Serve Frontend ============
+
+def _strip_crossorigin(html_bytes: bytes) -> bytes:
+    """Remove ``crossorigin`` attributes from script/link tags.
+
+    Vite adds ``crossorigin`` by default which forces CORS mode on font
+    subresource loads.  When Studio is served over plain HTTP, Firefox
+    HTTPS-Only Mode does not exempt CORS font requests -- causing all
+    @font-face downloads to fail silently.  Stripping the attribute
+    makes them regular same-origin fetches that work on any protocol.
+    """
+    import re as _re
+
+    html = html_bytes.decode("utf-8")
+    html = _re.sub(r'\s+crossorigin(?:="[^"]*")?', "", html)
+    return html.encode("utf-8")
+
+def setup_frontend(app: FastAPI, build_path: Path):
+    """Mount frontend static files (optional)"""
+    if not build_path.exists():
+        return False
+
+    # Mount assets
+    assets_dir = build_path / "assets"
+    if assets_dir.exists():
+        app.mount("/assets", StaticFiles(directory = assets_dir), name = "assets")
+
+    @app.get("/")
+    async def serve_root():
+        content = (build_path / "index.html").read_bytes()
+        content = _strip_crossorigin(content)
+        return Response(
+            content = content,
+            media_type = "text/html",
+            headers = {"Cache-Control": "no-cache, no-store, must-revalidate"},
+        )
+
+    @app.get("/{full_path:path}")
+    async def serve_frontend(full_path: str):
+        if full_path.startswith("api"):
+            return {"error": "API endpoint not found"}
+
+        file_path = (build_path / full_path).resolve()
+
+        # Block path traversal — ensure resolved path stays inside build_path
+        if not file_path.is_relative_to(build_path.resolve()):
+            return Response(status_code = 403)
+
+        if file_path.is_file():
+            return FileResponse(file_path)
+
+        # Serve index.html as bytes — avoids Content-Length mismatch
+        content = (build_path / "index.html").read_bytes()
+        content = _strip_crossorigin(content)
+        return Response(
+            content = content,
+            media_type = "text/html",
+            headers = {"Cache-Control": "no-cache, no-store, must-revalidate"},
+        )
+
+    return True
