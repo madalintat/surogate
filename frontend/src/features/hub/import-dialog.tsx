@@ -1,12 +1,14 @@
 // Copyright (c) 2026, Invergent SA, developed by Flavius Burca
 // SPDX-License-Identifier: AGPL-3.0-only
 //
-import { useState } from "react";
+import { useState, useEffect, useRef } from "react";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { cn } from "@/utils/cn";
+import { hfSearch, type HFItem } from "@/utils/hf";
+import { Loader2, Download } from "lucide-react";
 
 type ImportSource = "huggingface" | "modelscope";
 type ImportType = "model" | "dataset";
@@ -28,6 +30,51 @@ function ImportForm({ source, onImport, onClose }: { source: ImportSource; onImp
   const [repoId, setRepoId] = useState("");
   const [subset, setSubset] = useState("");
   const [token, setToken] = useState("");
+
+  // HuggingFace live search
+  const [hfResults, setHfResults] = useState<HFItem[]>([]);
+  const [hfLoading, setHfLoading] = useState(false);
+  const [showResults, setShowResults] = useState(false);
+  const justSelected = useRef(false);
+  const containerRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (source !== "huggingface" || repoId.length < 3 || justSelected.current) {
+      justSelected.current = false;
+      setHfResults([]);
+      setShowResults(false);
+      return;
+    }
+
+    setHfLoading(true);
+    const timer = setTimeout(async () => {
+      try {
+        const kind = type === "model" ? "models" : "datasets";
+        const results = await hfSearch(kind, repoId, 10, token || undefined);
+        setHfResults(results);
+        setShowResults(results.length > 0);
+      } catch {
+        setHfResults([]);
+        setShowResults(false);
+      } finally {
+        setHfLoading(false);
+      }
+    }, 300);
+
+    return () => { clearTimeout(timer); setHfLoading(false); };
+  }, [source, repoId, type, token]);
+
+  // Close dropdown on outside click
+  useEffect(() => {
+    if (!showResults) return;
+    const handler = (e: MouseEvent) => {
+      if (containerRef.current && !containerRef.current.contains(e.target as Node)) {
+        setShowResults(false);
+      }
+    };
+    document.addEventListener("mousedown", handler);
+    return () => document.removeEventListener("mousedown", handler);
+  }, [showResults]);
 
   const label = source === "huggingface" ? "HuggingFace" : "ModelScope";
   const placeholder = source === "huggingface" ? "meta-llama/Llama-3.1-8B" : "ZhipuAI/glm-4-9b";
@@ -57,16 +104,51 @@ function ImportForm({ source, onImport, onClose }: { source: ImportSource; onImp
           </div>
         </div>
 
-        <div>
+        <div ref={containerRef} className="relative">
           <label className="block mb-1 text-sm text-muted-foreground font-display">
             {label} Repository ID
           </label>
-          <Input
-            value={repoId}
-            onChange={(e) => setRepoId(e.target.value)}
-            placeholder={placeholder}
-            className="font-mono"
-          />
+          <div className="relative">
+            <Input
+              value={repoId}
+              onChange={(e) => setRepoId(e.target.value)}
+              onFocus={() => { if (hfResults.length > 0) setShowResults(true); }}
+              placeholder={placeholder}
+              className="font-mono"
+            />
+            {hfLoading && (
+              <Loader2 className="absolute right-2 top-1/2 -translate-y-1/2 animate-spin text-muted-foreground" size={14} />
+            )}
+          </div>
+          {showResults && hfResults.length > 0 && (
+            <div className="absolute z-50 mt-1 w-full max-h-56 overflow-y-auto rounded-lg border border-border bg-popover shadow-md">
+              {hfResults.map((item) => (
+                <button
+                  key={item.id}
+                  type="button"
+                  className="flex w-full items-center gap-2.5 px-2.5 py-2 text-left text-sm hover:bg-accent transition-colors cursor-pointer border-none bg-transparent"
+                  onClick={() => {
+                    justSelected.current = true;
+                    setRepoId(item.id);
+                    setShowResults(false);
+                  }}
+                >
+                  <div className="flex-1 min-w-0">
+                    <span className="font-mono text-foreground truncate block">{item.id}</span>
+                    {item.author && (
+                      <span className="text-xs text-muted-foreground">{item.author}</span>
+                    )}
+                  </div>
+                  {item.downloads != null && item.downloads > 0 && (
+                    <span className="flex items-center gap-1 text-xs text-faint shrink-0">
+                      <Download size={10} />
+                      {item.downloads.toLocaleString()}
+                    </span>
+                  )}
+                </button>
+              ))}
+            </div>
+          )}
         </div>
 
         {type === "dataset" && (

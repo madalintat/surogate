@@ -4,7 +4,6 @@ Runs as a standalone subprocess spawned by LocalTaskManager.
 Configuration is passed via environment variables.
 
 Stdout protocol:
-  PROGRESS: <downloaded>/<total>/<pct>%   — parsed by task manager
   ERROR: <message>                        — captured as error_message
 
 Exit codes: 0 = success, 1 = general failure, 77 = gated repo.
@@ -14,15 +13,14 @@ import asyncio
 import gc
 import json
 import os
+import shutil
 import sys
-import time
+import tempfile
 from multiprocessing import Process, Queue
-from threading import Event, Thread
 
 import lakefs_sdk
 import urllib3
 from datasets import load_dataset
-from huggingface_hub import get_paths_info, list_repo_files
 from huggingface_hub.errors import GatedRepoError
 
 urllib3.disable_warnings()
@@ -42,7 +40,6 @@ lakefs_endpoint = os.environ.get("LAKECTL_SERVER_ENDPOINT_URL", "")
 
 returncode = 0
 error_msg = ""
-_stop_monitoring = False
 
 
 # ── LakeFS helpers ───────────────────────────────────────────────────
@@ -80,62 +77,6 @@ def _lakefs_upload(path: str, content_path: str):
 
 
 # ── HuggingFace download ────────────────────────────────────────────
-
-def _get_repo_file_metadata(repo_id):
-    try:
-        files = list_repo_files(repo_id=repo_id, repo_type="dataset", token=hf_token or None)
-        files = [f for f in files if not f.startswith(".git")]
-        path_infos = get_paths_info(repo_id=repo_id, paths=files, repo_type="dataset", token=hf_token or None)
-        metadata = {}
-        total = 0
-        for f, info in zip(files, path_infos):
-            size = getattr(info, "size", 0) or 0
-            metadata[f] = size
-            total += size
-        return metadata, total
-    except Exception as e:
-        print(f"Error getting repo metadata: {e}")
-        return {}, 0
-
-
-def _get_cache_dir(repo_id):
-    from huggingface_hub.constants import HF_HUB_CACHE
-    return os.path.join(HF_HUB_CACHE, f"datasets--{repo_id.replace('/', '--')}")
-
-
-def _get_snapshot_path(repo_id):
-    snapshots = os.path.join(_get_cache_dir(repo_id), "snapshots")
-    if not os.path.isdir(snapshots):
-        return None
-    commits = sorted(os.listdir(snapshots))
-    return os.path.join(snapshots, commits[-1]) if commits else None
-
-
-def _downloaded_bytes(repo_id, file_metadata):
-    snap = _get_snapshot_path(repo_id)
-    if not snap:
-        return 0
-    total = 0
-    for name, expected in file_metadata.items():
-        path = os.path.join(snap, name)
-        if os.path.exists(path):
-            total += min(os.path.getsize(path), expected)
-    return total
-
-
-def _progress_monitor(file_metadata, total_bytes):
-    global _stop_monitoring
-    while not _stop_monitoring:
-        try:
-            done = _downloaded_bytes(hf_dataset_id, file_metadata)
-            pct = (done / total_bytes * 100) if total_bytes > 0 else 0
-            print(f"PROGRESS: {done}/{total_bytes}/{pct:.1f}%", flush=True)
-            if total_bytes > 0 and done >= total_bytes * 0.99:
-                break
-            time.sleep(2)
-        except Exception:
-            time.sleep(5)
-
 
 def _do_download(repo_id, subset, queue):
     try:
@@ -196,15 +137,9 @@ def _write_dataset_info(dataset):
 # ── Main ─────────────────────────────────────────────────────────────
 
 def download():
-    global returncode, error_msg, _stop_monitoring
+    global returncode, error_msg
     try:
-        file_metadata, total = _get_repo_file_metadata(hf_dataset_id)
-        monitor = Thread(target=_progress_monitor, args=(file_metadata, total), daemon=True)
-        monitor.start()
-
         result = _launch_download(hf_dataset_id, hf_dataset_subset)
-        _stop_monitoring = True
-        monitor.join(timeout=5)
 
         if isinstance(result, str) and result.startswith("error:"):
             returncode = 1
@@ -245,21 +180,21 @@ async def main():
         print(f"ERROR: {error_msg}")
         sys.exit(returncode)
 
-    # 2. Save to LakeFS
+    # 2. Save to LakeFS (via local temp dir to avoid lakefs_spec incompatibility)
     dataset = load_dataset(
         hf_dataset_id, hf_dataset_subset or None,
         token=hf_token or None, keep_in_memory=False,
     )
+    tmp_dir = tempfile.mkdtemp(prefix="surogate_ds_")
     try:
-        dataset.save_to_disk(
-            f"lakefs://{lakefs_repo_id}/{lakefs_branch}",
-            storage_options={
-                "username": lakefs_key,
-                "password": lakefs_secret,
-                "host": lakefs_endpoint,
-                "verify_ssl": False,
-            },
-        )
+        dataset.save_to_disk(tmp_dir)
+
+        # Upload all saved files to LakeFS
+        for root, _dirs, files in os.walk(tmp_dir):
+            for fname in files:
+                local_path = os.path.join(root, fname)
+                rel_path = os.path.relpath(local_path, tmp_dir)
+                _lakefs_upload(rel_path, local_path)
 
         # 3. Upload metadata
         _write_dataset_info(dataset)
@@ -274,6 +209,7 @@ async def main():
             print(f"ERROR: {e}")
             returncode = 1
     finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
         try:
             dataset.cleanup_cache_files()
         except Exception:

@@ -6,6 +6,8 @@ import { useNavigate } from "@tanstack/react-router";
 import { ArrowLeft, Loader2, Trash2, Upload } from "lucide-react";
 import { PageHeader } from "@/components/page-header";
 import { cn } from "@/utils/cn";
+import { ConfirmDialog } from "@/components/ui/confirm-dialog";
+import { toast } from "sonner";
 import { useHubStore } from "./hub-store";
 import { uploadObject } from "@/api/hub";
 import { UploadDialog } from "./upload-dialog";
@@ -41,7 +43,7 @@ export function RepoDetailPage({ repoId }: { repoId: string }) {
   const [selectedRef, setSelectedRef] = useState<string | null>(null);
   const [currentPath, setCurrentPath] = useState("");
   const [selectedObject, setSelectedObject] = useState<import("@/types/hub").ObjectStats | null>(null);
-  const [deleting, setDeleting] = useState(false);
+  const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
   const [showUpload, setShowUpload] = useState(false);
 
   useEffect(() => {
@@ -66,11 +68,14 @@ export function RepoDetailPage({ repoId }: { repoId: string }) {
   }, [repo, selectedRef, repoId, currentPath]);
 
   const handleDelete = async () => {
-    if (!confirm(`Delete repository "${repoId}"? This cannot be undone.`)) return;
-    setDeleting(true);
     const ok = await deleteRepository(repoId);
-    setDeleting(false);
-    if (ok) navigate({ to: "/studio/hub" });
+    if (ok) {
+      navigate({ to: "/studio/hub" });
+      toast.success(`Repository "${repoId}" deleted`);
+    } else {
+      setShowDeleteConfirm(false);
+      toast.error("Failed to delete repository", { description: error ?? undefined });
+    }
   };
 
   const handleUploadFiles = async (files: File[], uploadPath: string, onProgress: (name: string, percent: number) => void) => {
@@ -168,17 +173,27 @@ export function RepoDetailPage({ repoId }: { repoId: string }) {
           )}
           <button
             type="button"
-            onClick={handleDelete}
-            disabled={deleting}
+            onClick={() => setShowDeleteConfirm(true)}
             className={cn(
-              "px-3 py-1.5 rounded-md border border-destructive/30 bg-destructive/5 text-destructive cursor-pointer font-display hover:bg-destructive/10 transition-colors flex items-center gap-1.5 disabled:opacity-50",
+              "px-3 py-1.5 rounded-md border border-destructive/30 bg-destructive/5 text-destructive cursor-pointer font-display hover:bg-destructive/10 transition-colors flex items-center gap-1.5",
               detailTab !== "files" && "ml-auto",
             )}
           >
             <Trash2 size={14} />
-            {deleting ? "Deleting..." : "Delete"}
+            Delete
           </button>
         </div>
+
+        {/* delete confirmation dialog */}
+        <ConfirmDialog
+          open={showDeleteConfirm}
+          title="Delete Repository"
+          description={<>Are you sure you want to delete <span className="font-semibold text-foreground">{repoId}</span>? This action cannot be undone.</>}
+          confirmLabel="Delete"
+          confirmIcon={<Trash2 size={14} className="mr-1.5" />}
+          onConfirm={handleDelete}
+          onCancel={() => setShowDeleteConfirm(false)}
+        />
 
         {/* upload dialog */}
         {showUpload && (

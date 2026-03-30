@@ -76,6 +76,14 @@ export async function cancelTask(taskId: string): Promise<void> {
   }
 }
 
+export async function deleteTask(taskId: string): Promise<void> {
+  const response = await authFetch(`/api/tasks/${taskId}`, { method: "DELETE" });
+  if (!response.ok) {
+    const err = (await response.json().catch(() => null)) as { detail?: string } | null;
+    throw new Error(err?.detail ?? "Failed to delete task");
+  }
+}
+
 export async function getTaskLogs(taskId: string, tail = 100): Promise<TaskLogsResponse> {
   const response = await authFetch(`/api/tasks/${taskId}/logs?tail=${tail}`);
   if (!response.ok) {

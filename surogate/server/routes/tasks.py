@@ -110,6 +110,31 @@ async def cancel_task(
     return {"status": "cancelled"}
 
 
+@router.delete("/{task_id}")
+async def delete_task(
+    task_id: str,
+    request: Request,
+    current_subject: str = Depends(get_current_subject),
+    session: AsyncSession = Depends(get_session),
+):
+    """Cancel (if running) and delete a task record."""
+    result = await session.execute(
+        sa.select(LocalTask).where(LocalTask.id == task_id)
+    )
+    task = result.scalar_one_or_none()
+    if task is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+    if task.status in (LocalTaskStatus.pending, LocalTaskStatus.running):
+        manager = request.app.state.task_manager
+        try:
+            await manager.cancel(session, task_id)
+        except ValueError:
+            pass
+    await session.delete(task)
+    await session.commit()
+    return {"status": "deleted"}
+
+
 @router.get("/{task_id}/logs", response_model=TaskLogsResponse)
 async def get_task_logs(
     task_id: str,

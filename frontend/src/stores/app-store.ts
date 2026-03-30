@@ -23,6 +23,7 @@ type AppState = {
   addTask: (task: LocalTask) => void;
   fetchTasks: () => Promise<void>;
   cancelTask: (taskId: string) => Promise<void>;
+  deleteTask: (taskId: string) => Promise<void>;
   startTaskPolling: () => void;
   stopTaskPolling: () => void;
   _pollTimer: ReturnType<typeof setInterval> | null;
@@ -79,6 +80,11 @@ export const useAppStore = create<AppState>((set, get) => ({
         t.id === taskId ? { ...t, status: "cancelled" } : t,
       ),
     }));
+  },
+
+  deleteTask: async (taskId) => {
+    await tasksApi.deleteTask(taskId);
+    set((s) => ({ tasks: s.tasks.filter((t) => t.id !== taskId) }));
   },
 
   startTaskPolling: () => {

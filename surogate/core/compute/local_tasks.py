@@ -1,8 +1,7 @@
 """Local task manager — spawns and tracks subprocess-based tasks.
 
 Each task runs as a separate Python process (memory/IO isolation).
-Stdout is captured to a log file; PROGRESS: and ERROR: lines are
-parsed for status updates.
+Stdout is captured to a log file; ERROR: lines are parsed for status updates.
 """
 
 import asyncio
@@ -205,7 +204,6 @@ class LocalTaskManager:
             status = LocalTaskStatus.failed
 
         error_msg = _extract_error(str(TASKS_LOG_DIR / f"{task_id}.log"))
-        progress = _extract_last_progress(str(TASKS_LOG_DIR / f"{task_id}.log"))
 
         factory = get_session_factory()
         async with factory() as session:
@@ -216,7 +214,6 @@ class LocalTaskManager:
                     status=status,
                     exit_code=exit_code,
                     error_message=error_msg,
-                    progress=progress,
                     completed_at=datetime.utcnow(),
                 )
             )
@@ -298,6 +295,17 @@ class LocalTaskManager:
             if params.get("hf_dataset_subset"):
                 env["HF_DATASET_SUBSET"] = params["hf_dataset_subset"]
 
+        # Rclone config for the "lakefs" remote via env vars
+        if cfg.lakefs_s3_endpoint and creds and all(creds):
+            env["RCLONE_CONFIG_LAKEFS_TYPE"] = "s3"
+            env["RCLONE_CONFIG_LAKEFS_PROVIDER"] = "Other"
+            env["RCLONE_CONFIG_LAKEFS_ENV_AUTH"] = "false"
+            env["RCLONE_CONFIG_LAKEFS_NO_CHECK_BUCKET"] = "true"
+            
+            env["RCLONE_CONFIG_LAKEFS_ENDPOINT"] = cfg.lakefs_s3_endpoint
+            env["RCLONE_CONFIG_LAKEFS_ACCESS_KEY_ID"] = creds[0]
+            env["RCLONE_CONFIG_LAKEFS_SECRET_ACCESS_KEY"] = creds[1]
+
         return env
 
 
@@ -323,11 +331,3 @@ def _extract_error(log_path: Optional[str]) -> Optional[str]:
     return None
 
 
-def _extract_last_progress(log_path: Optional[str]) -> Optional[str]:
-    """Extract the last PROGRESS: line from a log file."""
-    if not log_path or not Path(log_path).exists():
-        return None
-    for line in reversed(Path(log_path).read_text().splitlines()):
-        if line.startswith("PROGRESS:"):
-            return line[len("PROGRESS:"):].strip()
-    return None

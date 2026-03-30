@@ -2,7 +2,7 @@ from typing import Optional, List, Union
 
 from sqlalchemy.ext.asyncio import AsyncSession
 import lakefs_sdk
-from lakefs_sdk import ApiClient, ApiException, RepositoryCreation, RepositoryList, Repository, RefList, Ref, BranchCreation, TagCreation, Commit, CommitList, ObjectStatsList, ObjectStats, AuthApi, UserCreation
+from lakefs_sdk import ApiClient, ApiException, RepositoryCreation, RepositoryList, Repository, RefList, Ref, BranchCreation, TagCreation, Commit, CommitList, ObjectStatsList, ObjectStats, AuthApi, UserCreation, Pagination
 
 from surogate.core.config.server_config import ServerConfig
 from surogate.core.db.repository.user import set_lakefs_credentials
@@ -54,26 +54,31 @@ async def init_lakefs(config: ServerConfig):
             logger.error(f"Error connecting to LakeFS: {e}")
             
     try:
-        # Ensure "users-policy" exists
-        auth_api.get_policy(USERS_POLICY)
+        # Ensure "users-policy" exists and is up to date
+        users_policy = lakefs_sdk.Policy(
+            id=USERS_POLICY,
+            statement=[
+                lakefs_sdk.Statement(
+                    effect="allow",
+                    resource="*",
+                    action=["fs:ListRepositories", "fs:CreateRepository", "fs:DeleteRepository", "fs:AttachStorageNamespace"]),
+                lakefs_sdk.Statement(
+                    effect="allow",
+                    resource="*",
+                    action=["auth:ListPolicies", "auth:GetPolicy", "auth:CreatePolicy", "auth:UpdatePolicy",
+                            "auth:AttachPolicyToUser", "auth:AttachPolicy"])
+            ]
+        )
+        try:
+            auth_api.get_policy(USERS_POLICY)
+            auth_api.update_policy(USERS_POLICY, policy=users_policy)
+        except ApiException as e:
+            if e.status == 404:
+                auth_api.create_policy(policy=users_policy)
+            else:
+                raise e
     except ApiException as e:
-        if e.status == 404:
-            auth_api.create_policy(policy=lakefs_sdk.Policy(
-                id=USERS_POLICY, 
-                statement=[
-                    lakefs_sdk.Statement(
-                        effect="allow", 
-                        resource="*",
-                        action=["fs:ListRepositories", "fs:CreateRepository", "fs:AttachStorageNamespace"]),
-                    lakefs_sdk.Statement(
-                        effect="allow", 
-                        resource="*",
-                        action=["auth:ListPolicies", "auth:GetPolicy", "auth:CreatePolicy", "auth:UpdatePolicy", 
-                                "auth:AttachPolicyToUser", "auth:AttachPolicy"])
-                ]
-            ))
-        else:
-            logger.error(f"Error connecting to LakeFS: {e}")
+        logger.error(f"Error connecting to LakeFS: {e}")
             
     # Attach "users-policy" to "Users" group
     try:
@@ -184,10 +189,10 @@ async def get_repository(client: ApiClient, repository: str) -> Optional[Reposit
 async def delete_repository(client: ApiClient, repository: str, user: str, config: ServerConfig) -> bool:
     try:
         repos_api = lakefs_sdk.RepositoriesApi(client)
-        
+
         repo_group = f"repo-{repository}"
         policy_id = f"{repository}-full-access"
-                
+
         admin_client = await get_lakefs_admin_client(config)
         auth_api = lakefs_sdk.AuthApi(admin_client)
         
@@ -232,7 +237,7 @@ async def get_branches(client: ApiClient, repository: str) -> RefList:
         return branches_api.list_branches(repository=repository)
     except ApiException as e:
         logger.error(f"Error retrieving LakeFS branches for repository '{repository}': {e}")
-        return RefList(pagination=None, results=[])
+        return RefList(pagination=Pagination(has_more=False, next_offset="", results=0, max_per_page=0), results=[])
 
 async def create_branch(client: ApiClient, repository: str, branch: str, source: Optional[str] = None) -> Optional[str]:
     try:
@@ -272,7 +277,7 @@ async def get_tags(client: ApiClient, repository: str) -> RefList:
         return tags_api.list_tags(repository=repository)
     except ApiException as e:
         logger.error(f"Error retrieving LakeFS tags for repository '{repository}': {e}")
-        return RefList(pagination=None, results=[])
+        return RefList(pagination=Pagination(has_more=False, next_offset="", results=0, max_per_page=0), results=[])
 
 async def create_tag(client: ApiClient, repository: str, tag: str, commit: Optional[str] = None) -> Optional[str]:
     try:
@@ -310,7 +315,7 @@ async def get_commits(client: ApiClient, repository: str, ref: str) -> CommitLis
         return commits_api.log_commits(repository=repository, ref=ref)
     except ApiException as e:
         logger.error(f"Error retrieving LakeFS commits for repository '{repository}' and ref '{ref}': {e}")
-        return CommitList(pagination=None, results=[])
+        return CommitList(pagination=Pagination(has_more=False, next_offset="", results=0, max_per_page=0), results=[])
 
 async def get_commit(client: ApiClient, repository: str, commit_id: str) -> Optional[Commit]:
     try:
@@ -327,7 +332,7 @@ async def get_objects(client: ApiClient, repository: str, ref: str, prefix: Opti
         return objects_api.list_objects(repository=repository, ref=ref, prefix=prefix, delimiter="/")
     except ApiException as e:
         logger.error(f"Error retrieving LakeFS objects for repository '{repository}' and ref '{ref}': {e}")
-        return ObjectStatsList(pagination=None, results=[])
+        return ObjectStatsList(pagination=Pagination(has_more=False, next_offset="", results=0, max_per_page=0), results=[])
     
 async def delete_object(client: ApiClient, repository: str, branch: str, path: str) -> bool:
     try:

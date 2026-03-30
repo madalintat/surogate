@@ -11,9 +11,10 @@ import { TYPE_META } from "./hub-data";
 import type { RepoType } from "./hub-data";
 import { CreateRepoDialog } from "./create-repo-dialog";
 import { ImportDialog } from "./import-dialog";
-import { Database, GitBranch, Clock, Download, LayoutGrid, Loader2, Plus } from "lucide-react";
+import { Database, GitBranch, Clock, Download, LayoutGrid, Loader2, Plus, RefreshCw } from "lucide-react";
 import { useAppStore } from "@/stores/app-store";
 import { spawnTask } from "@/api/tasks";
+import { toast } from "sonner";
 
 export function HubPage() {
   const navigate = useNavigate();
@@ -95,8 +96,17 @@ export function HubPage() {
           <span className="text-faint">{filtered.length} results</span>
           <button
             type="button"
+            onClick={() => fetchRepositories()}
+            disabled={loading}
+            className="ml-auto flex items-center gap-1.5 px-3 py-1.5 rounded-md border border-border text-muted-foreground cursor-pointer font-display hover:text-foreground transition-colors disabled:opacity-50"
+          >
+            <RefreshCw size={14} className={loading ? "animate-spin" : ""} />
+            Refresh
+          </button>
+          <button
+            type="button"
             onClick={() => setShowImport(true)}
-            className="ml-auto flex items-center gap-1.5 px-3 py-1.5 rounded-md border border-border text-muted-foreground cursor-pointer font-display hover:text-foreground transition-colors"
+            className="flex items-center gap-1.5 px-3 py-1.5 rounded-md border border-border text-muted-foreground cursor-pointer font-display hover:text-foreground transition-colors"
           >
             <Download size={14} />
             Import
@@ -187,8 +197,13 @@ export function HubPage() {
               },
             });
             addTask(task);
+            toast.success(`Import started: ${params.repoId}`, {
+              description: "Track progress in Compute \u2192 Workload Queue",
+            });
           } catch (e) {
-            console.error("Failed to start import task:", e);
+            toast.error("Failed to start import", {
+              description: (e as Error).message,
+            });
           }
         }}
       />

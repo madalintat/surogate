@@ -6,11 +6,14 @@ import argparse
 import signal
 from threading import Thread
 import traceback
-    
+import urllib3
+
 from surogate.core.config.loader import load_config
 from surogate.core.config.server_config import ServerConfig
 from surogate.utils.logger import get_logger
+
 logger = get_logger()
+urllib3.disable_warnings()
 
 # The uvicorn server instance -- set by run_server(), used by callers
 # that need to tell the server to exit (e.g. signal handlers).

@@ -4,7 +4,6 @@ Runs as a standalone subprocess spawned by LocalTaskManager.
 Configuration is passed via environment variables.
 
 Stdout protocol:
-  PROGRESS: <downloaded>/<total>/<pct>%   — parsed by task manager
   ERROR: <message>                        — captured as error_message
 
 Exit codes: 0 = success, 1 = general failure, 77 = gated repo.
@@ -14,13 +13,11 @@ import asyncio
 import json
 import os
 import sys
-import time
 from multiprocessing import Process, Queue
-from threading import Event, Thread
 
 import lakefs_sdk
 import urllib3
-from huggingface_hub import HfFileSystem, list_repo_files, snapshot_download
+from huggingface_hub import HfFileSystem, snapshot_download
 from huggingface_hub.errors import GatedRepoError
 from transformers import AutoTokenizer
 
@@ -45,7 +42,6 @@ ALLOW_PATTERNS = [
 
 returncode = 0
 error_msg = ""
-_stop_monitoring = False
 
 
 # ── LakeFS helpers ───────────────────────────────────────────────────
@@ -84,34 +80,6 @@ def _lakefs_upload(path: str, content_path: str):
 
 # ── HuggingFace download ────────────────────────────────────────────
 
-def _get_repo_file_metadata(repo_id, allow_patterns):
-    try:
-        files = list_repo_files(repo_id, token=hf_token or None)
-        files = [f for f in files if not f.startswith(".git")]
-        if allow_patterns:
-            import fnmatch
-            files = [
-                f for f in files
-                if any(fnmatch.fnmatch(f, p) for p in allow_patterns)
-            ]
-        fs = HfFileSystem(token=hf_token or None)
-        metadata = {}
-        total = 0
-        for f in files:
-            try:
-                info = fs.info(f"{repo_id}/{f}")
-                size = info.get("size", 0)
-                metadata[f] = size
-                total += size
-            except Exception as e:
-                print(f"  Warning: Could not get size for {f}: {e}")
-                metadata[f] = 0
-        return metadata, total
-    except Exception as e:
-        print(f"Error getting repo metadata: {e}")
-        return {}, 0
-
-
 def _get_cache_dir(repo_id):
     from huggingface_hub.constants import HF_HUB_CACHE
     return os.path.join(HF_HUB_CACHE, f"models--{repo_id.replace('/', '--')}")
@@ -123,32 +91,6 @@ def _get_snapshot_path(repo_id):
         return None
     commits = sorted(os.listdir(snapshots))
     return os.path.join(snapshots, commits[-1]) if commits else None
-
-
-def _downloaded_bytes(repo_id, file_metadata):
-    snap = _get_snapshot_path(repo_id)
-    if not snap:
-        return 0
-    total = 0
-    for name, expected in file_metadata.items():
-        path = os.path.join(snap, name)
-        if os.path.exists(path):
-            total += min(os.path.getsize(path), expected)
-    return total
-
-
-def _progress_monitor(file_metadata, total_bytes):
-    global _stop_monitoring
-    while not _stop_monitoring:
-        try:
-            done = _downloaded_bytes(hf_model_id, file_metadata)
-            pct = (done / total_bytes * 100) if total_bytes > 0 else 0
-            print(f"PROGRESS: {done}/{total_bytes}/{pct:.1f}%", flush=True)
-            if total_bytes > 0 and done >= total_bytes * 0.99:
-                break
-            time.sleep(2)
-        except Exception:
-            time.sleep(5)
 
 
 def _do_download(repo_id, queue, allow_patterns):
@@ -198,7 +140,7 @@ def _delete_cache(repo_id):
 # ── Main ─────────────────────────────────────────────────────────────
 
 def download():
-    global returncode, error_msg, _stop_monitoring
+    global returncode, error_msg
 
     try:
         _check_gated(hf_model_id)
@@ -208,13 +150,7 @@ def download():
         return
 
     try:
-        file_metadata, total = _get_repo_file_metadata(hf_model_id, ALLOW_PATTERNS)
-        monitor = Thread(target=_progress_monitor, args=(file_metadata, total), daemon=True)
-        monitor.start()
-
         result = _launch_download(hf_model_id, ALLOW_PATTERNS)
-        _stop_monitoring = True
-        monitor.join(timeout=5)
 
         if isinstance(result, str) and result.startswith("error:"):
             returncode = 1

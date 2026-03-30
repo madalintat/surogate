@@ -55,7 +55,10 @@ export const useHubStore = create<HubState>((set) => ({
     set({ error: null });
     try {
       await api.deleteRepository(repository);
-      set((s) => ({ repositories: s.repositories.filter((r) => r.id !== repository) }));
+      set((s) => ({ 
+        repositories: s.repositories.filter((r) => r.id !== repository), 
+        currentRepo: null
+      }));
       return true;
     } catch (e) {
       set({ error: (e as Error).message });
