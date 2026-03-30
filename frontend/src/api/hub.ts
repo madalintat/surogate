@@ -2,8 +2,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
 import { authFetch } from "@/api/auth";
+import { getAuthToken } from "@/features/auth";
 
-import type { RepositoryList, Repository, RefList, Ref, CommitList, Commit, ObjectStatsList, ObjectStats } from "@/types/hub";
+import type { RepositoryList, Repository, RefList, Ref, CommitList, Commit, ObjectStatsList, ObjectStats, RepositoryCreation } from "@/types/hub";
 
 // ============ Repositories ============
 
@@ -43,17 +44,24 @@ export async function deleteRepository(repository: string): Promise<{ success: b
       return (await response.json()) as { success: boolean };
 }
 
-export async function createRepository(repoName: string, repoType: string): Promise<Repository> {
-    const params = new URLSearchParams({ repo_name: repoName, repo_type: repoType });
-    const response = await authFetch(`/api/hub/repositories?${params}`, {
+export async function createRepository(creationRequest: RepositoryCreation): Promise<Repository> {
+    const response = await authFetch("/api/hub/repositories", {
         method: "POST",
+        body: JSON.stringify(creationRequest),
+        headers: {
+            "Content-Type": "application/json",
+        },
     });
     if (!response.ok) {
         const err = (await response.json().catch(() => null)) as { detail?: string } | null;
-        throw new Error(err?.detail ?? `Failed to create repository '${repoName}'`);
+        throw new Error(err?.detail ?? `Failed to create repository '${creationRequest.name}'`);
       }
-    
-      return (await response.json()) as Repository;
+
+      const repo = (await response.json()) as Repository | null;
+      if (!repo) {
+        throw new Error(`Failed to create repository '${creationRequest.name}'`);
+      }
+      return repo;
 }
 
 // ============ Branches ============
@@ -177,7 +185,7 @@ export async function listObjects(repository: string, ref: string, prefix?: stri
     return (await response.json()) as ObjectStatsList;
 }
 
-export async function getObject(repository: string, ref: string, path: string): Promise<ObjectStats> {
+export async function statObject(repository: string, ref: string, path: string): Promise<ObjectStats> {
     const params = new URLSearchParams({ path });
     const response = await authFetch(`/api/hub/repositories/${repository}/refs/${ref}/objects?${params}`);
     if (!response.ok) {
@@ -185,4 +193,64 @@ export async function getObject(repository: string, ref: string, path: string): 
         throw new Error(err?.detail ?? `Failed to fetch object '${path}'`);
     }
     return (await response.json()) as ObjectStats;
+}
+
+export async function getObjectContent(repository: string, ref: string, path: string): Promise<string | null> {
+    const params = new URLSearchParams({ path });
+    const response = await authFetch(`/api/hub/repositories/${repository}/refs/${ref}/objects/content?${params}`);
+    if (response.status === 404) return null;
+    if (!response.ok) {
+        const err = (await response.json().catch(() => null)) as { detail?: string } | null;
+        throw new Error(err?.detail ?? `Failed to fetch object content '${path}'`);
+    }
+    return (await response.json()) as string;
+}
+
+// ============ Upload ============
+
+export function uploadObject(
+    repository: string,
+    branch: string,
+    path: string,
+    file: File,
+    onProgress?: (percent: number) => void,
+): Promise<ObjectStats> {
+    return new Promise((resolve, reject) => {
+        const params = new URLSearchParams({ path });
+        const url = `/api/hub/repositories/${encodeURIComponent(repository)}/branches/${encodeURIComponent(branch)}/objects?${params}`;
+
+        const xhr = new XMLHttpRequest();
+        xhr.upload.addEventListener("progress", (e) => {
+            if (onProgress && e.lengthComputable) {
+                onProgress((e.loaded / e.total) * 100);
+            }
+        });
+        xhr.addEventListener("load", () => {
+            if (xhr.status >= 200 && xhr.status < 300) {
+                try {
+                    resolve(JSON.parse(xhr.responseText) as ObjectStats);
+                } catch {
+                    reject(new Error("Invalid response from server"));
+                }
+            } else {
+                try {
+                    const err = JSON.parse(xhr.responseText) as { detail?: string };
+                    reject(new Error(err.detail ?? `Upload failed (${xhr.status})`));
+                } catch {
+                    reject(new Error(`Upload failed (${xhr.status})`));
+                }
+            }
+        });
+        xhr.addEventListener("error", () => reject(new Error("Upload failed")));
+        xhr.addEventListener("abort", () => reject(new Error("Upload aborted")));
+
+        xhr.open("POST", url, true);
+        xhr.setRequestHeader("Accept", "application/json");
+        const token = getAuthToken();
+        if (token) xhr.setRequestHeader("Authorization", `Bearer ${token}`);
+
+        const data = new FormData();
+        data.append("content", file);
+        xhr.send(data);
+    });
 }

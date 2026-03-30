@@ -1,81 +1,81 @@
 // Copyright (c) 2026, Invergent SA, developed by Flavius Burca
 // SPDX-License-Identifier: AGPL-3.0-only
 //
-import { useState, useMemo } from "react";
+import { useState, useMemo, useEffect } from "react";
 import { useNavigate } from "@tanstack/react-router";
 import { PageHeader } from "@/components/page-header";
 import { Card } from "@/components/ui/card";
-import { cn } from "@/utils/cn";
-import {
-  REPO_ITEMS,
-  TYPE_META,
-  VIS_COLORS,
-} from "./hub-data";
-import type { RepoItem } from "./hub-data";
-import { Download, Heart, LayoutGrid } from "lucide-react";
+import { useHubStore } from "./hub-store";
+import { RepositoryType } from "@/types/hub";
+import { TYPE_META } from "./hub-data";
+import type { RepoType } from "./hub-data";
+import { CreateRepoDialog } from "./create-repo-dialog";
+import { ImportDialog } from "./import-dialog";
+import { Database, GitBranch, Clock, Download, LayoutGrid, Loader2, Plus } from "lucide-react";
 
 export function HubPage() {
   const navigate = useNavigate();
-  const [filterType, setFilterType] = useState<string>("all");
+  const { repositories = [], loading, error, fetchRepositories, createRepository: storeCreate } = useHubStore();
   const [filterSearch, setFilterSearch] = useState("");
-  const [filterSort, setFilterSort] = useState("updated");
+  const [filterType, setFilterType] = useState<string>("all");
   const [selectedTag, setSelectedTag] = useState<string | null>(null);
+  const [showCreate, setShowCreate] = useState(false);
+  const [showImport, setShowImport] = useState(false);
+
+  useEffect(() => {
+    void fetchRepositories();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const counts: Record<string, number> = useMemo(() => {
+    const c: Record<string, number> = { all: repositories.length };
+    for (const t of Object.values(RepositoryType)) c[t] = 0;
+    for (const r of repositories) {
+      const t = r.metadata?.type;
+      if (t && t in c) c[t]++;
+    }
+    return c;
+  }, [repositories]);
+
+  const allTags = useMemo(() => {
+    const set = new Set<string>();
+    for (const r of repositories) {
+      if (r.metadata?.tags) r.metadata.tags.split(",").forEach((t) => set.add(t.trim()));
+    }
+    return [...set].sort();
+  }, [repositories]);
 
   const filtered = useMemo(() => {
-    let items = REPO_ITEMS as RepoItem[];
-    if (filterType !== "all") items = items.filter((r) => r.type === filterType);
-    if (selectedTag) items = items.filter((r) => r.tags.includes(selectedTag));
+    let items = repositories;
+    if (filterType !== "all") items = items.filter((r) => r.metadata?.type === filterType);
+    if (selectedTag) items = items.filter((r) => r.metadata?.tags?.split(",").map((t) => t.trim()).includes(selectedTag));
     if (filterSearch) {
       const q = filterSearch.toLowerCase();
-      items = items.filter(
-        (r) =>
-          r.name.toLowerCase().includes(q) ||
-          r.displayName.toLowerCase().includes(q) ||
-          r.description.toLowerCase().includes(q) ||
-          r.tags.some((t) => t.includes(q)),
+      items = items.filter((r) =>
+        r.id.toLowerCase().includes(q) ||
+        (r.metadata?.description ?? "").toLowerCase().includes(q) ||
+        (r.metadata?.tags ?? "").toLowerCase().includes(q)
       );
     }
-    if (filterSort === "downloads") items = [...items].sort((a, b) => b.downloads - a.downloads);
-    else if (filterSort === "likes") items = [...items].sort((a, b) => b.likes - a.likes);
     return items;
-  }, [filterType, filterSearch, filterSort, selectedTag]);
-
-  const counts: Record<string, number> = {
-    all: REPO_ITEMS.length,
-    model: REPO_ITEMS.filter((r) => r.type === "model").length,
-    dataset: REPO_ITEMS.filter((r) => r.type === "dataset").length,
-    agent: REPO_ITEMS.filter((r) => r.type === "agent").length,
-    skill: REPO_ITEMS.filter((r) => r.type === "skill").length,
-  };
-  const allTags = [...new Set(REPO_ITEMS.flatMap((r) => r.tags))].sort();
-
-  const typeFilters = [
-    { id: "all", icon: LayoutGrid, label: "All", count: counts.all, color: "#22C55E" },
-    ...Object.entries(TYPE_META).map(([id, m]) => ({
-      id,
-      icon: m.icon,
-      label: m.plural,
-      count: counts[id],
-      color: m.color,
-    })),
-  ];
+  }, [repositories, filterType, selectedTag, filterSearch]);
 
   return (
     <div className="flex-1 flex flex-col overflow-hidden bg-background">
       <PageHeader
         title="Hub"
-        subtitle={`${counts.model} models · ${counts.dataset} datasets · ${counts.agent} agents · ${counts.skill} skills`}
+        subtitle={`${repositories.length} repositories`}
       />
 
       {/* filter bar */}
       <div className="px-7 py-2.5 border-b border-line bg-card shrink-0">
-        <div className="flex items-center gap-3 mb-2">
+        <div className="flex items-center gap-3">
           <div className="flex items-center gap-2 px-2.5 py-1.5 bg-input border border-border rounded-md flex-1 max-w-[480px]">
             <span className="text-faint text-[13px]">⌕</span>
             <input
               value={filterSearch}
               onChange={(e) => setFilterSearch(e.target.value)}
-              placeholder="Search models, datasets, agents, skills..."
+              placeholder="Search repositories..."
               className="flex-1 bg-transparent border-none outline-none text-foreground font-mono"
             />
             {filterSearch && (
@@ -89,33 +89,40 @@ export function HubPage() {
             )}
           </div>
           <span className="text-faint">{filtered.length} results</span>
-          <select
-            value={filterSort}
-            onChange={(e) => setFilterSort(e.target.value)}
-            className="px-2 py-1 rounded border border-border bg-input text-muted-foreground font-display cursor-pointer outline-none"
+          <button
+            type="button"
+            onClick={() => setShowImport(true)}
+            className="ml-auto flex items-center gap-1.5 px-3 py-1.5 rounded-md border border-border text-muted-foreground cursor-pointer font-display hover:text-foreground transition-colors"
           >
-            <option value="updated">Recently updated</option>
-            <option value="downloads">Most downloads</option>
-            <option value="likes">Most liked</option>
-          </select>
+            <Download size={14} />
+            Import
+          </button>
+          <button
+            type="button"
+            onClick={() => setShowCreate(true)}
+            className="flex items-center gap-1.5 px-3 py-1.5 rounded-md border border-success/30 bg-success/5 text-success cursor-pointer font-display hover:bg-success/10 transition-colors"
+          >
+            <Plus size={14} />
+            New Repository
+          </button>
         </div>
-        <div className="flex items-center gap-1.5 flex-wrap">
-          {typeFilters.map((c) => (
+        <div className="flex items-center gap-1.5 flex-wrap mt-2">
+          {[
+            { id: "all", icon: LayoutGrid, label: "All", count: counts.all, color: "#22C55E" },
+            ...Object.entries(TYPE_META).map(([id, m]) => ({
+              id, icon: m.icon, label: m.plural, count: counts[id] ?? 0, color: m.color,
+            })),
+          ].map((c) => (
             <button
               key={c.id}
               type="button"
-              onClick={() => {
-                setFilterType(c.id);
-                setSelectedTag(null);
-              }}
-              className={cn(
-                "flex items-center gap-1.5 border px-2.5 py-1 rounded-[5px] cursor-pointer font-display transition-all duration-150",
-                filterType === c.id ? "font-semibold" : "font-normal",
-              )}
+              onClick={() => { setFilterType(c.id); setSelectedTag(null); }}
+              className="flex items-center gap-1.5 border px-2.5 py-1 rounded-[5px] cursor-pointer font-display transition-all duration-150"
               style={{
                 borderColor: filterType === c.id ? `${c.color}33` : "var(--border)",
                 background: filterType === c.id ? `${c.color}10` : "transparent",
                 color: filterType === c.id ? c.color : "var(--subtle)",
+                fontWeight: filterType === c.id ? 600 : 400,
               }}
             >
               <c.icon size={12} />
@@ -143,7 +150,7 @@ export function HubPage() {
             <button
               type="button"
               onClick={() => setSelectedTag(null)}
-              className="text-success cursor-pointer font-display font-semibold"
+              className="text-success cursor-pointer font-display font-semibold bg-transparent border-none"
             >
               CLEAR
             </button>
@@ -154,12 +161,44 @@ export function HubPage() {
         </div>
       </div>
 
-      {/* item list */}
+      {/* import dialog */}
+      <ImportDialog
+        open={showImport}
+        onClose={() => setShowImport(false)}
+        onImport={(params) => {
+          console.log("Import:", params);
+          setShowImport(false);
+        }}
+      />
+
+      {/* create dialog */}
+      <CreateRepoDialog
+        open={showCreate}
+        error={error}
+        onClose={() => setShowCreate(false)}
+        onCreate={storeCreate}
+      />
+
+      {/* content */}
       <div className="flex-1 overflow-y-auto px-7 py-4 pb-10">
-        <div className="flex flex-col gap-2">
-          {filtered.map((r) => {
-            const rtm = TYPE_META[r.type];
-            return (
+        {loading && (
+          <div className="py-10 flex justify-center text-faint">
+            <Loader2 className="animate-spin" size={20} />
+          </div>
+        )}
+
+        {error && (
+          <div className="py-10 text-center text-destructive">{error}</div>
+        )}
+
+        {!loading && !error && (
+          <div className="flex flex-col gap-2">
+            {filtered.map((r) => {
+              const repoType = r.metadata?.type as RepoType | undefined;
+              const meta = repoType ? TYPE_META[repoType] : null;
+              const Icon = meta?.icon ?? Database;
+              const color = meta?.color ?? "#6B7280";
+              return (
               <div
                 key={r.id}
                 onClick={() => navigate({ to: `/studio/hub/${r.id}` })}
@@ -169,67 +208,68 @@ export function HubPage() {
                   <div className="flex items-start gap-3">
                     <div
                       className="w-9 h-9 rounded-lg shrink-0 flex items-center justify-center text-base border"
-                      style={{
-                        background: `${rtm.color}10`,
-                        borderColor: `${rtm.color}22`,
-                        color: rtm.color,
-                      }}
+                      style={{ background: `${color}10`, borderColor: `${color}22`, color }}
                     >
-                      <rtm.icon size={18} />
+                      <Icon size={18} />
                     </div>
                     <div className="flex-1 min-w-0">
                       <div className="flex items-center gap-1.5 mb-0.5 flex-wrap">
-                        <span className="font-medium font-display" style={{ color: r.projectColor }}>{r.project}</span>
-                        <span className="text-faint">/</span>
-                        <span className="font-bold text-foreground font-display">{r.name}</span>
-                        <code className="text-muted-foreground bg-line px-[5px] py-px rounded">{r.version}</code>
-                        <span
-                          className="text-sm px-[5px] py-px rounded font-semibold uppercase border"
-                          style={{ background: `${rtm.color}12`, color: rtm.color, borderColor: `${rtm.color}25` }}
-                        >
-                          {rtm.label}
-                        </span>
-                        <span
-                          className="text-xs px-[5px] py-px rounded"
-                          style={{ background: VIS_COLORS[r.visibility].bg, color: VIS_COLORS[r.visibility].fg }}
-                        >
-                          {r.visibility}
-                        </span>
-                        {r.serving && (
-                          <span className="text-sm px-1 py-px rounded font-semibold border" style={{ background: "#22C55E12", color: "#22C55E", borderColor: "#22C55E20" }}>
-                            SERVING
+                        <span className="font-bold text-foreground font-display">{r.id}</span>
+                        {meta && (
+                          <span
+                            className="text-sm px-[5px] py-px rounded font-semibold uppercase border"
+                            style={{ background: `${color}12`, color, borderColor: `${color}25` }}
+                          >
+                            {meta.label}
+                          </span>
+                        )}
+                        {r.read_only && (
+                          <span className="text-xs px-[5px] py-px rounded bg-[#EF444412] text-[#EF4444]">
+                            read-only
                           </span>
                         )}
                       </div>
-                      <p className="text-sm text-subtle leading-normal mb-1.5 truncate">{r.description}</p>
+                      {r.metadata?.description && (
+                        <p className="text-sm text-subtle leading-normal mb-1.5 truncate">{r.metadata.description}</p>
+                      )}
                       <div className="flex items-center gap-2.5 text-sm text-faint">
-                        <span>{r.author}</span>
+                        <span className="flex items-center gap-1">
+                          <GitBranch size={12} />
+                          {r.default_branch}
+                        </span>
                         <span>·</span>
-                        <span>updated {r.updatedAt}</span>
-                        <span>·</span>
-                        <span>{r.size}</span>
-                        <span>·</span>
-                        <span className="flex items-center gap-1"><Download size={12} />{r.downloads}</span>
-                        <span>·</span>
-                        <span className="flex items-center gap-1"><Heart size={12} />{r.likes}</span>
+                        <span className="flex items-center gap-1">
+                          <Clock size={12} />
+                          {new Date(r.creation_date * 1000).toLocaleDateString()}
+                        </span>
                         <span className="flex-1" />
-                        <div className="flex gap-[3px]">
-                          {r.tags.slice(0, 4).map((t) => (
-                            <span key={t} className="text-sm px-1 py-px rounded bg-accent text-muted-foreground">{t}</span>
-                          ))}
-                          {r.tags.length > 4 && <span className="text-sm text-faint">+{r.tags.length - 4}</span>}
-                        </div>
+                        {r.metadata?.tags && (
+                          <div className="flex gap-[3px]">
+                            {(() => {
+                              const tags = r.metadata.tags.split(",").map((t) => t.trim());
+                              return (
+                                <>
+                                  {tags.slice(0, 4).map((t) => (
+                                    <span key={t} className="text-sm px-1 py-px rounded bg-accent text-muted-foreground">{t}</span>
+                                  ))}
+                                  {tags.length > 4 && <span className="text-sm text-faint">+{tags.length - 4}</span>}
+                                </>
+                              );
+                            })()}
+                          </div>
+                        )}
                       </div>
                     </div>
                   </div>
                 </Card>
               </div>
-            );
-          })}
-          {filtered.length === 0 && (
-            <div className="py-10 text-center text-faint">No repositories match your filters</div>
-          )}
-        </div>
+              );
+            })}
+            {filtered.length === 0 && !loading && (
+              <div className="py-10 text-center text-faint">No repositories found</div>
+            )}
+          </div>
+        )}
       </div>
     </div>
   );

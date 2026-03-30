@@ -1,3 +1,12 @@
+export const RepositoryType = {
+  MODEL: "model",
+  DATASET: "dataset",
+  AGENT: "agent",
+  SKILL: "skill",
+} as const;
+
+export type RepositoryType = typeof RepositoryType[keyof typeof RepositoryType];
+
 export interface Pagination {
   has_more: boolean;
   next_offset: string;
@@ -22,11 +31,7 @@ export interface RepositoryList {
 
 export interface RepositoryCreation {
   name: string;
-  storage_id?: string;
   storage_namespace: string;
-  default_branch?: string;
-  sample_data?: boolean;
-  read_only?: boolean;
   metadata?: Record<string, string>;
 }
 

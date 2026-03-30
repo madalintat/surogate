@@ -12,7 +12,7 @@ from surogate.server.models.project import ProjectResponse
 
 router = APIRouter()
 
-@router.get("/projects", response_model=list[ProjectResponse])
+@router.get("", response_model=list[ProjectResponse])
 async def get_user_projects(
     current_subject: str = Depends(get_current_subject),
     session: AsyncSession = Depends(get_session),

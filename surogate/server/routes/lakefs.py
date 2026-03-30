@@ -4,8 +4,8 @@ Data Hub API routes
 
 from typing import Optional
 
-from fastapi import APIRouter, Depends, Query, Request
-from lakefs_sdk import Repository, RepositoryList, RefList, Ref, CommitList, Commit, ObjectStatsList, ObjectStats
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from lakefs_sdk import ApiException, Repository, RepositoryList, RefList, Ref, CommitList, Commit, ObjectStatsList, ObjectStats, RepositoryCreation
 from sqlalchemy.ext.asyncio import AsyncSession
 
 import surogate.core.hub.lakefs as lakefs
@@ -17,26 +17,33 @@ router = APIRouter()
 
 # ============ Repositories ============
 
-@router.get("/repositories", response_model=list[RepositoryList])
+@router.get("/repositories", response_model=RepositoryList)
 async def list_repos(
     request: Request,
     prefix: Optional[str] = Query(None),
     user: str = Depends(get_current_subject),
     session: AsyncSession = Depends(get_session),
-) -> list[RepositoryList]:
+) -> RepositoryList:
     api_client = await lakefs.get_lakefs_client(user, session, request.app.state.config)
     return await lakefs.list_repositories(api_client, prefix)
 
 @router.post("/repositories")
 async def create_repo(
+    creation_request: RepositoryCreation,
     request: Request,
-    repo_name: str = Query(...),
-    repo_type: str = Query(..., regex="^(model|dataset)$"),
     user: str = Depends(get_current_subject),
     session: AsyncSession = Depends(get_session),
-) -> Optional[Repository]:
+) -> Repository:
     api_client = await lakefs.get_lakefs_client(user, session, request.app.state.config)
-    return await lakefs.create_repository(api_client, repo_name, repo_type)
+    try:
+        repo = await lakefs.create_repository(api_client, user, creation_request, request.app.state.config)
+    except ApiException as e:
+        if e.status == 409:
+            raise HTTPException(status_code=409, detail=f"Repository '{creation_request.name}' already exists")
+        raise HTTPException(status_code=500, detail=f"Failed to create repository '{creation_request.name}'")
+    if repo is None:
+        raise HTTPException(status_code=500, detail=f"Failed to create repository '{creation_request.name}'")
+    return repo
 
 @router.get("/repositories/{repository}")
 async def get_repo(
@@ -56,7 +63,7 @@ async def delete_repo(
     session: AsyncSession = Depends(get_session),
 ) -> dict:
     api_client = await lakefs.get_lakefs_client(user, session, request.app.state.config)
-    result = await lakefs.delete_repository(api_client, repository)
+    result = await lakefs.delete_repository(api_client, repository, user, request.app.state.config)
     return {"success": result}
 
 # ============ Branches ============
@@ -120,7 +127,7 @@ async def list_tags(
 async def create_tag(
     repository: str,
     request: Request,
-    tag: str= Query(...),
+    tag: str = Query(...),
     commit: Optional[str] = Query(None),
     user: str = Depends(get_current_subject),
     session: AsyncSession = Depends(get_session),
@@ -188,13 +195,49 @@ async def list_objects(
     return await lakefs.get_objects(api_client, repository, ref, prefix=prefix)
 
 @router.get("/repositories/{repository}/refs/{ref}/objects")
-async def get_object(
+async def stat_object(
     repository: str,
     ref: str,
     request: Request,
-    path: Optional[str] = Query(...),
+    path: str = Query(...),
     user: str = Depends(get_current_subject),
     session: AsyncSession = Depends(get_session),
 ) -> Optional[ObjectStats]:
     api_client = await lakefs.get_lakefs_client(user, session, request.app.state.config)
-    return await lakefs.get_object(api_client, repository, ref, path)
+    return await lakefs.stat_object(api_client, repository, ref, path)
+
+@router.get("/repositories/{repository}/refs/{ref}/objects/content")
+async def get_object_content(
+    repository: str,
+    ref: str,
+    request: Request,
+    path: str = Query(...),
+    user: str = Depends(get_current_subject),
+    session: AsyncSession = Depends(get_session),
+) -> str:
+    api_client = await lakefs.get_lakefs_client(user, session, request.app.state.config)
+    content = await lakefs.get_object_content(api_client, repository, ref, path)
+    if content is None:
+        raise HTTPException(status_code=404, detail=f"Object '{path}' not found")
+    return content.decode("utf-8", errors="replace")
+
+@router.post("/repositories/{repository}/branches/{branch}/objects")
+async def upload_object(
+    request: Request,
+    repository: str,
+    branch: str,
+    path: str = Query(...),
+    user: str = Depends(get_current_subject),
+    session: AsyncSession = Depends(get_session),
+) -> ObjectStats:
+    api_client = await lakefs.get_lakefs_client(user, session, request.app.state.config)
+    form = await request.form()
+    upload = form.get("content")
+    if upload is None:
+        raise HTTPException(status_code=400, detail="Missing 'content' field")
+    content = await upload.read()
+    path = path.lstrip("/")
+    result = await lakefs.upload_objects(api_client, repository, branch, path, content)
+    if result is None:
+        raise HTTPException(status_code=500, detail=f"Failed to upload object '{path}'")
+    return result

@@ -7,6 +7,7 @@ from pathlib import Path as _Path
 
 from surogate.core.config.server_config import ServerConfig
 from surogate.core.db.engine import get_session_factory
+from surogate.core.hub.lakefs import seed_lakefs_user, init_lakefs
 from surogate.server.auth.authentication import get_current_subject
 from surogate.utils.logger import get_logger
 
@@ -24,7 +25,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, Response
 from pathlib import Path
 
-from routes import auth_router, project_router
+from routes import auth_router, project_router, hub_router
 
 logger = get_logger()
 
@@ -40,6 +41,8 @@ async def lifespan(app: FastAPI):
     factory = get_session_factory()
     async with factory() as session:
         await auth_repository.seed_admin_user(session)
+        await init_lakefs(config)
+        await seed_lakefs_user("surogate", session, config)
         
     logger.info(f"Database ready: {config.database_url}")
     yield
@@ -67,7 +70,7 @@ app.add_middleware(
 # ============ Register API Routes ============
 app.include_router(auth_router, prefix = "/api/auth", tags = ["auth"])
 app.include_router(project_router, prefix = "/api/projects", tags = ["projects"])
-app.include_router(project_router, prefix = "/api/hub", tags = ["hub"])
+app.include_router(hub_router, prefix = "/api/hub", tags = ["hub"])
 
 
 # ============ Health and System Endpoints ============

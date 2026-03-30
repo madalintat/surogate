@@ -2,7 +2,7 @@
 Authentication API routes
 """
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from surogate.server.auth.authentication import (
@@ -11,10 +11,12 @@ from surogate.server.auth.authentication import (
     get_current_subject_allow_password_change,
     refresh_access_token,
 )
+from surogate.core.hub.lakefs import seed_lakefs_user
 from surogate.core.db.engine import get_session
 from surogate.core.db.repository import auth as auth_repository
 from surogate.core.db.repository import project as project_repository
 from surogate.server.models.auth import AuthLoginRequest, ChangePasswordRequest, RefreshTokenRequest, Token
+
 from surogate.utils import hashing
 
 router = APIRouter()
@@ -22,7 +24,8 @@ router = APIRouter()
 @router.post("/login", response_model = Token)
 async def login(
     payload: AuthLoginRequest,
-    session: AsyncSession = Depends(get_session)
+    request: Request,
+    session: AsyncSession = Depends(get_session),
 ) -> Token:
     """
     Login with username/password and receive access + refresh tokens.
@@ -43,6 +46,7 @@ async def login(
         )
 
     await project_repository.seed_default_project(session, payload.username)
+    await seed_lakefs_user(payload.username, session, request.app.state.config)
 
     access_token = await create_access_token(payload.username, session)
     refresh_token = await create_refresh_token(payload.username, session)

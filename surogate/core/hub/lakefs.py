@@ -2,9 +2,10 @@ from typing import Optional, List, Union
 
 from sqlalchemy.ext.asyncio import AsyncSession
 import lakefs_sdk
-from lakefs_sdk import ApiClient, ApiException, RepositoryCreation, RepositoryList, Repository, RefList, Ref, BranchCreation, TagCreation, Commit, CommitList, ObjectStatsList, ObjectStats
+from lakefs_sdk import ApiClient, ApiException, RepositoryCreation, RepositoryList, Repository, RefList, Ref, BranchCreation, TagCreation, Commit, CommitList, ObjectStatsList, ObjectStats, AuthApi, UserCreation
 
 from surogate.core.config.server_config import ServerConfig
+from surogate.core.db.repository.user import set_lakefs_credentials
 from surogate.utils.logger import get_logger
 import surogate.core.db.repository.user as user_repo
 
@@ -12,7 +13,22 @@ logger = get_logger()
 
 REPO_TYPE_MODEL = "model"
 REPO_TYPE_DATASET = "dataset"
+REPO_TYPE_AGENT = "agent"
+REPO_TYPE_SKILL = "skill"
 
+VALID_REPO_ID_PATTERN = r"^[a-zA-Z0-9][a-zA-Z0-9\-\.]{2,62}$"
+
+USERS_GROUP = "Users"
+USERS_POLICY = "users-policy"
+
+async def get_lakefs_admin_client(config: ServerConfig) -> ApiClient:
+    endpoint = config.lakefs_endpoint
+    if "/api/v1" not in endpoint:
+        endpoint = endpoint.rstrip("/") + "/api/v1"
+    sdk_config = lakefs_sdk.Configuration(host=endpoint, username=config.lakefs_access_key, password=config.lakefs_secret_key)
+    sdk_config.verify_ssl = False
+    return ApiClient(sdk_config)
+    
 async def get_lakefs_client(user: str, session: AsyncSession, config: ServerConfig) -> ApiClient:
     endpoint = config.lakefs_endpoint
     if "/api/v1" not in endpoint:
@@ -22,6 +38,50 @@ async def get_lakefs_client(user: str, session: AsyncSession, config: ServerConf
     sdk_config = lakefs_sdk.Configuration(host=endpoint, username=key, password=secret)
     sdk_config.verify_ssl = False
     return ApiClient(sdk_config)
+
+async def init_lakefs(config: ServerConfig):
+    client = await get_lakefs_admin_client(config)
+    auth_api = lakefs_sdk.AuthApi(client)
+    
+    try:
+        # Ensure "Users" group exists
+        auth_api.get_group(USERS_GROUP)
+    except ApiException as e:
+        if e.status == 404:
+            request = lakefs_sdk.GroupCreation(id=USERS_GROUP)
+            auth_api.create_group(group_creation=request)
+        else:
+            logger.error(f"Error connecting to LakeFS: {e}")
+            
+    try:
+        # Ensure "users-policy" exists
+        auth_api.get_policy(USERS_POLICY)
+    except ApiException as e:
+        if e.status == 404:
+            auth_api.create_policy(policy=lakefs_sdk.Policy(
+                id=USERS_POLICY, 
+                statement=[
+                    lakefs_sdk.Statement(
+                        effect="allow", 
+                        resource="*",
+                        action=["fs:ListRepositories", "fs:CreateRepository", "fs:AttachStorageNamespace"]),
+                    lakefs_sdk.Statement(
+                        effect="allow", 
+                        resource="*",
+                        action=["auth:ListPolicies", "auth:GetPolicy", "auth:CreatePolicy", "auth:UpdatePolicy", 
+                                "auth:AttachPolicyToUser", "auth:AttachPolicy"])
+                ]
+            ))
+        else:
+            logger.error(f"Error connecting to LakeFS: {e}")
+            
+    # Attach "users-policy" to "Users" group
+    try:
+        auth_api.attach_policy_to_group(USERS_GROUP, USERS_POLICY)
+    except ApiException as e:
+        if e.status != 409:  # 409 Conflict means it's already attached
+            raise e
+        
 
 # ============ Repositories ============
 
@@ -33,20 +93,84 @@ async def list_repositories(client: ApiClient, prefix: Optional[str] = None) -> 
         logger.error(f"Error listing LakeFS repositories: {e}")
         return []
     
-async def create_repository(client: ApiClient, repository: str, type: str) -> Optional[Repository]:
+async def create_repository(client: ApiClient, user: str, request: RepositoryCreation, config: ServerConfig) -> Optional[Repository]:
     try:
         repos_api = lakefs_sdk.RepositoriesApi(client)
-        request = RepositoryCreation(
-            name=repository,
-            storage_namespace=f"local://{repository}",
-            default_branch="main",
-            metadata={"type": type},
-        )
-        return repos_api.create_repository(repository_creation=request)
+        admin_client = await get_lakefs_admin_client(config)
+        auth_api = lakefs_sdk.AuthApi(admin_client)
+        request.storage_namespace = f"local://{request.name}"
+        request.default_branch = "main"
+        repo = repos_api.create_repository(repository_creation=request)
+
+        # Create or ensure the repo group exists
+        repo_group = f"repo-{request.name}"
+        policy_id = f"{request.name}-full-access"
+        
+        try:
+            auth_api.get_group(repo_group)
+        except ApiException as e:
+            if e.status == 404:
+                auth_api.create_group(group_creation=lakefs_sdk.GroupCreation(id=repo_group))
+            else:
+                await delete_repository(admin_client, request.name, user, config)
+                raise e            
+            
+        # Create or ensure the policy exists
+        try:
+            auth_api.get_policy(policy_id)
+        except ApiException as e:
+            if e.status == 404:
+                auth_api.create_policy(policy=lakefs_sdk.Policy(
+                    id=policy_id, 
+                    statement=[
+                        lakefs_sdk.Statement(
+                            effect="allow",
+                            resource=f"arn:lakefs:fs:::repository/{request.name}",
+                            action=["fs:*"]),
+                         lakefs_sdk.Statement(
+                            effect="allow",
+                            resource=f"arn:lakefs:fs:::repository/{request.name}/*",
+                            action=["fs:*"])
+                    ]
+                ))
+            else:
+                await delete_repository(admin_client, request.name, user,config)
+                raise e
+            
+        # Attach the policy to the repo group
+        try:
+            auth_api.attach_policy_to_group(repo_group, policy_id)
+        except ApiException as e:
+            if e.status != 409:  # 409 Conflict means it's already attached
+                await delete_repository(admin_client, request.name, user, config)
+                raise e
+        
+        # Add repo creator to the group
+        auth_api.add_group_membership(repo_group, user)
+        
+        return repo
     except ApiException as e:
-        logger.error(f"Error creating LakeFS repository '{repository}': {e}")
+        if e.status == 409:
+            raise
+        logger.error(f"Error creating LakeFS repository '{request.name}': {e}")
+        await delete_repository(admin_client, request.name, user, config)
         return None
     
+async def seed_lakefs_user(user: str, session: AsyncSession, config: ServerConfig):
+    try:
+        existing_creds = await user_repo.get_lakefs_credentials(session, user)
+        if existing_creds is not None and all(existing_creds):
+            return
+        client = await get_lakefs_admin_client(config)
+        auth_api = lakefs_sdk.AuthApi(client)
+        request = UserCreation(id=user)
+        auth_api.create_user(user_creation=request)
+        creds = auth_api.create_credentials(user_id=user)
+        auth_api.add_group_membership(USERS_GROUP, user)
+        await set_lakefs_credentials(session, user, creds.access_key_id, creds.secret_access_key)
+    except ApiException as e:
+        logger.error(f"Error creating LakeFS user '{user}': {e}")
+        return None
 
 async def get_repository(client: ApiClient, repository: str) -> Optional[Repository]:
     try:
@@ -57,12 +181,46 @@ async def get_repository(client: ApiClient, repository: str) -> Optional[Reposit
         return None
     
 
-async def delete_repository(client: ApiClient, repository: str) -> bool:
+async def delete_repository(client: ApiClient, repository: str, user: str, config: ServerConfig) -> bool:
     try:
         repos_api = lakefs_sdk.RepositoriesApi(client)
+        
+        repo_group = f"repo-{repository}"
+        policy_id = f"{repository}-full-access"
+                
+        admin_client = await get_lakefs_admin_client(config)
+        auth_api = lakefs_sdk.AuthApi(admin_client)
+        
+        try:
+            auth_api.detach_policy_from_group(repo_group, policy_id)
+        except ApiException as e:
+            if e.status != 404:
+                raise e
+        
+        try:
+            auth_api.delete_group_membership(repo_group, user)
+        except ApiException as e:
+            if e.status != 404:
+                raise e
+            
+        try:
+            auth_api.delete_group(repo_group)
+        except ApiException as e:
+            if e.status != 404:
+                raise e
+            
+        try:
+            auth_api.delete_policy(policy_id)
+        except ApiException as e:
+            if e.status != 404:
+                raise e
+            
         repos_api.delete_repository(repository=repository, force=True)
+        
         return True
     except ApiException as e:
+        if e.status == 404:
+            return True
         logger.error(f"Error deleting LakeFS repository '{repository}': {e}")
         return False
     
@@ -166,10 +324,10 @@ async def get_commit(client: ApiClient, repository: str, commit_id: str) -> Opti
 async def get_objects(client: ApiClient, repository: str, ref: str, prefix: Optional[str] = None) -> ObjectStatsList:
     try:
         objects_api = lakefs_sdk.ObjectsApi(client)
-        return objects_api.list_objects(repository=repository, ref=ref, prefix=prefix).results
+        return objects_api.list_objects(repository=repository, ref=ref, prefix=prefix, delimiter="/")
     except ApiException as e:
         logger.error(f"Error retrieving LakeFS objects for repository '{repository}' and ref '{ref}': {e}")
-        return []
+        return ObjectStatsList(pagination=None, results=[])
     
 async def delete_object(client: ApiClient, repository: str, branch: str, path: str) -> bool:
     try:
@@ -180,11 +338,24 @@ async def delete_object(client: ApiClient, repository: str, branch: str, path: s
         logger.error(f"Error deleting LakeFS object '{path}' in repository '{repository}' and branch '{branch}': {e}")
         return False
     
-async def get_object(client: ApiClient, repository: str, ref: str, path: str) -> Optional[ObjectStats]:
+async def stat_object(client: ApiClient, repository: str, ref: str, path: str) -> Optional[ObjectStats]:
+    try:
+        objects_api = lakefs_sdk.ObjectsApi(client)
+        return objects_api.stat_object(repository=repository, ref=ref, path=path)
+    except ApiException as e:
+        return None
+    
+async def get_object_content(client: ApiClient, repository: str, ref: str, path: str) -> Optional[bytes]:
     try:
         objects_api = lakefs_sdk.ObjectsApi(client)
         return objects_api.get_object(repository=repository, ref=ref, path=path)
     except ApiException as e:
-        logger.error(f"Error retrieving LakeFS object '{path}' in repository '{repository}' and ref '{ref}': {e}")
         return None
-    
+
+async def upload_objects(client: ApiClient, repository: str, branch: str, path: str, content: bytes) -> Optional[ObjectStats]:
+    try:
+        objects_api = lakefs_sdk.ObjectsApi(client)
+        return objects_api.upload_object(repository=repository, branch=branch, path=path, content=content)
+    except ApiException as e:
+        logger.error(f"Error uploading objects to LakeFS repository '{repository}' and ref '{branch}': {e}")
+        return None

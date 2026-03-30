@@ -23,6 +23,10 @@ class ServerConfig:
         self.workers = cfg.get('workers', self.workers)
         self.log_level = cfg.get('log_level', self.log_level)
         self.database_url = cfg.get('database_url', self.database_url)
+        self.lakefs_endpoint = cfg.get('lakefs_endpoint', self.lakefs_endpoint)
+        self.lakefs_s3_endpoint = cfg.get('lakefs_s3_endpoint', self.lakefs_s3_endpoint)
+        self.lakefs_access_key = cfg.get('lakefs_access_key', self.lakefs_access_key)
+        self.lakefs_secret_key = cfg.get('lakefs_secret_key', self.lakefs_secret_key)
 
     def __post_init__(self):
         pass

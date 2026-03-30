@@ -2,8 +2,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
 import type { ReactNode } from "react";
-import { Settings, Sun, Moon } from "lucide-react";
+import { Settings, Sun, Moon, LogOut } from "lucide-react";
 import { useTheme } from "@/hooks/use-theme";
+import { logout } from "@/api/auth";
 import { ProjectSelector } from "@/components/project-selector";
 
 interface PageHeaderProps {
@@ -39,6 +40,13 @@ export function PageHeader({ title, subtitle }: PageHeaderProps) {
           className="bg-transparent border-none text-muted-foreground cursor-pointer hover:text-foreground"
         >
           {isDark ? <Sun size={16} /> : <Moon size={16} />}
+        </button>
+        <button
+          type="button"
+          onClick={() => { logout(); window.location.href = "/login"; }}
+          className="bg-transparent border-none text-muted-foreground cursor-pointer hover:text-foreground"
+        >
+          <LogOut size={16} />
         </button>
       </div>
     </header>
