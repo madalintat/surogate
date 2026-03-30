@@ -49,6 +49,9 @@ export function WorkloadQueueTab() {
   const tasks = useAppStore((s) => s.tasks);
   const fetchTasks = useAppStore((s) => s.fetchTasks);
   const deleteTask = useAppStore((s) => s.deleteTask);
+  const activeProjectId = useAppStore((s) => s.activeProjectId);
+  const projects = useAppStore((s) => s.projects);
+  const activeProject = projects.find((p) => p.id === activeProjectId);
 
   useEffect(() => {
     void fetchTasks();
@@ -57,7 +60,13 @@ export function WorkloadQueueTab() {
   const allItems = useMemo<ExtendedWorkload[]>(() => {
     const localTaskItems = tasks.map(taskToWorkloadItem);
     const items = [...WORKLOAD_QUEUE, ...localTaskItems];
-    items.sort((a, b) => {
+    // Filter to current project — match on id (real tasks) or name (mock data)
+    const projectMatches = activeProject
+      ? items.filter(
+          (w) => w.project === activeProject.id || w.project === activeProject.name,
+        )
+      : items;
+    projectMatches.sort((a, b) => {
       const aActive = a.status === "running" || a.status === "pending" ? 1 : 0;
       const bActive = b.status === "running" || b.status === "pending" ? 1 : 0;
       if (aActive !== bActive) return bActive - aActive;
@@ -65,8 +74,8 @@ export function WorkloadQueueTab() {
       const bTime = b.startedAt ? new Date(b.startedAt).getTime() : 0;
       return bTime - aTime;
     });
-    return items;
-  }, [tasks]);
+    return projectMatches;
+  }, [tasks, activeProject]);
 
   const filtered = useMemo(
     () => filter === "all" ? allItems : allItems.filter(w => w.type === filter),

@@ -14,3 +14,20 @@ export async function fetchProjects(): Promise<Project[]> {
 
   return (await response.json()) as Project[];
 }
+
+export async function createProject(
+  body: { name: string; color: string },
+): Promise<Project> {
+  const response = await authFetch("/api/projects", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+
+  if (!response.ok) {
+    const err = (await response.json().catch(() => null)) as { detail?: string } | null;
+    throw new Error(err?.detail ?? "Failed to create project");
+  }
+
+  return (await response.json()) as Project;
+}

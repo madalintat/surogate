@@ -1,14 +1,23 @@
 // Copyright (c) 2026, Invergent SA, developed by Flavius Burca
 // SPDX-License-Identifier: AGPL-3.0-only
 //
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
+import { CreateProjectDialog } from "@/components/create-project-dialog";
 import { useAppStore } from "@/stores/app-store";
 import { cn } from "@/utils/cn";
 import { Plus } from "lucide-react";
+import { useState } from "react";
 
 export function ProjectSelector() {
   const projects = useAppStore((s) => s.projects);
   const activeProjectId = useAppStore((s) => s.activeProjectId);
   const setActiveProject = useAppStore((s) => s.setActiveProject);
+  const [createOpen, setCreateOpen] = useState(false);
 
   return (
     <div className="flex gap-1">
@@ -36,12 +45,21 @@ export function ProjectSelector() {
           {p.name}
         </button>
       ))}
-      <button
-        type="button"
-        className="px-2 py-1 rounded border border-dashed border-border bg-transparent text-faint cursor-pointer hover:text-muted-foreground"
-      >
-        <Plus size={14} />
-      </button>
+      <TooltipProvider>
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <button
+              type="button"
+              onClick={() => setCreateOpen(true)}
+              className="px-2 py-1 rounded border border-dashed border-border bg-transparent text-faint cursor-pointer hover:text-muted-foreground"
+            >
+              <Plus size={14} />
+            </button>
+          </TooltipTrigger>
+          <TooltipContent>Create a new Project</TooltipContent>
+        </Tooltip>
+      </TooltipProvider>
+      <CreateProjectDialog open={createOpen} onOpenChange={setCreateOpen} />
     </div>
   );
 }

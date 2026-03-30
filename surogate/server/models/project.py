@@ -5,6 +5,11 @@ from datetime import datetime
 from pydantic import BaseModel
 
 
+class CreateProjectRequest(BaseModel):
+    name: str
+    color: str
+
+
 class ProjectResponse(BaseModel):
     id: str
     name: str
