@@ -51,13 +51,10 @@ function SkillListItem({
           <span className="text-sm font-semibold text-foreground font-display">
             {skill.displayName}
           </span>
-          <Badge>{skill.version}</Badge>
         </div>
         <StatusDot status={toStatus(skill.status)} />
       </div>
       <div className="flex items-center gap-2 text-xs text-muted-foreground/50">
-        { skill.agent && <span>&#x2B21; {skill.agent}</span> }
-        { skill.agent && <span>&middot;</span> }
         <span>{skill.author}</span>
         <span>&middot;</span>
         <span>{skill.updatedAt}</span>
@@ -99,11 +96,9 @@ function SkillDetail({ skill, onClose, onEdit, onDelete, onPublish }: { skill: S
                 <span className="text-base font-bold text-foreground font-display">
                   {skill.displayName}
                 </span>
-                <Badge>{skill.version}</Badge>
                 <StatusDot status={toStatus(skill.status)} />
               </div>
               <div className="text-sm text-muted-foreground mt-0.5">
-                Agent: <span className="text-foreground/70">{skill.agent || 'none'}</span> &middot;{" "}
                 {skill.author} &middot; {skill.updatedAt}
               </div>
             </div>
@@ -271,7 +266,6 @@ export function SkillsTab() {
   const handleSave = async (data: SkillFormData) => {
     if (panel.kind === "edit") {
       const result = await updateSkill(panel.skill.id, {
-        name: data.name,
         display_name: data.displayName,
         description: data.description,
         content: data.content,
@@ -290,8 +284,6 @@ export function SkillsTab() {
         display_name: data.displayName,
         description: data.description,
         content: data.content,
-        version: data.version,
-        status: data.status,
         tags: data.tags,
       });
       if (result) {

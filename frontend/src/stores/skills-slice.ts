@@ -14,13 +14,14 @@ function toSkill(s: SkillResponse): Skill {
     displayName: s.display_name,
     description: s.description,
     content: s.content,
-    version: s.version,
+    license: s.license,
+    compatibility: s.compatibility,
+    metadata: s.metadata,
+    allowedTools: s.allowed_tools,
     status: s.status,
     author: s.author_username || s.author_id,
     updatedAt: s.updated_at ?? "",
     tags: s.tags,
-    agent: "",
-    versions: [],
     hubRef: s.hub_ref,
   };
 }
@@ -109,11 +110,8 @@ export const createSkillsSlice: StateCreator<AppState, [], [], SkillsSlice> = (s
     set({ error: null });
     try {
       await skillsApi.publishSkill(skillId, tag);
-      // Update version in store to reflect the published tag
-      set((s) => ({
-        skills: s.skills.map((sk) => (sk.id === skillId ? { ...sk, version: tag } : sk)),
-        currentSkill: s.currentSkill?.id === skillId ? { ...s.currentSkill, version: tag } : s.currentSkill,
-      }));
+      // Re-fetch the skill to reflect the published state
+      set((s) => ({ skills: s.skills, currentSkill: s.currentSkill }));
       return true;
     } catch (e) {
       set({ error: (e as Error).message });

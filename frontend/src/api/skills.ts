@@ -11,7 +11,10 @@ export interface SkillResponse {
   display_name: string;
   description: string;
   content: string;
-  version: string;
+  license: string;
+  compatibility: string;
+  metadata?: Record<string, string>;
+  allowed_tools: string[];
   status: string;
   author_id: string;
   author_username: string;
@@ -31,6 +34,11 @@ export interface SkillCreateRequest {
   display_name: string;
   description?: string;
   content?: string;
+  license?: string;
+  compatibility?: string;
+  metadata?: Record<string, string>;
+  allowed_tools?: string[];
+  status?: string;
   tags?: string[];
 }
 
@@ -38,6 +46,11 @@ export interface SkillUpdateRequest {
   display_name?: string;
   description?: string;
   content?: string;
+  license?: string;
+  compatibility?: string;
+  metadata?: Record<string, string>;
+  allowed_tools?: string[];
+  status?: string;
   tags?: string[];
 }
 

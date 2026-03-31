@@ -174,7 +174,8 @@ async def seed_lakefs_user(user: str, session: AsyncSession, config: ServerConfi
         auth_api.add_group_membership(USERS_GROUP, user)
         await set_lakefs_credentials(session, user, creds.access_key_id, creds.secret_access_key)
     except ApiException as e:
-        logger.error(f"Error creating LakeFS user '{user}': {e}")
+        if e.status != 409:
+            logger.error(f"Error creating LakeFS user '{user}': {e}")
         return None
 
 async def get_repository(client: ApiClient, repository: str) -> Optional[Repository]:

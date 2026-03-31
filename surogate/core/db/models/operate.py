@@ -161,6 +161,7 @@ class AgentVersion(UUIDMixin, TimestampMixin, Base):
     created_by: Mapped["User"] = relationship()  # noqa: F821
 
 
+
 class Skill(UUIDMixin, TimestampMixin, Base):
     __tablename__ = "skills"
 
@@ -171,17 +172,19 @@ class Skill(UUIDMixin, TimestampMixin, Base):
     display_name: Mapped[str] = mapped_column(sa.String(255))
     description: Mapped[str] = mapped_column(sa.Text, default="")
     content: Mapped[str] = mapped_column(sa.Text, default="")
-    version: Mapped[str] = mapped_column(sa.String(64))
+    license: Mapped[str] = mapped_column(sa.String(255))
+    compatibility: Mapped[str] = mapped_column(sa.Text, default="")
+    meta: Mapped[Optional[dict[str, str]]] = mapped_column("metadata", sa.JSON, nullable=True)
+    allowed_tools: Mapped[Optional[list[str]]] = mapped_column(sa.JSON, nullable=True)
     status: Mapped[SkillStatus] = mapped_column(sa.Enum(SkillStatus))
     author_id: Mapped[str] = mapped_column(sa.ForeignKey("users.id"))
-    tags: Mapped[Optional[list[Any]]] = mapped_column(sa.JSON, nullable=True)
+    tags: Mapped[Optional[list[str]]] = mapped_column(sa.JSON, nullable=True)
     hub_ref: Mapped[Optional[str]] = mapped_column(
         sa.String(512), nullable=True
     )
     updated_at: Mapped[Optional[datetime]] = mapped_column(
         sa.DateTime, onupdate=sa.func.now(), nullable=True
     )
-
     author: Mapped["User"] = relationship()  # noqa: F821
     agents: Mapped[list[Agent]] = relationship(
         secondary=agent_skills, back_populates="skills"
@@ -208,7 +211,7 @@ class Tool(UUIDMixin, TimestampMixin, Base):
     )
     config: Mapped[Optional[list[Any]]] = mapped_column(sa.JSON, nullable=True)
     author_id: Mapped[str] = mapped_column(sa.ForeignKey("users.id"))
-    tags: Mapped[Optional[list[Any]]] = mapped_column(sa.JSON, nullable=True)
+    tags: Mapped[Optional[list[str]]] = mapped_column(sa.JSON, nullable=True)
     hub_ref: Mapped[Optional[str]] = mapped_column(
         sa.String(512), nullable=True
     )

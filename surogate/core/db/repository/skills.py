@@ -22,16 +22,28 @@ async def create_skill(
     author_id: str,
     description: str = "",
     content: str = "",
+    license: str = "",
+    compatibility: str = "",
+    meta: dict[str, str] | None = None,
+    allowed_tools: list[str] | None = None,
+    status: SkillStatus = SkillStatus.active,
     tags: list[str] | None = None,
+    hub_ref: str | None = None,
 ) -> Skill:
     skill = Skill(
         name=name,
         display_name=display_name,
         description=description,
         content=content,
+        license=license,
+        compatibility=compatibility,
+        meta=meta,
+        allowed_tools=allowed_tools,
+        status=status,
         project_id=project_id,
         author_id=author_id,
         tags=tags or [],
+        hub_ref=hub_ref,
     )
     session.add(skill)
     await session.commit()

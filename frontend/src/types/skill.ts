@@ -1,24 +1,17 @@
-export interface SkillVersion {
-  version: string;
-  date: string;
-  author: string;
-  change: string;
-  status: string;
-}
-
 export interface Skill {
   id: string;
   name: string;
   displayName: string;
   description: string;
-  agent: string;
+  content: string;
+  license: string;
+  compatibility: string;
+  metadata?: Record<string, string>;
+  allowedTools: string[];
   status: string;
   author: string;
   updatedAt: string;
-  version: string;
   tags: string[];
-  content: string;
-  versions: SkillVersion[];
   hubRef?: string | null;
 }
 

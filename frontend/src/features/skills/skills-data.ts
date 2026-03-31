@@ -23,7 +23,6 @@ export function toStatus(raw: string): Status {
 
 export type {
   Skill,
-  SkillVersion,
   SchemaField,
   ToolConfig,
   AgentRef,
@@ -32,7 +31,7 @@ export type {
   McpServer,
 } from "@/types/skill";
 
-import type { Skill, Tool, ToolCategory, McpServer } from "@/types/skill";
+import type { Tool, ToolCategory, McpServer } from "@/types/skill";
 
 // ── Category colours (Tailwind-compatible) ──────────────────────
 
@@ -53,184 +52,6 @@ export const TOOL_CATEGORIES: ToolCategory[] = [
   { id: "workflow", label: "Workflows", icon: "⬡" },
   { id: "guardrail", label: "Guardrails", icon: "◈" },
   { id: "output", label: "Output Parsers", icon: "⊡" },
-];
-
-export const SKILLS: Skill[] = [
-  {
-    id: "cx-support-skills",
-    name: "cx-support-skills",
-    displayName: "CX Support Skills",
-    description: "Core customer support capabilities: greeting protocols, empathy-first response patterns, refund & cancellation workflows, escalation criteria, and SLA-aware prioritization.",
-    agent: "cx-support-v3",
-    status: "active",
-    author: "A. Kovács",
-    updatedAt: "2d ago",
-    version: "3.2.0",
-    tags: ["customer-support", "empathy", "refunds", "escalation"],
-    content: `# CX Support Agent Skills
-
-## Greeting & Tone
-- Always greet the customer by name when available
-- Use empathy-first language: acknowledge frustration before solving
-- Match formality to customer's tone
-
-## Refund Workflow
-1. Verify order via order-lookup tool
-2. Check refund eligibility (< 30 days, unused)
-3. Process via subscription-manager tool
-4. Confirm with customer and provide timeline
-
-## Escalation Criteria
-- Customer mentions legal action
-- Sentiment score drops below 0.3
-- 3+ failed resolution attempts
-- VIP customer flag detected
-
-## SLA Priorities
-- P0: Service outage affecting billing → 15 min response
-- P1: Failed transaction → 1 hour response
-- P2: General inquiry → 4 hour response`,
-    versions: [
-      { version: "3.2.0", date: "2d ago", author: "A. Kovács", change: "Added SLA priority matrix", status: "active" },
-      { version: "3.1.0", date: "2w ago", author: "A. Kovács", change: "Revised escalation criteria", status: "previous" },
-      { version: "3.0.0", date: "1mo ago", author: "M. Chen", change: "Full rewrite for v3 agent", status: "archived" },
-    ],
-  },
-  {
-    id: "code-assist-skills",
-    name: "code-assist-skills",
-    displayName: "Code Assistant Skills",
-    description: "Developer productivity capabilities: code generation patterns, refactoring strategies, debugging workflows, PR review guidelines, and documentation standards.",
-    agent: "code-assist-v2",
-    status: "active",
-    author: "M. Chen",
-    updatedAt: "1w ago",
-    version: "2.7.0",
-    tags: ["coding", "refactoring", "debugging", "review"],
-    content: `# Code Assistant Skills
-
-## Code Generation
-- Always generate type-safe code with explicit return types
-- Include error handling for external calls
-- Follow project conventions from .editorconfig
-
-## Refactoring
-- Identify code smells: long methods, deep nesting, duplicated logic
-- Suggest extract-method for functions > 30 lines
-- Prefer composition over inheritance
-
-## Debugging Workflow
-1. Reproduce the issue with a minimal test case
-2. Use LSP diagnostics to check types
-3. Trace data flow from input to failure point
-4. Suggest fix with explanation
-
-## PR Review Guidelines
-- Check for security issues (injection, XSS, auth)
-- Verify test coverage for new code paths
-- Flag breaking API changes`,
-    versions: [
-      { version: "2.7.0", date: "1w ago", author: "M. Chen", change: "Added PR review guidelines", status: "active" },
-      { version: "2.6.0", date: "1mo ago", author: "M. Chen", change: "Debugging workflow section", status: "previous" },
-    ],
-  },
-  {
-    id: "data-analyst-skills",
-    name: "data-analyst-skills",
-    displayName: "Data Analyst Skills",
-    description: "Data analysis capabilities: natural language to SQL translation, chart selection heuristics, statistical summary patterns, and data quality checks.",
-    agent: "data-analyst-v1",
-    status: "active",
-    author: "R. Silva",
-    updatedAt: "4d ago",
-    version: "1.4.0",
-    tags: ["sql", "analytics", "charts", "data-quality"],
-    content: `# Data Analyst Skills
-
-## SQL Generation
-- Always use parameterized queries
-- Prefer CTEs over subqueries for readability
-- Add LIMIT to exploratory queries
-- Validate generated SQL before execution
-
-## Chart Selection
-- Time series → line chart
-- Comparison across categories → bar chart
-- Part-of-whole → pie chart (max 6 slices)
-- Correlation → scatter plot
-
-## Data Quality Checks
-- Flag NULL rates > 5%
-- Detect outliers using IQR method
-- Warn on date gaps in time series`,
-    versions: [
-      { version: "1.4.0", date: "4d ago", author: "R. Silva", change: "Data quality checks section", status: "active" },
-      { version: "1.3.0", date: "2w ago", author: "R. Silva", change: "Chart selection heuristics", status: "previous" },
-    ],
-  },
-  {
-    id: "onboarding-skills",
-    name: "onboarding-skills",
-    displayName: "Onboarding Skills",
-    description: "Employee onboarding guidance: first-day checklists, IT setup procedures, benefits enrollment walkthrough, and HR policy Q&A patterns.",
-    agent: "onboarding-bot",
-    status: "active",
-    author: "L. Park",
-    updatedAt: "3d ago",
-    version: "1.0.3",
-    tags: ["hr", "onboarding", "it-setup", "benefits"],
-    content: `# Onboarding Bot Skills
-
-## First Day Checklist
-1. Welcome message with team info
-2. IT equipment setup guide
-3. Account provisioning status check
-4. Benefits enrollment reminder
-
-## IT Setup
-- Guide laptop configuration step by step
-- Create IT ticket if provisioning is delayed
-- Verify VPN and SSO access
-
-## HR Policy Q&A
-- Use policy-search tool for answers
-- Always cite the source document and section
-- Escalate to HR for ambiguous cases`,
-    versions: [
-      { version: "1.0.3", date: "3d ago", author: "L. Park", change: "Updated IT setup for 2026 laptops", status: "active" },
-    ],
-  },
-  {
-    id: "safety-reviewer-skills",
-    name: "safety-reviewer-skills",
-    displayName: "Safety Reviewer Skills",
-    description: "Content moderation capabilities: toxicity classification rules, PII detection patterns, compliance check procedures, and incident escalation protocols.",
-    agent: "safety-reviewer",
-    status: "error",
-    author: "A. Kovács",
-    updatedAt: "1d ago",
-    version: "0.9.1",
-    tags: ["safety", "moderation", "pii", "compliance"],
-    content: `# Safety Reviewer Skills
-
-## Toxicity Classification
-- Run all user-facing text through toxicity-classifier
-- Block responses scoring > 0.9 on any category
-- Log borderline cases (0.7-0.9) for human review
-
-## PII Detection
-- Scan all inputs and outputs with pii-detector
-- Auto-redact SSN, credit card, phone patterns
-- Flag but don't redact email addresses
-
-## Compliance Checks
-- GDPR: ensure right-to-deletion requests are honored
-- SOC2: log all data access decisions
-- HIPAA: block health information in non-medical contexts`,
-    versions: [
-      { version: "0.9.1", date: "1d ago", author: "A. Kovács", change: "HIPAA compliance rules", status: "error" },
-    ],
-  },
 ];
 
 export const TOOLS: Tool[] = [

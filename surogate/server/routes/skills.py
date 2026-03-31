@@ -23,7 +23,6 @@ from surogate.server.models.skill import (
 
 router = APIRouter()
 
-
 # ── helpers ──────────────────────────────────────────────────────────
 
 
@@ -34,7 +33,10 @@ def _skill_to_response(skill) -> SkillResponse:
         display_name=skill.display_name,
         description=skill.description,
         content=skill.content,
-        version=skill.version,
+        license=skill.license or "",
+        compatibility=skill.compatibility,
+        metadata=skill.meta,
+        allowed_tools=skill.allowed_tools or [],
         status=skill.status.value if hasattr(skill.status, "value") else skill.status,
         author_id=skill.author_id,
         author_username=skill.author.username if skill.author else "",
@@ -114,14 +116,17 @@ async def create_skill(
         raise HTTPException(status_code=500, detail=f"Failed to create skill repository '{repo_name}'")
     if repo is None:
         raise HTTPException(status_code=500, detail=f"Failed to create skill repository '{repo_name}'")
-
+    
     skill = await skill_repo.create_skill(
         session,
         name=body.name,
         display_name=body.display_name,
         description=body.description,
         content=body.content,
-        version=body.version,
+        license=body.license,
+        compatibility=body.compatibility,
+        meta=body.metadata,
+        allowed_tools=body.allowed_tools,
         status=skill_status,
         project_id=project_id,
         author_id=user.id,

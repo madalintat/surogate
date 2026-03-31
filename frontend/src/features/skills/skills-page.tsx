@@ -4,7 +4,7 @@
 import { Outlet, useLocation, useNavigate } from "@tanstack/react-router";
 import { PageHeader } from "@/components/page-header";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { SKILLS, TOOLS, MCP_SERVERS } from "./skills-data";
+import { TOOLS, MCP_SERVERS } from "./skills-data";
 
 const TAB_ROUTES: Record<string, string> = {
   skills: "/studio/skills",
@@ -29,7 +29,7 @@ export function SkillsPage() {
         title="Skills & Tools"
         subtitle={
           <>
-            {SKILLS.length} skills &middot; {TOOLS.length} tools &middot;{" "}
+            {TOOLS.length} tools &middot;{" "}
             {connectedMcp} MCP servers connected
           </>
         }
@@ -43,7 +43,6 @@ export function SkillsPage() {
           <TabsList variant="line">
             <TabsTrigger value="skills">
               Skills
-              <span className="text-[9px] ml-1 opacity-50">{SKILLS.length}</span>
             </TabsTrigger>
             <TabsTrigger value="tools">
               Tools

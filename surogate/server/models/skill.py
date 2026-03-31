@@ -13,6 +13,11 @@ class SkillCreateRequest(BaseModel):
     display_name: str
     description: str = ""
     content: str = ""
+    license: str = ""
+    compatibility: str = ""
+    metadata: Optional[dict[str, str]] = None
+    allowed_tools: list[str] = []
+    status: str = "active"
     tags: list[str] = []
 
 
@@ -21,6 +26,11 @@ class SkillUpdateRequest(BaseModel):
     display_name: Optional[str] = None
     description: Optional[str] = None
     content: Optional[str] = None
+    license: Optional[str] = None
+    compatibility: Optional[str] = None
+    metadata: Optional[dict[str, str]] = None
+    allowed_tools: Optional[list[str]] = None
+    status: Optional[str] = None
     tags: Optional[list[str]] = None
 
 
@@ -33,7 +43,10 @@ class SkillResponse(BaseModel):
     display_name: str
     description: str
     content: str
-    version: str
+    license: str
+    compatibility: str = ""
+    metadata: Optional[dict[str, str]] = None
+    allowed_tools: list[str] = []
     status: str
     author_id: str
     author_username: str = ""
