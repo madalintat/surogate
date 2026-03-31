@@ -5,27 +5,24 @@ import { useState, useMemo, useEffect } from "react";
 import { useNavigate } from "@tanstack/react-router";
 import { PageHeader } from "@/components/page-header";
 import { Card } from "@/components/ui/card";
-import { useHubStore } from "./hub-store";
+import { useAppStore } from "@/stores/app-store";
 import { RepositoryType } from "@/types/hub";
 import { TYPE_META } from "./hub-data";
 import type { RepoType } from "./hub-data";
 import { CreateRepoDialog } from "./create-repo-dialog";
 import { ImportDialog } from "./import-dialog";
 import { Database, GitBranch, Clock, Download, LayoutGrid, Loader2, Plus, RefreshCw } from "lucide-react";
-import { useAppStore } from "@/stores/app-store";
 import { spawnTask } from "@/api/tasks";
 import { toast } from "sonner";
 
 export function HubPage() {
   const navigate = useNavigate();
-  const { repositories = [], loading, error, fetchRepositories, createRepository: storeCreate } = useHubStore();
+  const { repositories = [], loading, error, fetchRepositories, createRepository: storeCreate, activeProjectId, addTask } = useAppStore();
   const [filterSearch, setFilterSearch] = useState("");
   const [filterType, setFilterType] = useState<string>("all");
   const [selectedTag, setSelectedTag] = useState<string | null>(null);
   const [showCreate, setShowCreate] = useState(false);
   const [showImport, setShowImport] = useState(false);
-  const activeProjectId = useAppStore((s) => s.activeProjectId);
-  const addTask = useAppStore((s) => s.addTask);
 
   useEffect(() => {
     void fetchRepositories();

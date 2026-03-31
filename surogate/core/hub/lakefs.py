@@ -325,6 +325,15 @@ async def get_commit(client: ApiClient, repository: str, commit_id: str) -> Opti
         logger.error(f"Error retrieving LakeFS commit '{commit_id}' in repository '{repository}': {e}")
         return None
     
+async def commit(client: ApiClient, repository: str, branch: str, message: str = "") -> Optional[str]:
+    try:
+        commits_api = lakefs_sdk.CommitsApi(client)
+        request = lakefs_sdk.CommitCreation(message=message)
+        return commits_api.commit(repository=repository, branch=branch, commit_creation=request)
+    except ApiException as e:
+        logger.error(f"Error creating LakeFS commit in repository '{repository}' and branch '{branch}': {e}")
+        return None
+    
 # ============ Objects ============
 async def get_objects(client: ApiClient, repository: str, ref: str, prefix: Optional[str] = None) -> ObjectStatsList:
     try:
@@ -357,10 +366,11 @@ async def get_object_content(client: ApiClient, repository: str, ref: str, path:
     except ApiException as e:
         return None
 
-async def upload_objects(client: ApiClient, repository: str, branch: str, path: str, content: bytes) -> Optional[ObjectStats]:
+async def upload_object(client: ApiClient, repository: str, branch: str, path: str, content: bytes) -> Optional[ObjectStats]:
     try:
         objects_api = lakefs_sdk.ObjectsApi(client)
         return objects_api.upload_object(repository=repository, branch=branch, path=path, content=content)
     except ApiException as e:
-        logger.error(f"Error uploading objects to LakeFS repository '{repository}' and ref '{branch}': {e}")
+        logger.error(f"Error uploading object to LakeFS repository '{repository}' and ref '{branch}': {e}")
         return None
+    

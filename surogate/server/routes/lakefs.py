@@ -237,7 +237,9 @@ async def upload_object(
         raise HTTPException(status_code=400, detail="Missing 'content' field")
     content = await upload.read()
     path = path.lstrip("/")
-    result = await lakefs.upload_objects(api_client, repository, branch, path, content)
+    result = await lakefs.upload_object(api_client, repository, branch, path, content)
     if result is None:
         raise HTTPException(status_code=500, detail=f"Failed to upload object '{path}'")
+    
+    await lakefs.commit(api_client, repository, branch, f"Uploaded via API'")
     return result

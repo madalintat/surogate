@@ -26,7 +26,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, Response
 from pathlib import Path
 
-from routes import auth_router, project_router, hub_router, compute_router, tasks_router
+from routes import auth_router, project_router, hub_router, compute_router, tasks_router, skills_router
 
 logger = get_logger()
 
@@ -84,6 +84,7 @@ app.include_router(project_router, prefix = "/api/projects", tags = ["projects"]
 app.include_router(hub_router, prefix = "/api/hub", tags = ["hub"])
 app.include_router(compute_router, prefix = "/api/compute", tags = ["compute"])
 app.include_router(tasks_router, prefix = "/api/tasks", tags = ["tasks"])
+app.include_router(skills_router, prefix = "/api/skills", tags = ["skills"])
 
 
 # ============ Health and System Endpoints ============

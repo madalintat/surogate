@@ -6,6 +6,12 @@ from surogate.core.db.models.platform import (
     User,
 )
 
+async def get_user_by_username(session: AsyncSession, username: str) -> Optional[User]:
+    result = await session.execute(
+        sa.select(User).where(User.username == username)
+    )
+    return result.scalar_one_or_none()
+
 async def get_lakefs_credentials(session: AsyncSession, username: str) -> Optional[tuple[str, str]]:
     """Return LakeFS credentials (key, secret) for a user."""
     result = await session.execute(

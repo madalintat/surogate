@@ -1,14 +1,30 @@
 // Copyright (c) 2026, Invergent SA, developed by Flavius Burca
 // SPDX-License-Identifier: AGPL-3.0-only
 //
-import { useState } from "react";
+import { useEffect, useState } from "react";
+import { useNavigate } from "@tanstack/react-router";
+import { Loader2, Trash2 } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { ConfirmDialog } from "@/components/ui/confirm-dialog";
+import { Input } from "@/components/ui/input";
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+  DialogDescription,
+  DialogFooter,
+} from "@/components/ui/dialog";
 import { StatusDot } from "@/components/ui/status-dot";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { cn } from "@/utils/cn";
-import { SKILLS, toStatus } from "./skills-data";
-import type { Skill } from "./skills-data";
+import { toStatus } from "./skills-data";
+import type { Skill } from "@/types/skill";
+import { SkillForm } from "./skill-form";
+import type { SkillFormData } from "./skill-form";
+import { useAppStore } from "@/stores/app-store";
+import { RepoExplorer } from "@/features/hub/repo-explorer";
 
 function SkillListItem({
   skill,
@@ -39,6 +55,9 @@ function SkillListItem({
         </div>
         <StatusDot status={toStatus(skill.status)} />
       </div>
+      <code className="text-[10px] text-muted-foreground/60 font-mono mb-0.5 block">
+        {skill.name}
+      </code>
       <p className="text-[10px] text-muted-foreground leading-snug line-clamp-1 mb-1.5">
         {skill.description}
       </p>
@@ -53,7 +72,28 @@ function SkillListItem({
   );
 }
 
-function SkillDetail({ skill, onClose }: { skill: Skill; onClose: () => void }) {
+function SkillDetail({ skill, onClose, onEdit, onDelete, onPublish }: { skill: Skill; onClose: () => void; onEdit: () => void; onDelete: () => Promise<void>; onPublish: (tag: string) => Promise<boolean> }) {
+  const navigate = useNavigate();
+  const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
+  const [showPublish, setShowPublish] = useState(false);
+  const [publishTag, setPublishTag] = useState("");
+  const [publishing, setPublishing] = useState(false);
+  const [publishError, setPublishError] = useState<string | null>(null);
+
+  const handlePublish = async () => {
+    if (!publishTag.trim()) return;
+    setPublishing(true);
+    setPublishError(null);
+    const ok = await onPublish(publishTag.trim());
+    setPublishing(false);
+    if (ok) {
+      setShowPublish(false);
+      setPublishTag("");
+    } else {
+      setPublishError("Failed to publish. The tag may already exist.");
+    }
+  };
+
   return (
     <div className="flex-1 flex flex-col overflow-hidden animate-in fade-in duration-150">
       {/* Header */}
@@ -69,15 +109,30 @@ function SkillDetail({ skill, onClose }: { skill: Skill; onClose: () => void }) 
                 <Badge>v{skill.version}</Badge>
                 <StatusDot status={toStatus(skill.status)} />
               </div>
+              <code className="text-[10px] text-muted-foreground/60 font-mono block">
+                {skill.name}
+              </code>
               <div className="text-[10px] text-muted-foreground mt-0.5">
                 Agent: <span className="text-foreground/70">{skill.agent}</span> &middot;{" "}
                 {skill.author} &middot; {skill.updatedAt}
               </div>
+              {skill.hubRef && (
+                <button
+                  type="button"
+                  onClick={() => navigate({ to: `/studio/hub/${skill.hubRef}` })}
+                  className="text-[10px] text-amber-500 hover:underline cursor-pointer mt-0.5 bg-transparent border-none p-0 font-mono"
+                >
+                  &#x2B21; {skill.hubRef}
+                </button>
+              )}
             </div>
           </div>
           <div className="flex gap-1.5">
-            <Button variant="outline" size="xs">Edit</Button>
-            <Button variant="outline" size="xs">Publish</Button>
+            <Button variant="outline" size="xs" onClick={onEdit}>Edit</Button>
+            <Button variant="outline" size="xs" onClick={() => { setPublishTag(""); setPublishError(null); setShowPublish(true); }}>Publish</Button>
+            <Button variant="outline" size="xs" onClick={() => setShowDeleteConfirm(true)}>
+              <Trash2 size={12} className="mr-1" />Delete
+            </Button>
             <Button variant="ghost" size="icon-xs" onClick={onClose}>
               &#x2715;
             </Button>
@@ -95,7 +150,7 @@ function SkillDetail({ skill, onClose }: { skill: Skill; onClose: () => void }) 
         <div className="px-6 border-b border-border shrink-0">
           <TabsList variant="line">
             <TabsTrigger value="content">Content</TabsTrigger>
-            <TabsTrigger value="versions">Versions</TabsTrigger>
+            {skill.hubRef && <TabsTrigger value="repository">Repository</TabsTrigger>}
           </TabsList>
         </div>
 
@@ -105,47 +160,56 @@ function SkillDetail({ skill, onClose }: { skill: Skill; onClose: () => void }) 
           </pre>
         </TabsContent>
 
-        <TabsContent value="versions" className="flex-1 overflow-y-auto p-6">
-          {skill.versions.map((v, i) => (
-            <div key={v.version} className="flex gap-3 mb-1">
-              <div className="flex flex-col items-center w-5">
-                <div
-                  className={cn(
-                    "w-2.5 h-2.5 rounded-full shrink-0",
-                    v.status === "active"
-                      ? "bg-green-500"
-                      : "bg-muted border border-muted-foreground/30",
-                  )}
-                />
-                {i < skill.versions.length - 1 && (
-                  <div className="w-px flex-1 bg-border" />
-                )}
-              </div>
-              <div className="pb-4 flex-1">
-                <div className="flex items-center gap-1.5 mb-0.5">
-                  <code
-                    className={cn(
-                      "text-[11px] font-semibold",
-                      v.status === "active" ? "text-foreground" : "text-muted-foreground",
-                    )}
-                  >
-                    v{v.version}
-                  </code>
-                  {v.status === "active" && (
-                    <Badge variant="active">LIVE</Badge>
-                  )}
-                </div>
-                <div className="text-[10px] text-muted-foreground mb-0.5">
-                  {v.change}
-                </div>
-                <div className="text-[9px] text-muted-foreground/50">
-                  {v.author} &middot; {v.date}
-                </div>
-              </div>
-            </div>
-          ))}
-        </TabsContent>
+        {skill.hubRef && (
+          <TabsContent value="repository" className="flex-1 flex flex-col overflow-hidden">
+            <RepoExplorer repoId={skill.hubRef} className="flex-1" />
+          </TabsContent>
+        )}
       </Tabs>
+
+      <ConfirmDialog
+        open={showDeleteConfirm}
+        title="Delete Skill"
+        description={<>Are you sure you want to delete <span className="font-semibold text-foreground">{skill.displayName}</span>? This action cannot be undone.</>}
+        confirmLabel="Delete"
+        confirmIcon={<Trash2 size={14} className="mr-1.5" />}
+        onConfirm={async () => { await onDelete(); setShowDeleteConfirm(false); }}
+        onCancel={() => setShowDeleteConfirm(false)}
+      />
+
+      <Dialog open={showPublish} onOpenChange={(o) => { if (!o && !publishing) setShowPublish(false); }}>
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>Publish Skill</DialogTitle>
+            <DialogDescription>
+              Tag the current <code className="text-foreground/70">main</code> branch as a new version.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="py-2">
+            <label className="block mb-1 text-sm text-muted-foreground font-display">Tag name</label>
+            <Input
+              value={publishTag}
+              onChange={(e) => setPublishTag(e.target.value)}
+              placeholder="v1.0.0"
+              className="font-mono"
+              autoFocus
+              onKeyDown={(e) => { if (e.key === "Enter") handlePublish(); }}
+            />
+            {publishError && (
+              <div className="text-destructive text-xs mt-1">{publishError}</div>
+            )}
+          </div>
+          <DialogFooter>
+            <Button variant="outline" disabled={publishing} onClick={() => setShowPublish(false)}>
+              Cancel
+            </Button>
+            <Button disabled={publishing || !publishTag.trim()} onClick={handlePublish}>
+              {publishing && <Loader2 className="animate-spin mr-1.5" size={14} />}
+              Publish
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }
@@ -156,7 +220,7 @@ function SkillEmptyState() {
       <div className="text-center">
         <div className="text-3xl mb-2">&#x1F4C4;</div>
         <div className="font-display text-sm">Select a skill to view its content</div>
-        <div className="text-[10px] mt-1 max-w-[300px] leading-relaxed text-muted-foreground/30">
+        <div className="text-[10px] mt-1 max-w-75 leading-relaxed text-muted-foreground/30">
           Skills are markdown files that define agent capabilities, workflows,
           escalation rules, and behavioral guidelines.
         </div>
@@ -165,38 +229,134 @@ function SkillEmptyState() {
   );
 }
 
+type RightPanel =
+  | { kind: "empty" }
+  | { kind: "detail"; skill: Skill }
+  | { kind: "create" }
+  | { kind: "edit"; skill: Skill };
+
 export function SkillsTab() {
   const [selectedId, setSelectedId] = useState<string | null>(null);
-  const selected = selectedId ? SKILLS.find((s) => s.id === selectedId) ?? null : null;
+  const [panel, setPanel] = useState<RightPanel>({ kind: "empty" });
+
+  const skills = useAppStore((s) => s.skills);
+  const activeProjectId = useAppStore((s) => s.activeProjectId);
+  const fetchSkills = useAppStore((s) => s.fetchSkills);
+  const createSkill = useAppStore((s) => s.createSkill);
+  const updateSkill = useAppStore((s) => s.updateSkill);
+  const deleteSkill = useAppStore((s) => s.deleteSkill);
+  const publishSkill = useAppStore((s) => s.publishSkill);
+
+  useEffect(() => {
+    fetchSkills(activeProjectId ?? undefined);
+  }, [fetchSkills, activeProjectId]);
+
+  const handleSelect = (id: string) => {
+    const skill = skills.find((s) => s.id === id);
+    if (!skill) return;
+    setSelectedId(id);
+    setPanel({ kind: "detail", skill });
+  };
+
+  const handleCreate = () => {
+    setSelectedId(null);
+    setPanel({ kind: "create" });
+  };
+
+  const handleEdit = (skill: Skill) => {
+    setPanel({ kind: "edit", skill });
+  };
+
+  const handleClose = () => {
+    setSelectedId(null);
+    setPanel({ kind: "empty" });
+  };
+
+  const handleDelete = async (skillId: string) => {
+    const ok = await deleteSkill(skillId);
+    if (ok) {
+      setSelectedId(null);
+      setPanel({ kind: "empty" });
+    }
+  };
+
+  const handleSave = async (data: SkillFormData) => {
+    if (panel.kind === "edit") {
+      const result = await updateSkill(panel.skill.id, {
+        name: data.name,
+        display_name: data.displayName,
+        description: data.description,
+        content: data.content,
+        version: data.version,
+        status: data.status,
+        tags: data.tags,
+      });
+      if (result) {
+        setSelectedId(result.id);
+        setPanel({ kind: "detail", skill: result });
+        return;
+      }
+    } else {
+      const projectId = activeProjectId;
+      if (!projectId) return;
+      const result = await createSkill(projectId, {
+        name: data.name,
+        display_name: data.displayName,
+        description: data.description,
+        content: data.content,
+        version: data.version,
+        status: data.status,
+        tags: data.tags,
+      });
+      if (result) {
+        setSelectedId(result.id);
+        setPanel({ kind: "detail", skill: result });
+        return;
+      }
+    }
+    setPanel({ kind: "empty" });
+    setSelectedId(null);
+  };
 
   return (
     <div className="flex-1 flex overflow-hidden">
       {/* List */}
-      <div className="w-[420px] min-w-[420px] border-r border-border flex flex-col">
+      <div className="w-105 min-w-105 border-r border-border flex flex-col">
         <div className="px-4 py-3 border-b border-border flex justify-between items-center">
           <span className="text-[10px] text-muted-foreground">
-            {SKILLS.length} agent skill files
+            {skills.length} agent skill files
           </span>
-          <Button size="xs">+ New Skill</Button>
+          <Button size="xs" onClick={handleCreate}>+ New Skill</Button>
         </div>
         <div className="flex-1 overflow-y-auto">
-          {SKILLS.map((s) => (
+          {skills.map((s) => (
             <SkillListItem
               key={s.id}
               skill={s}
               selected={selectedId === s.id}
-              onSelect={() => setSelectedId(s.id)}
+              onSelect={() => handleSelect(s.id)}
             />
           ))}
         </div>
       </div>
 
-      {/* Detail / Empty */}
-      {selected ? (
-        <SkillDetail skill={selected} onClose={() => setSelectedId(null)} />
-      ) : (
-        <SkillEmptyState />
+      {/* Right panel */}
+      {panel.kind === "detail" && (
+        <SkillDetail
+          skill={panel.skill}
+          onClose={handleClose}
+          onEdit={() => handleEdit(panel.skill)}
+          onDelete={() => handleDelete(panel.skill.id)}
+          onPublish={(tag) => publishSkill(panel.skill.id, tag)}
+        />
       )}
+      {panel.kind === "create" && (
+        <SkillForm onSave={handleSave} onCancel={handleClose} />
+      )}
+      {panel.kind === "edit" && (
+        <SkillForm skill={panel.skill} onSave={handleSave} onCancel={handleClose} />
+      )}
+      {panel.kind === "empty" && <SkillEmptyState />}
     </div>
   );
 }
