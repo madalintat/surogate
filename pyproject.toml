@@ -58,7 +58,8 @@ dependencies = [
     "sqlalchemy[asyncio]>=2.0",
     "aiosqlite>=0.20.0",
     "skypilot>=0.12.0",
-    "kubernetes==0.34.0",
+    "kubernetes>=0.34.0",
+    "prometheus-api-client>=0.7.0"
 ]
 scripts = { "surogate" = "surogate.cli.main:cli_main" }
 

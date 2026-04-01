@@ -5,6 +5,7 @@
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+export K3D_IMAGE="ghcr.io/invergent-ai/k3s-v1.35.3-k3s1-cuda-12.9.1-cudnn-runtime-ubuntu24.04"
 export SUROGATE_DIR="${HOME}/.surogate"
 export LAKEFS_DIR="${SUROGATE_DIR}/lakefs"
 export HF_CACHE="${HOME}/.cache/huggingface"
@@ -77,25 +78,28 @@ fi
 setup_helm_repositories() {
     "$HELM" repo add traefik https://traefik.github.io/charts
     "$HELM" repo add lakefs https://charts.lakefs.io
-    # "$HELM" repo update
+    "$HELM" repo add prometheus-community https://prometheus-community.github.io/helm-charts
+    "$HELM" repo add nvidia https://helm.ngc.nvidia.com/nvidia
+    "$HELM" repo add dcgm-exporter https://nvidia.github.io/dcgm-exporter/helm-charts
+    "$HELM" repo update
 }
 
 create_cluster() {
-    for host in k8s.localhost studio.k8s.localhost lakefs.k8s.localhost lakefs-s3.k8s.localhost; do
+    for host in k8s.localhost studio.k8s.localhost lakefs.k8s.localhost lakefs-s3.k8s.localhost metrics.k8s.localhost; do
         grep -qF "$host" /etc/hosts || sudo sh -c "echo '127.0.0.1 $host' >> /etc/hosts"
     done
     
     tmp_config=$(mktemp /tmp/k3d-config-XXXXXX.yaml)
     envsubst < "${SCRIPT_DIR}/cluster.yaml" > "$tmp_config"
-    "$K3D" cluster create --config "$tmp_config"
+    "$K3D" cluster create --config "$tmp_config" --gpus all
     rm -f "$tmp_config"
 }
 
 install_traefik() {
     "$MKCERT" -key-file "${SUROGATE_DIR}/ssl.key.pem" -cert-file "${SUROGATE_DIR}/ssl.cert.pem" "*.k8.localhost"
     "$KUBECTL" create secret generic traefik-tls-secret --from-file=tls.crt="${SUROGATE_DIR}/ssl.cert.pem" --from-file=tls.key="${SUROGATE_DIR}/ssl.key.pem" -n kube-system
-    "$HELM" install traefik traefik/traefik --version 35.4.0 -n kube-system -f "$SCRIPT_DIR/traefik/values.yaml"
-    "$KUBECTL" apply -f "${SCRIPT_DIR}/traefik/middleware.yaml"
+    "$HELM" install traefik traefik/traefik --version 35.4.0 -n kube-system -f "$SCRIPT_DIR/traefik/values.yml"
+    "$KUBECTL" apply -f "${SCRIPT_DIR}/traefik/middleware.yml"
 }
 
 setup_lakefs() {
@@ -158,6 +162,14 @@ install_lakefs() {
     "$KUBECTL" apply -f "${SCRIPT_DIR}/lakefs/s3-service.yml"
 }
 
+install_metrics() {
+  "$KUBECTL" create namespace monitoring
+  "$HELM" install dcgm-exporter dcgm-exporter/dcgm-exporter -f "${SCRIPT_DIR}/metrics/dcgm.yml"
+  "$HELM" install kube-prometheus-stack prometheus-community/kube-prometheus-stack -f "${SCRIPT_DIR}/metrics/values.yml" -n monitoring
+  "$KUBECTL" apply -f "${SCRIPT_DIR}/metrics/ingress.yml"
+  "$KUBECTL" apply -f "${SCRIPT_DIR}/metrics/gpu_scraper.yml"
+}
+
 create_server_config() {
     cat >"${SUROGATE_DIR}/config.yaml" <<EOF
 host: 127.0.0.1
@@ -190,6 +202,7 @@ export KUBECONFIG="$SUROGATE_DIR/kubeconfig"
 
 install_traefik
 install_lakefs
+install_metrics
 create_server_config
 
 echo -e "${GREEN}✓ Cluster setup complete!${NC}"

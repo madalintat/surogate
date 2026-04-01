@@ -244,9 +244,6 @@ export function ModelsPage() {
         }
         action={
           <div className="flex gap-2">
-            <Button variant="outline" size="sm">
-              &#x2295; Import from Hub
-            </Button>
             <Button size="sm" onClick={() => setShowServeModal(true)}>
               &#x25C7; Serve Model
             </Button>

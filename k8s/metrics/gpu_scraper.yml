@@ -1,0 +1,23 @@
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: nvidia-dcgm-exporter
+  # It's usually best to put the ServiceMonitor in the same namespace as Prometheus
+  namespace: monitoring 
+  labels:
+    # This label is critical. The kube-prometheus-stack looks for this 
+    # specific label to know which ServiceMonitors to load.
+    release: kube-prometheus-stack
+spec:
+  # This selector targets the specific service of your DCGM exporter
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: dcgm-exporter # UPDATE THIS if yours is different
+  # If your exporter is in a different namespace, specify it here
+  namespaceSelector:
+    matchNames:
+      - default # UPDATE THIS to the namespace where DCGM is installed
+  endpoints:
+    - port: metrics # UPDATE THIS to the exact port name from 'kubectl get svc'
+      interval: 5s  # Your requested 5-second scrape interval
+      path: /metrics

@@ -257,9 +257,8 @@ class Model(UUIDMixin, TimestampMixin, Base):
         sa.ForeignKey("projects.id"), index=True
     )
     name: Mapped[str] = mapped_column(sa.String(255))
-    display_name: Mapped[str] = mapped_column(sa.String(255))
-    description: Mapped[str] = mapped_column(sa.Text, default="")
-    family: Mapped[str] = mapped_column(sa.String(128))
+    description: Mapped[str] = mapped_column(sa.String(255))
+    architecture: Mapped[str] = mapped_column(sa.String(128))
     parameters: Mapped[str] = mapped_column(sa.String(32))
     type: Mapped[ModelType] = mapped_column(sa.Enum(ModelType))
     base_model_ref: Mapped[Optional[str]] = mapped_column(
@@ -279,9 +278,6 @@ class Model(UUIDMixin, TimestampMixin, Base):
     generation_defaults: Mapped[Optional[dict[str, Any]]] = mapped_column(
         sa.JSON, nullable=True
     )
-    gpu: Mapped[str] = mapped_column(sa.String(128), default="")
-    vram: Mapped[str] = mapped_column(sa.String(64), default="")
-    throughput: Mapped[Optional[int]] = mapped_column(sa.Integer, nullable=True)
     training_run_id: Mapped[Optional[str]] = mapped_column(
         sa.String(36), nullable=True
     )
@@ -293,6 +289,9 @@ class Model(UUIDMixin, TimestampMixin, Base):
     )
     deployed_by_id: Mapped[Optional[str]] = mapped_column(
         sa.ForeignKey("users.id"), nullable=True
+    )
+    deployed_endpoint: Mapped[Optional[str]] = mapped_column(
+        sa.String(2048), nullable=True
     )
 
     deployed_by: Mapped[Optional["User"]] = relationship()  # noqa: F821

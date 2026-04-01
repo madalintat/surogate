@@ -107,7 +107,11 @@ async def create_skill(
         repo = await lakefs.create_repository(
             api_client,
             current_subject,
-            RepositoryCreation(name=repo_name, storage_namespace=f"local://{repo_name}"),
+            RepositoryCreation(
+                name=repo_name, 
+                storage_namespace=f"local://{repo_name}",
+                metadata={"type": lakefs.REPO_TYPE_SKILL}, 
+            ),
             config,
         )
     except ApiException as e:

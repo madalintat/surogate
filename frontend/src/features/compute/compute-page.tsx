@@ -43,7 +43,7 @@ export function ComputePage() {
           <TabsList variant="line">
             <TabsTrigger value="overview">Overview</TabsTrigger>
             <TabsTrigger value="nodes">Cluster Nodes</TabsTrigger>
-            <TabsTrigger value="cloud">Cloud / SkyPilot</TabsTrigger>
+            <TabsTrigger value="cloud">Cloud</TabsTrigger>
             <TabsTrigger value="queue">Workload Queue</TabsTrigger>
             <TabsTrigger value="costs">Costs</TabsTrigger>
             <TabsTrigger value="policies">Policies</TabsTrigger>

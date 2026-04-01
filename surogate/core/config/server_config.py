@@ -15,6 +15,8 @@ class ServerConfig:
     lakefs_endpoint: Optional[str] = None
     lakefs_s3_endpoint: Optional[str] = None
     lakefs_access_key: Optional[str] = None
+    prometheus_endpoint: Optional[str] = 'https://metrics.k8s.localhost'
+    
     lakefs_secret_key: Optional[str] = None
 
     def __init__(self, cfg: DictDefault):
