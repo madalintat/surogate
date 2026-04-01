@@ -1,12 +1,22 @@
 // Copyright (c) 2026, Invergent SA, developed by Flavius Burca
 // SPDX-License-Identifier: AGPL-3.0-only
 //
+import { useEffect } from "react";
 import { Outlet, useLocation, useNavigate } from "@tanstack/react-router";
 import { PageHeader } from "@/components/page-header";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Button } from "@/components/ui/button";
 import { Cloud, Plus } from "lucide-react";
-import { LOCAL_NODES, CLOUD_INSTANCES } from "./compute-data";
+import { useAppStore } from "@/stores/app-store";
+import { CLOUD_INSTANCES } from "./compute-data";
+
+function getGpuTotal(node: { total?: Record<string, number> }): number {
+  return node.total?.["accelerator_count"] ?? 0;
+}
+
+function getGpuFree(node: { free?: Record<string, number> }): number {
+  return node.free?.["accelerators_available"] ?? 0;
+}
 
 const TAB_ROUTES: Record<string, string> = {
   overview: "/studio/compute",
@@ -26,8 +36,13 @@ export function ComputePage() {
   const navigate = useNavigate();
   const activeTab = ROUTE_TO_TAB[pathname.replace(/\/$/, "")] ?? "overview";
 
-  const usedGpu = LOCAL_NODES.reduce((s, n) => s + (n.gpu?.used || 0), 0);
-  const totalGpu = LOCAL_NODES.reduce((s, n) => s + (n.gpu?.count || 0), 0);
+  const k8sNodes = useAppStore((s) => s.k8sNodes);
+  useEffect(() => {
+    return useAppStore.getState().startK8sPolling();
+  }, []);
+
+  const totalGpu = k8sNodes.reduce((s, n) => s + getGpuTotal(n), 0);
+  const usedGpu = totalGpu - k8sNodes.reduce((s, n) => s + getGpuFree(n), 0);
   const runningCloud = CLOUD_INSTANCES.filter((c) => c.status === "running").length;
   const cloudCost = CLOUD_INSTANCES.filter((c) => c.status === "running").reduce((s, c) => s + c.costPerHour, 0);
 

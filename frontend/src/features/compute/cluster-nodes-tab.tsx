@@ -1,7 +1,6 @@
 // Copyright (c) 2026, Invergent SA, developed by Flavius Burca
 // SPDX-License-Identifier: AGPL-3.0-only
 //
-import { useEffect } from "react";
 import { Card } from "@/components/ui/card";
 import { StatusDot } from "@/components/ui/status-dot";
 import { ProgressBar } from "@/components/ui/progress-bar";
@@ -18,11 +17,6 @@ function getGpuFree(node: { free?: Record<string, number> }): number {
 
 export function ClusterNodesTab() {
   const k8sNodes = useAppStore((s) => s.k8sNodes);
-  const fetchK8Nodes = useAppStore((s) => s.fetchK8Nodes);
-
-  useEffect(() => {
-    fetchK8Nodes();
-  }, [fetchK8Nodes]);
 
   return (
     <div className="animate-in fade-in duration-200">

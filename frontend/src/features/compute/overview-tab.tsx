@@ -1,7 +1,6 @@
 // Copyright (c) 2026, Invergent SA, developed by Flavius Burca
 // SPDX-License-Identifier: AGPL-3.0-only
 //
-import { useEffect } from "react";
 import { Card, CardContent } from "@/components/ui/card";
 import { ProgressBar } from "@/components/ui/progress-bar";
 import { StatusDot } from "@/components/ui/status-dot";
@@ -21,11 +20,6 @@ function getGpuFree(node: { free?: Record<string, number> }): number {
 
 export function OverviewTab() {
   const k8sNodes = useAppStore((s) => s.k8sNodes);
-  const fetchK8Nodes = useAppStore((s) => s.fetchK8Nodes);
-
-  useEffect(() => {
-    fetchK8Nodes();
-  }, [fetchK8Nodes]);
 
   const totalLocalGpu = k8sNodes.reduce((s, n) => s + getGpuTotal(n), 0);
   const usedLocalGpu = totalLocalGpu - k8sNodes.reduce((s, n) => s + getGpuFree(n), 0);
