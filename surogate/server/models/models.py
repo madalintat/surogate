@@ -22,15 +22,6 @@ class DeployedModelCreateRequest(BaseModel):
     image: Optional[str] = None
     hub_ref: Optional[str] = None
     namespace: Optional[str] = None
-    # ServingService params
-    task_yaml: Optional[str] = None
-    accelerators: Optional[str] = None
-    cloud: Optional[str] = None
-    use_spot: bool = False
-    min_replicas: int = 1
-    max_replicas: Optional[int] = None
-    readiness_path: Optional[str] = None
-    load_balancing_policy: Optional[str] = None
     serving_config: Optional[dict] = None
     generation_defaults: Optional[dict] = None
 
@@ -38,15 +29,14 @@ class DeployedModelCreateRequest(BaseModel):
 class DeployedModelUpdateRequest(BaseModel):
     engine: Optional[str] = None
     accelerators: Optional[str] = None
-    cloud: Optional[str] = None
+    infra: Optional[str] = None
     use_spot: Optional[bool] = None
     serving_config: Optional[dict] = None
     generation_defaults: Optional[dict] = None
 
 
 class DeployedModelScaleRequest(BaseModel):
-    min_replicas: Optional[int] = None
-    max_replicas: Optional[int] = None
+    replicas: int
 
 
 # ── Response sub-models ───────────────────────────────────────────────
@@ -107,6 +97,7 @@ class DeployedModelResponse(BaseModel):
     display_name: str
     description: str
     base: str
+    project_id: str
     family: str
     param_count: str
     type: str
@@ -152,3 +143,9 @@ class DeployedModelListResponse(BaseModel):
     models: list[DeployedModelResponse]
     total: int
     status_counts: dict[str, int]
+
+
+class ModelLogsResponse(BaseModel):
+    model_id: str
+    target: str
+    lines: list[str]

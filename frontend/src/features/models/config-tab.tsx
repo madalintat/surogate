@@ -102,7 +102,7 @@ export function ConfigTab({ model }: { model: Model }) {
     await updateModel(model.id, {
       engine: engine || undefined,
       accelerators: acc || undefined,
-      cloud: computeIdx === 1 ? (cloud || undefined) : undefined,
+      infra: computeIdx === 1 ? (cloud || undefined) : "k8s",
     });
     setSaving(false);
   };

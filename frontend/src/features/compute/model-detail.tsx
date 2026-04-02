@@ -4,29 +4,30 @@
 import { useState, useEffect } from "react";
 import { Button } from "@/components/ui/button";
 import { StatusDot } from "@/components/ui/status-dot";
-import { ProgressBar } from "@/components/ui/progress-bar";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { useAppStore } from "@/stores/app-store";
-import { getTaskLogs } from "@/api/tasks";
+import { getModelLogs } from "@/api/models";
 import { STATUS_COLORS } from "./compute-data";
-import { X, Terminal, Clock, User, Folder, Cpu, MapPin, ChevronRight } from "lucide-react";
-import { statusForDot, parseProgress, InfoRow, TASK_COLOR, EXTENDED_WORKLOAD_COLORS } from "./detail-shared";
+import { X, Terminal, Clock, User, Folder, Cpu, MapPin, ChevronRight, Globe, Layers, Gauge, Server } from "lucide-react";
+import { statusForDot, InfoRow, EXTENDED_WORKLOAD_COLORS } from "./detail-shared";
 import type { ExtendedWorkload } from "./detail-shared";
 
-export function TaskDetail({ item, onClose }: { item: ExtendedWorkload; onClose: () => void }) {
+export function ModelDetail({ item, onClose }: { item: ExtendedWorkload; onClose: () => void }) {
   const [logs, setLogs] = useState<string[]>([]);
   const [logsLoading, setLogsLoading] = useState(false);
-  const cancelTask = useAppStore((s) => s.cancelTask);
+  const stopModel = useAppStore((s) => s.stopModel);
+  const startModel = useAppStore((s) => s.startModel);
+  const restartModel = useAppStore((s) => s.restartModel);
   const dot = statusForDot(item.status);
-  const isActive = dot === "running" || dot === "deploying" || item.status === "pending";
-  const task = item._task;
+  const isActive = dot === "running" || dot === "deploying";
+  const model = item._model;
 
   useEffect(() => {
     let cancelled = false;
     const fetchLogs = async () => {
       setLogsLoading(true);
       try {
-        const res = await getTaskLogs(item.id, 200);
+        const res = await getModelLogs(item.id, { tail: 200 });
         if (!cancelled) setLogs(res.lines);
       } catch {
         if (!cancelled) setLogs(["(could not fetch logs)"]);
@@ -61,14 +62,32 @@ export function TaskDetail({ item, onClose }: { item: ExtendedWorkload; onClose:
             {item.method !== "\u2014" && <span className="text-[11px] text-faint">{"\u00b7"} {item.method}</span>}
           </div>
           <div className="flex items-center gap-2">
-            {isActive && (
+            {model && (dot === "running" || dot === "deploying") && (
               <Button
                 variant="outline"
                 size="xs"
                 className="text-destructive border-destructive/30 hover:bg-destructive/10"
-                onClick={(e) => { e.stopPropagation(); void cancelTask(item.id); }}
+                onClick={(e) => { e.stopPropagation(); void stopModel(model.id); }}
               >
-                Cancel
+                Stop
+              </Button>
+            )}
+            {model && dot === "stopped" && (
+              <Button
+                variant="outline"
+                size="xs"
+                onClick={(e) => { e.stopPropagation(); void startModel(model.id); }}
+              >
+                Start
+              </Button>
+            )}
+            {model && dot === "error" && (
+              <Button
+                variant="outline"
+                size="xs"
+                onClick={(e) => { e.stopPropagation(); void restartModel(model.id); }}
+              >
+                Restart
               </Button>
             )}
             <Button variant="ghost" size="icon-xs" onClick={(e) => { e.stopPropagation(); onClose(); }}>
@@ -82,32 +101,17 @@ export function TaskDetail({ item, onClose }: { item: ExtendedWorkload; onClose:
           <div className="w-80 shrink-0 px-4 py-3 border-r border-line">
             <div className="grid grid-cols-2 gap-x-4 gap-y-2.5">
               <InfoRow icon={Folder} label="Project" value={item.project} />
-              <InfoRow icon={User} label="Requested by" value={item.requestedBy} />
+              <InfoRow icon={User} label="Deployed by" value={item.requestedBy} />
               <InfoRow icon={MapPin} label="Location" value={item.location === "aws" ? "AWS Cloud" : "Local"} />
               <InfoRow icon={Cpu} label="GPU" value={item.gpu} />
               {item.node !== "\u2014" && <InfoRow icon={ChevronRight} label="Node" value={item.node} />}
               {item.startedAt && <InfoRow icon={Clock} label="Started" value={item.startedAt} />}
-              {task?.exit_code != null && <InfoRow icon={Terminal} label="Exit code" value={String(task.exit_code)} />}
-              {task?.created_at && <InfoRow icon={Clock} label="Created" value={new Date(task.created_at).toLocaleString()} />}
-              {task?.completed_at && <InfoRow icon={Clock} label="Completed" value={new Date(task.completed_at).toLocaleString()} />}
+              {model && <InfoRow icon={Server} label="Engine" value={model.engine} />}
+              {model && <InfoRow icon={Layers} label="Replicas" value={`${model.replicas.current}/${model.replicas.desired}`} />}
+              {model?.endpoint && model.endpoint !== "\u2014" && <InfoRow icon={Globe} label="Endpoint" value={model.endpoint} />}
+              {model?.uptime && model.uptime !== "\u2014" && <InfoRow icon={Clock} label="Uptime" value={model.uptime} />}
+              {model && model.tps > 0 && <InfoRow icon={Gauge} label="TPS" value={String(model.tps)} />}
             </div>
-
-            {task?.progress && (
-              <div className="mt-3">
-                <div className="flex justify-between text-[11px] mb-1">
-                  <span className="text-faint">Progress</span>
-                  <span className="text-muted-foreground font-mono">{task.progress}</span>
-                </div>
-                <ProgressBar value={parseProgress(task.progress)} color={TASK_COLOR} />
-              </div>
-            )}
-
-            {task?.error_message && (
-              <div className="mt-3 p-2 rounded-md bg-destructive/10 border border-destructive/20">
-                <div className="text-[10px] text-destructive uppercase font-display font-semibold mb-0.5">Error</div>
-                <div className="text-[11px] text-destructive/80 leading-relaxed">{task.error_message}</div>
-              </div>
-            )}
           </div>
 
           {/* Right: log viewer */}
@@ -130,7 +134,6 @@ export function TaskDetail({ item, onClose }: { item: ExtendedWorkload; onClose:
                         key={i}
                         className={
                           line.startsWith("ERROR:") ? "text-destructive font-semibold" :
-                          line.startsWith("PROGRESS:") ? "text-primary" :
                           line.startsWith("Warning:") ? "text-[#F59E0B]" :
                           ""
                         }

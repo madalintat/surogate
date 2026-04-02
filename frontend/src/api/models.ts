@@ -6,7 +6,7 @@ import type { Model } from "@/types/model";
 
 // ── Request types ─────────────────────────────────────────────
 
-export interface DeployModelRequest {
+export interface CreateModelRequest {
   name: string;
   display_name: string;
   base_model: string;
@@ -20,14 +20,6 @@ export interface DeployModelRequest {
   image?: string;
   hub_ref?: string;
   namespace?: string;
-  task_yaml?: string;
-  accelerators?: string;
-  cloud?: string;
-  use_spot?: boolean;
-  min_replicas?: number;
-  max_replicas?: number;
-  readiness_path?: string;
-  load_balancing_policy?: string;
   serving_config?: Record<string, unknown>;
   generation_defaults?: Record<string, unknown>;
 }
@@ -35,15 +27,14 @@ export interface DeployModelRequest {
 export interface UpdateModelRequest {
   engine?: string;
   accelerators?: string;
-  cloud?: string | null;
+  infra?: string | null;
   use_spot?: boolean;
   serving_config?: Record<string, unknown>;
   generation_defaults?: Record<string, unknown>;
 }
 
 export interface ScaleModelRequest {
-  min_replicas?: number;
-  max_replicas?: number;
+  replicas: number;
 }
 
 // ── Response types ────────────────────────────────────────────
@@ -61,12 +52,13 @@ export interface ModelListResponse {
 }
 
 // Raw backend shape (snake_case)
-interface RawModel {
+export interface RawModel {
   id: string;
   name: string;
   display_name: string;
   description: string;
   base: string;
+  project_id: string;
   family: string;
   param_count: string;
   type: string;
@@ -121,13 +113,14 @@ interface RawModel {
 
 // ── Transform ─────────────────────────────────────────────────
 
-function transformModel(r: RawModel): Model {
+export function transformModel(r: RawModel): Model {
   return {
     id: r.id,
     name: r.name,
     displayName: r.display_name,
     description: r.description,
     base: r.base,
+    projectId: r.project_id,
     family: r.family,
     paramCount: r.param_count,
     type: r.type,
@@ -235,7 +228,7 @@ export async function getModel(modelId: string): Promise<Model> {
   return transformModel((await response.json()) as RawModel);
 }
 
-export async function deployModel(req: DeployModelRequest): Promise<Model> {
+export async function createModel(req: CreateModelRequest): Promise<Model> {
   const response = await authFetch("/api/models/", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -280,6 +273,17 @@ export async function scaleModel(
   return transformModel((await response.json()) as RawModel);
 }
 
+export async function startModel(modelId: string): Promise<Model> {
+  const response = await authFetch(`/api/models/${modelId}/start`, {
+    method: "POST",
+  });
+  if (!response.ok) {
+    const err = (await response.json().catch(() => null)) as { detail?: string } | null;
+    throw new Error(err?.detail ?? "Failed to start model");
+  }
+  return transformModel((await response.json()) as RawModel);
+}
+
 export async function restartModel(modelId: string): Promise<Model> {
   const response = await authFetch(`/api/models/${modelId}/restart`, {
     method: "POST",
@@ -299,6 +303,31 @@ export async function stopModel(modelId: string): Promise<void> {
     const err = (await response.json().catch(() => null)) as { detail?: string } | null;
     throw new Error(err?.detail ?? "Failed to stop model");
   }
+}
+
+// ── Logs ─────────────────────────────────────────────────────
+
+export interface ModelLogsResponse {
+  model_id: string;
+  target: string;
+  lines: string[];
+}
+
+export async function getModelLogs(
+  modelId: string,
+  params?: { target?: string; replica_id?: number; tail?: number },
+): Promise<ModelLogsResponse> {
+  const qs = new URLSearchParams();
+  if (params?.target) qs.set("target", params.target);
+  if (params?.replica_id != null) qs.set("replica_id", String(params.replica_id));
+  if (params?.tail != null) qs.set("tail", String(params.tail));
+  const url = `/api/models/${modelId}/logs${qs.toString() ? `?${qs}` : ""}`;
+  const response = await authFetch(url);
+  if (!response.ok) {
+    const err = (await response.json().catch(() => null)) as { detail?: string } | null;
+    throw new Error(err?.detail ?? "Failed to get model logs");
+  }
+  return (await response.json()) as ModelLogsResponse;
 }
 
 export async function deleteModel(modelId: string): Promise<void> {

@@ -4,27 +4,26 @@
 import type { StateCreator } from "zustand";
 import type { AppState } from "./app-store";
 import type { Model } from "@/types/model";
-import type { DeployModelRequest, ScaleModelRequest, UpdateModelRequest } from "@/api/models";
+import type { CreateModelRequest, ScaleModelRequest, UpdateModelRequest } from "@/api/models";
 import * as modelsApi from "@/api/models";
-
-let pollTimer: ReturnType<typeof setInterval> | null = null;
-let pollRefCount = 0;
 
 export type ModelsSlice = {
   models: Model[];
   selectedModel: Model | null;
   modelsStatusCounts: Record<string, number>;
   modelsLoading: boolean;
+  /** Tracks pending actions per model — maps modelId → status at time of action */
+  modelPending: Record<string, string>;
 
   fetchModels: (params?: { status?: string; search?: string }) => Promise<void>;
   fetchModel: (modelId: string) => Promise<void>;
-  deployModel: (req: DeployModelRequest) => Promise<Model | null>;
+  createModel: (req: CreateModelRequest) => Promise<Model | null>;
   updateModel: (modelId: string, req: UpdateModelRequest) => Promise<boolean>;
   scaleModel: (modelId: string, req: ScaleModelRequest) => Promise<boolean>;
+  startModel: (modelId: string) => Promise<boolean>;
   restartModel: (modelId: string) => Promise<boolean>;
   stopModel: (modelId: string) => Promise<boolean>;
   deleteModel: (modelId: string) => Promise<boolean>;
-  startModelsPolling: () => () => void;
 };
 
 export const createModelsSlice: StateCreator<AppState, [], [], ModelsSlice> = (
@@ -35,15 +34,25 @@ export const createModelsSlice: StateCreator<AppState, [], [], ModelsSlice> = (
   selectedModel: null,
   modelsStatusCounts: {},
   modelsLoading: false,
+  modelPending: {},
 
   fetchModels: async (params) => {
     try {
       set({ modelsLoading: true });
       const res = await modelsApi.listModels(params);
+      // Clear pending for models whose status differs from the snapshot
+      const prev = get();
+      const pending = { ...prev.modelPending };
+      for (const m of res.models) {
+        if (m.id in pending && m.status !== pending[m.id]) {
+          delete pending[m.id];
+        }
+      }
       set({
         models: res.models,
         modelsStatusCounts: res.statusCounts,
         modelsLoading: false,
+        modelPending: pending,
       });
       // Refresh selected model if it's still in the list
       const sel = get().selectedModel;
@@ -65,9 +74,9 @@ export const createModelsSlice: StateCreator<AppState, [], [], ModelsSlice> = (
     }
   },
 
-  deployModel: async (req) => {
+  createModel: async (req) => {
     try {
-      const model = await modelsApi.deployModel(req);
+      const model = await modelsApi.createModel(req);
       await get().fetchModels();
       return model;
     } catch (e) {
@@ -100,19 +109,49 @@ export const createModelsSlice: StateCreator<AppState, [], [], ModelsSlice> = (
     }
   },
 
-  restartModel: async (modelId) => {
+  startModel: async (modelId) => {
+    const cur = get().models.find((m) => m.id === modelId);
+    set((s) => ({ modelPending: { ...s.modelPending, [modelId]: cur?.status ?? "" } }));
     try {
-      const model = await modelsApi.restartModel(modelId);
-      set({ selectedModel: model });
-      await get().fetchModels();
+      const updated = await modelsApi.startModel(modelId);
+      set((s) => ({
+        selectedModel: s.selectedModel?.id === modelId ? updated : s.selectedModel,
+        models: s.models.map((m) => (m.id === modelId ? updated : m)),
+      }));
       return true;
     } catch (e) {
-      set({ error: (e as Error).message });
+      set((s) => {
+        const pending = { ...s.modelPending };
+        delete pending[modelId];
+        return { modelPending: pending, error: (e as Error).message };
+      });
+      return false;
+    }
+  },
+
+  restartModel: async (modelId) => {
+    const cur = get().models.find((m) => m.id === modelId);
+    set((s) => ({ modelPending: { ...s.modelPending, [modelId]: cur?.status ?? "" } }));
+    try {
+      const updated = await modelsApi.restartModel(modelId);
+      set((s) => ({
+        selectedModel: s.selectedModel?.id === modelId ? updated : s.selectedModel,
+        models: s.models.map((m) => (m.id === modelId ? updated : m)),
+      }));
+      return true;
+    } catch (e) {
+      set((s) => {
+        const pending = { ...s.modelPending };
+        delete pending[modelId];
+        return { modelPending: pending, error: (e as Error).message };
+      });
       return false;
     }
   },
 
   stopModel: async (modelId) => {
+    const cur = get().models.find((m) => m.id === modelId);
+    set((s) => ({ modelPending: { ...s.modelPending, [modelId]: cur?.status ?? "" } }));
     try {
       await modelsApi.stopModel(modelId);
       await get().fetchModels();
@@ -122,7 +161,11 @@ export const createModelsSlice: StateCreator<AppState, [], [], ModelsSlice> = (
       }
       return true;
     } catch (e) {
-      set({ error: (e as Error).message });
+      set((s) => {
+        const pending = { ...s.modelPending };
+        delete pending[modelId];
+        return { modelPending: pending, error: (e as Error).message };
+      });
       return false;
     }
   },
@@ -139,19 +182,4 @@ export const createModelsSlice: StateCreator<AppState, [], [], ModelsSlice> = (
     }
   },
 
-  startModelsPolling: () => {
-    pollRefCount++;
-    if (!pollTimer) {
-      get().fetchModels();
-      pollTimer = setInterval(() => get().fetchModels(), 10_000);
-    }
-    return () => {
-      pollRefCount--;
-      if (pollRefCount <= 0 && pollTimer) {
-        clearInterval(pollTimer);
-        pollTimer = null;
-        pollRefCount = 0;
-      }
-    };
-  },
 });

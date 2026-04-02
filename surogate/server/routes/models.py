@@ -14,6 +14,7 @@ from surogate.server.models.models import (
     DeployedModelResponse,
     DeployedModelScaleRequest,
     DeployedModelUpdateRequest,
+    ModelLogsResponse,
 )
 
 router = APIRouter()
@@ -52,14 +53,14 @@ async def get_model(
 
 
 @router.post("/", response_model=DeployedModelResponse)
-async def deploy_model(
+async def create_model(
     req: DeployedModelCreateRequest,
     request: Request,
     current_subject: str = Depends(get_current_subject),
     session: AsyncSession = Depends(get_session),
 ):
-    """Create a new model, resolving metadata from config files."""
-    model = await models_service.deploy_model(
+    """Create a new model record, resolving metadata from config files."""
+    model = await models_service.create_model(
         session,
         name=req.name,
         display_name=req.display_name,
@@ -75,14 +76,6 @@ async def deploy_model(
         image=req.image,
         hub_ref=req.hub_ref,
         namespace=req.namespace,
-        task_yaml=req.task_yaml,
-        accelerators=req.accelerators,
-        cloud=req.cloud,
-        use_spot=req.use_spot,
-        min_replicas=req.min_replicas,
-        max_replicas=req.max_replicas,
-        readiness_path=req.readiness_path,
-        load_balancing_policy=req.load_balancing_policy,
         serving_config=req.serving_config,
         generation_defaults=req.generation_defaults,
         server_config=request.app.state.config,
@@ -100,7 +93,13 @@ async def update_model(
 ):
     """Update a deployed model's configuration."""
     resp = await models_service.update_model_config(
-        session, model_id, **req.model_dump(exclude_none=True)
+        session, model_id,
+        engine=req.engine,
+        serving_config=req.serving_config,
+        generation_defaults=req.generation_defaults,
+        infra=req.infra,
+        accelerators=req.accelerators,
+        use_spot=req.use_spot,
     )
     if resp is None:
         raise HTTPException(status_code=404, detail="Model not found")
@@ -118,13 +117,26 @@ async def scale_model(
     try:
         resp = await models_service.scale_model(
             session, model_id,
-            min_replicas=req.min_replicas,
-            max_replicas=req.max_replicas,
+            replicas=req.replicas,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     if resp is None:
         raise HTTPException(status_code=404, detail="Model not found")
+    return resp
+
+
+@router.post("/{model_id}/start", response_model=DeployedModelResponse)
+async def start_model(
+    model_id: str,
+    current_subject: str = Depends(get_current_subject),
+    session: AsyncSession = Depends(get_session),
+):
+    """Start serving a stopped model via SkyPilot."""
+    try:
+        resp = await models_service.start_model(session, model_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
     return resp
 
 
@@ -154,6 +166,25 @@ async def stop_model(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     return {"status": "stopping"}
+
+
+@router.get("/{model_id}/logs", response_model=ModelLogsResponse)
+async def get_model_logs(
+    model_id: str,
+    current_subject: str = Depends(get_current_subject),
+    session: AsyncSession = Depends(get_session),
+    target: str = Query("controller"),
+    replica_id: Optional[int] = Query(None),
+    tail: int = Query(200, le=1000),
+):
+    """Get the last N lines of logs for a model's serving service."""
+    try:
+        return await models_service.get_model_logs(
+            session, model_id,
+            target=target, replica_id=replica_id, tail=tail,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
 
 
 @router.delete("/{model_id}")

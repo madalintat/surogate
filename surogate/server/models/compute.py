@@ -23,10 +23,9 @@ class ServingServiceLaunchRequest(BaseModel):
     service_name: str
     project_id: str
     accelerators: Optional[str] = None
-    cloud: Optional[str] = None
+    infra: Optional[str] = None
     use_spot: bool = False
-    min_replicas: int = 1
-    max_replicas: Optional[int] = None
+    replicas: int = 1
     readiness_path: Optional[str] = None
     load_balancing_policy: Optional[str] = None
 
@@ -86,11 +85,9 @@ class ServingServiceResponse(BaseModel):
     status: str
     endpoint: Optional[str] = None
     accelerators: Optional[str] = None
-    cloud: Optional[str] = None
-    region: Optional[str] = None
+    infra: Optional[str] = None
     use_spot: bool = False
-    min_replicas: int = 1
-    max_replicas: Optional[int] = None
+    num_replicas: int = 1
     readiness_path: Optional[str] = None
     load_balancing_policy: Optional[str] = None
     update_mode: Optional[str] = None

@@ -25,7 +25,7 @@ export function ServeModelDialog({
   open: boolean;
   onOpenChange: (open: boolean) => void;
 }) {
-  const deployModel = useAppStore((s) => s.deployModel);
+  const createModel = useAppStore((s) => s.createModel);
   const [baseModelField, setBaseModelField] = useState("");
   const [saving, setSaving] = useState(false);
   const [sourceIdx, setSourceIdx] = useState(0);
@@ -44,7 +44,7 @@ export function ServeModelDialog({
     const displayName = baseModel.split("/").pop() ?? baseModel;
 
     setSaving(true);
-    const result = await deployModel({
+    const result = await createModel({
       name: slug,
       display_name: displayName,
       base_model: baseModel,

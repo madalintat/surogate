@@ -146,6 +146,24 @@ async def get_current_subject_allow_password_change(
         allow_password_change = True,
     )
     
+async def verify_ws_token(token: str, session: AsyncSession) -> Optional[str]:
+    """Validate a JWT for WebSocket auth. Returns the subject or None."""
+    subject = _decode_subject_without_verification(token)
+    if subject is None:
+        return None
+    record = await repository.get_user_and_secret(session, subject)
+    if record is None:
+        return None
+    _salt, _pwd_hash, jwt_secret, _must_change = record
+    try:
+        payload = jwt.decode(token, jwt_secret, algorithms=[ALGORITHM])
+        if payload.get("sub") != subject:
+            return None
+        return subject
+    except jwt.InvalidTokenError:
+        return None
+
+
 async def _get_secret_for_subject(subject: str, session: AsyncSession) -> str:
     secret = await repository.get_jwt_secret(subject, session)
     if secret is None:

@@ -80,6 +80,11 @@ export const STATUS_COLORS: Record<string, string> = {
   active: "#22C55E", running: "#22C55E", cordoned: "#F59E0B", error: "#EF4444",
   queued: "#6B7280", provisioning: "#06B6D4", connected: "#22C55E", disconnected: "#3A4154",
   completed: "#22C55E", failed: "#EF4444", cancelled: "#6B7280",
+  serving: "#22C55E", deploying: "#06B6D4", stopped: "#6B7280",
+  // SkyPilot serving statuses
+  ready: "#22C55E", controller_init: "#06B6D4", replica_init: "#06B6D4",
+  no_replica: "#F59E0B", controller_failed: "#EF4444", failed_cleanup: "#EF4444",
+  shutting_down: "#6B7280",
 };
 
 export const WORKLOAD_COLORS: Record<string, string> = {

@@ -8,7 +8,7 @@ platform-specific features.
 """
 
 import os
-from pathlib import Path
+import uuid
 
 from surogate.utils.logger import get_logger
 
@@ -16,33 +16,7 @@ logger = get_logger()
 
 _initialized = False
 
-# All SkyPilot artifacts live under ~/.surogate/.sky instead of ~/.sky.
-#
-# SkyPilot resolves dynamic paths via:
-#   runtime_utils.get_runtime_dir_path('.sky/foo')
-#     → os.path.join(os.environ.get('SKY_RUNTIME_DIR', '~'), '.sky/foo')
-#
-# Setting SKY_RUNTIME_DIR=~/.surogate makes everything land in
-# ~/.surogate/.sky/ (state.db, locks, logs, etc.).
-# Hardcoded '~/.sky/...' string constants are patched to match.
-SUROGATE_HOME = Path.home() / ".surogate"
-SUROGATE_SKY_DIR = SUROGATE_HOME / ".sky"
-
-
-def _redirect_sky_home():
-    """Set SKY_RUNTIME_DIR so all dynamic paths resolve under ~/.surogate/.sky."""
-    os.environ.setdefault("SKY_RUNTIME_DIR", str(SUROGATE_HOME))
-    SUROGATE_SKY_DIR.mkdir(parents=True, exist_ok=True)
-
-
-def _patch_hardcoded_paths():
-    """Patch constants that use literal '~/.sky' strings."""
-    import sky.skypilot_config as cfg
-
-    sky_dir = str(SUROGATE_SKY_DIR)
-    cfg._GLOBAL_CONFIG_PATH = f"{sky_dir}/config.yaml"
-    cfg.SKYPILOT_CONFIG_LOCK_PATH = f"{sky_dir}/locks/.skypilot_config.lock"
-
+dummy_request_id = str(uuid.uuid4())  # Used in skylet for non-SkyPilot requests
 
 def init_skypilot():
     """Initialize SkyPilot as a library.
@@ -51,18 +25,24 @@ def init_skypilot():
     2. Initialize global user state (SkyPilot's SQLite DB).
     3. Reload SkyPilot config.
     """
+    
     global _initialized
     if _initialized:
         return
 
-    # ── Redirect paths (before heavy sky imports) ────────────────
-    _redirect_sky_home()
+    os.environ.setdefault("ENV_VAR_IS_SKYPILOT_SERVER", "1")
+    
+    # ── Patch get_current_request_id to return a real UUID ──────
+    from sky.utils import common_utils
+    _original_get_request_id = common_utils.get_current_request_id
 
-    # ── Additional monkeypatches ─────────────────────────────────
-    # Apply further patches here before initializing state.
+    def _patched_get_current_request_id() -> str:
+        value = _original_get_request_id()
+        if value == "dummy-request-id":
+            return dummy_request_id
+        return value
 
-    # ── Patch hardcoded path constants ───────────────────────────
-    _patch_hardcoded_paths()
+    common_utils.get_current_request_id = _patched_get_current_request_id
 
     # ── SkyPilot state initialization ────────────────────────────
     from sky import global_user_state
@@ -72,6 +52,8 @@ def init_skypilot():
     skypilot_config.safe_reload_config()
 
     _initialized = True
-    logger.info(
-        "SkyPilot initialized (direct library mode, home=%s)", SUROGATE_SKY_DIR
-    )
+    logger.info("SkyPilot initialized (direct library mode)")
+
+    from surogate.core.compute.kubernetes import init_kubernetes
+    init_kubernetes()
+    

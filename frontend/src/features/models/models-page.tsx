@@ -47,9 +47,9 @@ function ModelListItem({
         <div
           className="w-8.5 h-8.5 rounded-lg shrink-0 flex items-center justify-center text-[15px] border"
           style={{
-            backgroundColor: model.status === "serving" ? "#3B82F612" : undefined,
-            borderColor: model.status === "serving" ? "#3B82F625" : undefined,
-            color: model.status === "serving" ? "#3B82F6" : undefined,
+            backgroundColor: model.status === "ready" ? "#3B82F612" : undefined,
+            borderColor: model.status === "ready" ? "#3B82F625" : undefined,
+            color: model.status === "ready" ? "#3B82F6" : undefined,
           }}
         >
           &#x25C7;
@@ -80,9 +80,9 @@ function ModelListItem({
               <StatusDot status={toStatus(model.status)} />
               <span
                 className={cn(
-                  model.status === "error"
+                  toStatus(model.status) === "error"
                     ? "text-destructive"
-                    : model.status === "serving"
+                    : model.status === "ready"
                       ? "text-green-500"
                       : "text-muted-foreground",
                 )}
@@ -90,7 +90,7 @@ function ModelListItem({
                 {model.status}
               </span>
             </span>
-            {model.status === "serving" && (
+            {model.status === "ready" && (
               <>
                 <span className="text-muted-foreground/30">&middot;</span>
                 <span className="text-muted-foreground">
@@ -118,13 +118,12 @@ export function ModelsPage() {
   const models = useAppStore((s) => s.models);
   const selectedModel = useAppStore((s) => s.selectedModel);
   const modelsStatusCounts = useAppStore((s) => s.modelsStatusCounts);
+  const fetchModels = useAppStore((s) => s.fetchModels);
   const fetchModel = useAppStore((s) => s.fetchModel);
-  const startModelsPolling = useAppStore((s) => s.startModelsPolling);
 
   useEffect(() => {
-    const stopPolling = startModelsPolling();
-    return stopPolling;
-  }, [startModelsPolling]);
+    void fetchModels();
+  }, [fetchModels]);
 
   const handleSelect = (id: string) => {
     setSelectedId(id);
@@ -136,7 +135,7 @@ export function ModelsPage() {
     : null;
 
   const filtered = models.filter((m: Model) => {
-    if (filterStatus !== "all" && m.status !== filterStatus) return false;
+    if (filterStatus !== "all" && toStatus(m.status) !== filterStatus) return false;
     if (
       filterSearch &&
       !m.name.toLowerCase().includes(filterSearch.toLowerCase()) &&
@@ -146,15 +145,18 @@ export function ModelsPage() {
     return true;
   });
 
+  const sum = (...keys: string[]) =>
+    keys.reduce((n, k) => n + (modelsStatusCounts[k] ?? 0), 0);
+
   const statusCounts = {
     all: models.length,
-    serving: modelsStatusCounts["serving"] ?? 0,
-    error: modelsStatusCounts["error"] ?? 0,
-    stopped: modelsStatusCounts["stopped"] ?? 0,
+    serving: sum("ready"),
+    error: sum("controller_failed", "failed", "failed_cleanup"),
+    stopped: sum("stopped", "shutting_down", "configured"),
   };
 
   const totalGpus = models.reduce(
-    (s: number, m: Model) => s + (m.status === "serving" ? m.gpu.count : 0),
+    (s: number, m: Model) => s + (m.status === "ready" ? m.gpu.count : 0),
     0,
   );
   const totalTps = models.reduce((s: number, m: Model) => s + m.tps, 0);

@@ -6,10 +6,13 @@ import { Card } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { StatusDot } from "@/components/ui/status-dot";
 import { useAppStore } from "@/stores/app-store";
-import { WORKLOAD_QUEUE, WORKLOAD_COLORS, STATUS_COLORS, PROVIDER_COLORS } from "./compute-data";
+import { WORKLOAD_COLORS, STATUS_COLORS, PROVIDER_COLORS } from "./compute-data";
 import type { LocalTask } from "@/api/tasks";
-import { TaskDetail, statusForDot } from "./task-detail";
-import type { ExtendedWorkload } from "./task-detail";
+import type { Model } from "@/types/model";
+import { TaskDetail } from "./task-detail";
+import { ModelDetail } from "./model-detail";
+import { statusForDot } from "./detail-shared";
+import type { ExtendedWorkload } from "./detail-shared";
 import { Trash2 } from "lucide-react";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 
@@ -35,6 +38,27 @@ function taskToWorkloadItem(t: LocalTask): ExtendedWorkload {
   };
 }
 
+function modelToWorkloadItem(m: Model): ExtendedWorkload {
+  const gpuLabel = m.gpu.count > 0 ? `${m.gpu.count}\u00d7 ${m.gpu.type}` : "\u2014";
+  return {
+    id: m.id,
+    name: m.displayName || m.name,
+    type: "serving",
+    method: m.engine !== "\u2014" ? m.engine : "\u2014",
+    status: m.status,
+    priority: 0,
+    gpu: gpuLabel,
+    gpuCount: m.gpu.count,
+    location: "local",
+    node: m.namespace !== "\u2014" ? m.namespace : "\u2014",
+    eta: m.uptime !== "\u2014" ? `up ${m.uptime}` : "\u2014",
+    startedAt: m.lastDeployed !== "\u2014" ? m.lastDeployed : null,
+    requestedBy: m.deployedBy || "\u2014",
+    project: m.projectId ?? "\u2014",
+    _model: m,
+  };
+}
+
 const FILTERS = ["all", "training", "serving", "eval", "task"] as const;
 
 const EXTENDED_WORKLOAD_COLORS: Record<string, string> = {
@@ -49,33 +73,44 @@ export function WorkloadQueueTab() {
   const tasks = useAppStore((s) => s.tasks);
   const fetchTasks = useAppStore((s) => s.fetchTasks);
   const deleteTask = useAppStore((s) => s.deleteTask);
+  const models = useAppStore((s) => s.models);
+  const fetchModels = useAppStore((s) => s.fetchModels);
+  const deleteModel = useAppStore((s) => s.deleteModel);
   const activeProjectId = useAppStore((s) => s.activeProjectId);
   const projects = useAppStore((s) => s.projects);
   const activeProject = projects.find((p) => p.id === activeProjectId);
 
   useEffect(() => {
     void fetchTasks();
+    void fetchModels();
   }, []);
 
   const allItems = useMemo<ExtendedWorkload[]>(() => {
-    const localTaskItems = tasks.map(taskToWorkloadItem);
-    const items = [...WORKLOAD_QUEUE, ...localTaskItems];
-    // Filter to current project — match on id (real tasks) or name (mock data)
+    const taskItems = tasks.map(taskToWorkloadItem);
+    const modelItems = models.map(modelToWorkloadItem);
+    const items = [...taskItems, ...modelItems];
+    // Filter to current project — match on id (real tasks/models) or name (mock data)
     const projectMatches = activeProject
-      ? items.filter(
-          (w) => w.project === activeProject.id || w.project === activeProject.name,
-        )
+      ? items.filter((w) => {
+          if (!w.project) return true; // no project assigned
+          const p = w.project.toLowerCase();
+          return p === activeProject.id
+            || p === activeProject.name.toLowerCase()
+            || p === activeProject.namespace.toLowerCase();
+        })
       : items;
     projectMatches.sort((a, b) => {
-      const aActive = a.status === "running" || a.status === "pending" ? 1 : 0;
-      const bActive = b.status === "running" || b.status === "pending" ? 1 : 0;
+      const activeStatuses = ["running", "pending", "serving", "deploying",
+        "ready", "controller_init", "replica_init", "no_replica"];
+      const aActive = activeStatuses.includes(a.status) ? 1 : 0;
+      const bActive = activeStatuses.includes(b.status) ? 1 : 0;
       if (aActive !== bActive) return bActive - aActive;
       const aTime = a.startedAt ? new Date(a.startedAt).getTime() : 0;
       const bTime = b.startedAt ? new Date(b.startedAt).getTime() : 0;
       return bTime - aTime;
     });
     return projectMatches;
-  }, [tasks, activeProject]);
+  }, [tasks, models, activeProject]);
 
   const filtered = useMemo(
     () => filter === "all" ? allItems : allItems.filter(w => w.type === filter),
@@ -181,13 +216,13 @@ export function WorkloadQueueTab() {
                     </td>
                     <td className="px-3 py-2.5 text-[11px] text-faint">{w.requestedBy}</td>
                     <td className="px-3 py-2.5">
-                      {isTask && (
+                      {(isTask || w.type === "serving") && (
                         <Button
                           variant="ghost"
                           size="icon-xs"
                           className="text-muted-foreground hover:text-destructive"
                           onClick={(e) => { e.stopPropagation(); setDeleteTarget(w); }}
-                          title="Delete task"
+                          title={w.type === "serving" ? "Delete model" : "Delete task"}
                         >
                           <Trash2 size={12} />
                         </Button>
@@ -196,7 +231,9 @@ export function WorkloadQueueTab() {
                   </tr>
                   {isSelected && (
                     <tr className="border-b border-line">
-                      <TaskDetail item={w} onClose={() => setSelectedId(null)} />
+                      {w.type === "serving"
+                        ? <ModelDetail item={w} onClose={() => setSelectedId(null)} />
+                        : <TaskDetail item={w} onClose={() => setSelectedId(null)} />}
                     </tr>
                   )}
                 </React.Fragment>
@@ -213,17 +250,25 @@ export function WorkloadQueueTab() {
 
       <ConfirmDialog
         open={deleteTarget !== null}
-        title="Delete Task"
+        title={deleteTarget?.type === "serving" ? "Delete Model" : "Delete Task"}
         description={
-          deleteTarget && (deleteTarget.status === "running" || deleteTarget.status === "pending")
-            ? <>This will kill the running process and delete <span className="font-semibold text-foreground">{deleteTarget?.name}</span>. Continue?</>
-            : <>Delete <span className="font-semibold text-foreground">{deleteTarget?.name}</span>? This cannot be undone.</>
+          deleteTarget && deleteTarget.type === "serving"
+            ? (statusForDot(deleteTarget.status) === "running" || statusForDot(deleteTarget.status) === "deploying")
+              ? <>This will stop the serving service and delete <span className="font-semibold text-foreground">{deleteTarget?.name}</span>. Continue?</>
+              : <>Delete <span className="font-semibold text-foreground">{deleteTarget?.name}</span>? This cannot be undone.</>
+            : deleteTarget && (deleteTarget.status === "running" || deleteTarget.status === "pending")
+              ? <>This will kill the running process and delete <span className="font-semibold text-foreground">{deleteTarget?.name}</span>. Continue?</>
+              : <>Delete <span className="font-semibold text-foreground">{deleteTarget?.name}</span>? This cannot be undone.</>
         }
         confirmLabel="Delete"
         confirmIcon={<Trash2 size={14} className="mr-1.5" />}
         onConfirm={async () => {
           if (!deleteTarget) return;
-          await deleteTask(deleteTarget.id);
+          if (deleteTarget.type === "serving") {
+            await deleteModel(deleteTarget.id);
+          } else {
+            await deleteTask(deleteTarget.id);
+          }
           setDeleteTarget(null);
         }}
         onCancel={() => setDeleteTarget(null)}

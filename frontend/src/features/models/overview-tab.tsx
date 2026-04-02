@@ -146,7 +146,7 @@ export function OverviewTab({ model }: { model: Model }) {
             <div className="text-xs font-semibold text-foreground font-display mb-4">
               GPU Resources
             </div>
-            {model.status === "serving" ? (
+            {model.status === "ready" ? (
               <div className="flex gap-8 items-start">
                 <div className="flex gap-5 items-center">
                   <GaugeRing
@@ -190,7 +190,7 @@ export function OverviewTab({ model }: { model: Model }) {
               </div>
             ) : (
               <div className="py-4 text-center text-muted-foreground/40 text-[11px]">
-                {model.status === "error"
+                {toStatus(model.status) === "error"
                   ? "Model failed to start \u2014 check Events tab for details"
                   : "Model not currently serving \u2014 no GPU allocated"}
               </div>

@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
+from alembic import command
+from alembic.config import Config
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -49,4 +53,16 @@ async def create_all_tables() -> None:
     engine = get_engine()
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+
+
+def run_migrations(db_url: str | None = None) -> None:
+    """Run Alembic migrations (upgrade to head).
+
+    Uses the project's alembic.ini. Optionally overrides the DB URL.
+    """
+    ini_path = Path(__file__).resolve().parents[3] / "alembic.ini"
+    alembic_cfg = Config(str(ini_path))
+    if db_url:
+        alembic_cfg.set_main_option("sqlalchemy.url", db_url)
+    command.upgrade(alembic_cfg, "head")
 

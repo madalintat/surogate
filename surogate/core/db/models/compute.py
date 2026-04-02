@@ -241,17 +241,11 @@ class ServingService(UUIDMixin, Base):
     accelerators: Mapped[Optional[str]] = mapped_column(
         sa.String(128), nullable=True
     )
-    cloud: Mapped[Optional[str]] = mapped_column(
-        sa.String(64), nullable=True
-    )
-    region: Mapped[Optional[str]] = mapped_column(
-        sa.String(64), nullable=True
+    infra: Mapped[Optional[str]] = mapped_column(
+        sa.String(128), nullable=True
     )
     use_spot: Mapped[bool] = mapped_column(sa.Boolean, default=False)
-    min_replicas: Mapped[int] = mapped_column(sa.Integer, default=1)
-    max_replicas: Mapped[Optional[int]] = mapped_column(
-        sa.Integer, nullable=True
-    )
+    replicas: Mapped[int] = mapped_column(sa.Integer, default=1)
     readiness_path: Mapped[Optional[str]] = mapped_column(
         sa.String(255), nullable=True
     )

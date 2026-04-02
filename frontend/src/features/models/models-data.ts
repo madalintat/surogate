@@ -19,16 +19,22 @@ export type {
 
 // ── Status mapping ──────────────────────────────────────────────
 
-const STATUS_MAP: Record<string, Status> = {
-  serving: "serving",
-  running: "running",
-  deploying: "deploying",
-  error: "error",
+// Map raw SkyPilot serving status → StatusDot color only
+const DOT_MAP: Record<string, Status> = {
+  controller_init: "deploying",
+  replica_init: "deploying",
+  no_replica: "deploying",
+  ready: "serving",
+  controller_failed: "error",
+  failed: "error",
+  failed_cleanup: "error",
+  shutting_down: "deploying",
   stopped: "stopped",
+  configured: "stopped",
 };
 
 export function toStatus(raw: string): Status {
-  return STATUS_MAP[raw] ?? "stopped";
+  return DOT_MAP[raw] ?? "stopped";
 }
 
 // ── Type badge styles ───────────────────────────────────────────

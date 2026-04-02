@@ -5,6 +5,7 @@ from surogate.core.db.engine import (
     get_session,
     get_session_factory,
     create_all_tables,
+    run_migrations,
 )
 
 # Register all models with Base.metadata
@@ -19,4 +20,5 @@ __all__ = [
     "get_session",
     "get_session_factory",
     "create_all_tables",
+    "run_migrations",
 ]

@@ -76,6 +76,7 @@ export interface Model {
   displayName: string;
   description: string;
   base: string;
+  projectId: string;
   family: string;
   paramCount: string;
   type: string;

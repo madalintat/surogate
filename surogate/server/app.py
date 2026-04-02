@@ -11,6 +11,7 @@ from surogate.core.db.engine import get_session_factory
 from surogate.core.hub.lakefs import seed_lakefs_user, init_lakefs
 from surogate.server.auth.authentication import get_current_subject
 from surogate.utils.logger import get_logger
+from surogate.server.notifier import manager as ws_manager, notify_transition
 
 # Ensure backend dir is on sys.path so _platform_compat is importable when
 # main.py is launched directly (e.g. `uvicorn main:app`).
@@ -27,17 +28,21 @@ from fastapi.responses import FileResponse, Response
 from pathlib import Path
 
 from surogate.core.db.repository import auth as auth_repository
-from surogate.core.compute.kubernetes import init_kubernetes
+
+# the order of imports is important here. init_skypilot() must be called before any sky imports, 
+# and it must be called in the main thread to properly set up context propagation for threads.
+from surogate.core.compute import init_skypilot 
 
 from routes import auth_router, project_router, hub_router, compute_router, tasks_router, skills_router, models_router
 
 logger = get_logger()
 
+
 async def init_app(session: AsyncSession, config: ServerConfig):
     await auth_repository.seed_admin_user(session)
     await init_lakefs(config)
     await seed_lakefs_user("surogate", session, config)
-    init_kubernetes()  
+    await asyncio.to_thread(init_skypilot)
     
 
 @asynccontextmanager
@@ -55,16 +60,22 @@ async def lifespan(app: FastAPI):
         
     logger.info(f"Database ready: {config.database_url}")
 
-    from surogate.core.compute import init_skypilot
-    await asyncio.to_thread(init_skypilot)
-
     from surogate.core.compute.local_tasks import LocalTaskManager
     task_manager = LocalTaskManager(config)
     async with factory() as session:
         await task_manager.reap(session)
     app.state.task_manager = task_manager
 
+    # Start background monitor for SkyPilot serving services, managed jobs & local tasks
+    from surogate.core.compute.monitor import ServingMonitor
+    monitor = ServingMonitor(poll_interval=5.0, task_manager=task_manager)
+    monitor.on_transition(notify_transition)
+    await monitor.start()
+    app.state.serving_monitor = monitor
+
     yield
+
+    await monitor.stop()
     await engine.dispose()
 
 
@@ -94,6 +105,36 @@ app.include_router(compute_router, prefix = "/api/compute", tags = ["compute"])
 app.include_router(tasks_router, prefix = "/api/tasks", tags = ["tasks"])
 app.include_router(skills_router, prefix = "/api/skills", tags = ["skills"])
 app.include_router(models_router, prefix = "/api/models", tags = ["models"])
+
+
+# ============ WebSocket ============
+from fastapi import WebSocket, WebSocketDisconnect
+from surogate.server.auth.authentication import verify_ws_token
+
+
+@app.websocket("/ws/monitor")
+async def monitor_ws(ws: WebSocket):
+    """Push status-transition events to connected clients (authenticated)."""
+    token = ws.query_params.get("token")
+    if not token:
+        await ws.close(code=4001, reason="Missing token")
+        return
+
+    factory = get_session_factory()
+    async with factory() as session:
+        subject = await verify_ws_token(token, session)
+    if subject is None:
+        await ws.close(code=4003, reason="Invalid or expired token")
+        return
+
+    await ws_manager.connect(ws)
+    try:
+        while True:
+            await ws.receive_text()
+    except WebSocketDisconnect:
+        pass
+    finally:
+        ws_manager.disconnect(ws)
 
 
 # ============ Health and System Endpoints ============

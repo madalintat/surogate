@@ -123,11 +123,9 @@ async def create_serving_service(
     status: str = "controller_init",
     endpoint: Optional[str] = None,
     accelerators: Optional[str] = None,
-    cloud: Optional[str] = None,
-    region: Optional[str] = None,
+    infra: Optional[str] = None,
     use_spot: bool = False,
-    min_replicas: int = 1,
-    max_replicas: Optional[int] = None,
+    replicas: int = 1,
     readiness_path: Optional[str] = None,
     load_balancing_policy: Optional[str] = None,
     update_mode: Optional[str] = None,
@@ -140,11 +138,9 @@ async def create_serving_service(
         status=status,
         endpoint=endpoint,
         accelerators=accelerators,
-        cloud=cloud,
-        region=region,
+        infra=infra,
         use_spot=use_spot,
-        min_replicas=min_replicas,
-        max_replicas=max_replicas,
+        replicas=replicas,
         readiness_path=readiness_path,
         load_balancing_policy=load_balancing_policy,
         update_mode=update_mode,
@@ -187,6 +183,43 @@ async def list_serving_services(
     stmt = stmt.limit(limit)
     result = await session.execute(stmt)
     return list(result.scalars().all())
+
+
+_SERVING_TERMINAL = ("stopped", "failed", "failed_cleanup", "controller_failed")
+_JOB_TERMINAL = ("completed", "failed", "cancelled")
+
+
+async def list_active_serving_services(
+    session: AsyncSession,
+) -> list[ServingService]:
+    """Return all serving services whose status is non-terminal."""
+    stmt = (
+        sa.select(ServingService)
+        .where(ServingService.status.notin_(_SERVING_TERMINAL))
+    )
+    result = await session.execute(stmt)
+    return list(result.scalars().all())
+
+
+async def list_active_managed_jobs(
+    session: AsyncSession,
+) -> list[ManagedJob]:
+    """Return all managed jobs whose status is non-terminal."""
+    stmt = (
+        sa.select(ManagedJob)
+        .where(ManagedJob.status.notin_(_JOB_TERMINAL))
+    )
+    result = await session.execute(stmt)
+    return list(result.scalars().all())
+
+
+async def delete_serving_service(
+    session: AsyncSession, service_id: str
+) -> None:
+    await session.execute(
+        sa.delete(ServingService).where(ServingService.id == service_id)
+    )
+    await session.commit()
 
 
 async def update_serving_service(
@@ -257,6 +290,17 @@ async def get_deployed_model(
 ) -> Optional[DeployedModel]:
     result = await session.execute(
         sa.select(DeployedModel).where(DeployedModel.id == model_id)
+    )
+    return result.scalar_one_or_none()
+
+
+async def get_deployed_model_by_service(
+    session: AsyncSession, service_id: str
+) -> Optional[DeployedModel]:
+    result = await session.execute(
+        sa.select(DeployedModel).where(
+            DeployedModel.serving_service_id == service_id
+        )
     )
     return result.scalar_one_or_none()
 

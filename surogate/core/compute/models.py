@@ -9,6 +9,8 @@ import asyncio
 from datetime import datetime, timezone
 from typing import Optional
 
+import yaml
+
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from surogate.core.compute import sky as sky_service
@@ -29,24 +31,11 @@ from surogate.utils.logger import get_logger
 logger = get_logger()
 
 
-# ── Status derivation ────────────────────────────────────────────────
-
-_SERVING_TO_MODEL_STATUS: dict[str, str] = {
-    "controller_init": "deploying",
-    "replica_init": "deploying",
-    "ready": "serving",
-    "controller_failed": "error",
-    "failed": "error",
-    "failed_cleanup": "error",
-    "no_replica": "error",
-    "shutting_down": "stopped",
-}
-
 
 def _derive_status(svc: Optional[ServingService]) -> str:
     if svc is None:
         return "stopped"
-    return _SERVING_TO_MODEL_STATUS.get(svc.status, "stopped")
+    return svc.status
 
 
 def _relative_time(dt: Optional[datetime]) -> str:
@@ -113,6 +102,7 @@ def build_model_response(
         display_name=model.display_name,
         description="",
         base=model.base_model,
+        project_id=model.project_id,
         family=model.family or "\u2014",
         param_count=model.param_count or "\u2014",
         type=model.model_type,
@@ -121,8 +111,8 @@ def build_model_response(
         status=status,
         engine=model.engine or "\u2014",
         replicas=ReplicaInfo(
-            current=svc.min_replicas if svc and status == "serving" else 0,
-            desired=svc.min_replicas if svc else 0,
+            current=svc.replicas if svc and status == "serving" else 0,
+            desired=svc.replicas if svc else 0,
         ),
         gpu=GpuInfo(type=gpu_type, count=gpu_count, utilization=0),
         vram=VramInfo(used="0Gi", total="0Gi", pct=0),
@@ -159,7 +149,7 @@ def build_model_response(
 # ── Service functions ────────────────────────────────────────────────
 
 
-async def deploy_model(
+async def create_model(
     session: AsyncSession,
     *,
     name: str,
@@ -176,31 +166,25 @@ async def deploy_model(
     image: Optional[str] = None,
     hub_ref: Optional[str] = None,
     namespace: Optional[str] = None,
-    task_yaml: Optional[str] = None,
-    accelerators: Optional[str] = None,
-    cloud: Optional[str] = None,
-    use_spot: bool = False,
-    min_replicas: int = 1,
-    max_replicas: Optional[int] = None,
-    readiness_path: Optional[str] = None,
-    load_balancing_policy: Optional[str] = None,
     serving_config: Optional[dict] = None,
     generation_defaults: Optional[dict] = None,
     server_config: Optional[ServerConfig] = None,
 ) -> DeployedModel:
-    """Create a model record, resolving metadata from config files."""
+    """Create a model record, resolving metadata from config files.
+
+    This only creates the DB record — call start_model() to actually
+    launch the serving service via SkyPilot.
+    """
 
     # Resolve model info from config.json / generation_config.json
     resolved: dict = {}
     try:
         if hub_ref and server_config:
-            # LakeFS source — read config files from the repo
             client = await lakefs.get_lakefs_client(
                 requested_by_id, session, server_config,
             )
             resolved = await resolve_from_lakefs(client, hub_ref)
         elif base_model and not hub_ref:
-            # Hugging Face source — fetch config files via SDK
             resolved = await asyncio.to_thread(
                 resolve_from_huggingface, base_model,
             )
@@ -221,29 +205,15 @@ async def deploy_model(
     if not generation_defaults and resolved.get("generation_defaults"):
         generation_defaults = resolved["generation_defaults"]
 
-    svc_id: Optional[str] = None
-    deployed_at: Optional[datetime] = None
-
-    if task_yaml:
-        try:
-            svc = await sky_service.launch_serving_service(
-                session,
-                task_yaml=task_yaml,
-                service_name=name,
-                project_id=project_id,
-                requested_by_id=requested_by_id,
-                accelerators=accelerators,
-                cloud=cloud,
-                use_spot=use_spot,
-                min_replicas=min_replicas,
-                max_replicas=max_replicas,
-                readiness_path=readiness_path,
-                load_balancing_policy=load_balancing_policy,
-            )
-            svc_id = svc.id
-            deployed_at = datetime.now(timezone.utc)
-        except Exception:
-            logger.warning(f"Failed to launch serving service for model {name}", exc_info=True)
+    # Create the ServingService first (defaults to k8s, stopped)
+    svc = await repo.create_serving_service(
+        session,
+        name=name,
+        project_id=project_id,
+        requested_by_id=requested_by_id,
+        task_yaml="",
+        status="stopped",
+    )
 
     model = await repo.create_deployed_model(
         session,
@@ -263,8 +233,7 @@ async def deploy_model(
         namespace=namespace,
         serving_config=serving_config,
         generation_defaults=generation_defaults,
-        serving_service_id=svc_id,
-        last_deployed_at=deployed_at,
+        serving_service_id=svc.id,
     )
     return model
 
@@ -272,14 +241,54 @@ async def deploy_model(
 async def update_model_config(
     session: AsyncSession,
     model_id: str,
-    **values: object,
+    *,
+    engine: Optional[str] = None,
+    serving_config: Optional[dict] = None,
+    generation_defaults: Optional[dict] = None,
+    infra: Optional[str] = None,
+    accelerators: Optional[str] = None,
+    use_spot: Optional[bool] = None,
 ) -> Optional[DeployedModelResponse]:
     """Update serving configuration fields on a deployed model."""
     m = await repo.get_deployed_model(session, model_id)
     if m is None:
         return None
 
-    await repo.update_deployed_model(session, model_id, **values)
+    # Model-level fields -> DeployedModel
+    model_updates: dict = {}
+    if engine is not None:
+        model_updates["engine"] = engine
+    if serving_config is not None:
+        model_updates["serving_config"] = serving_config
+    if generation_defaults is not None:
+        model_updates["generation_defaults"] = generation_defaults
+    if model_updates:
+        await repo.update_deployed_model(session, model_id, **model_updates)
+
+    # Infra fields -> ServingService
+    svc_updates: dict = {}
+    if infra is not None:
+        svc_updates["infra"] = infra
+    if accelerators is not None:
+        svc_updates["accelerators"] = accelerators
+    if use_spot is not None:
+        svc_updates["use_spot"] = use_spot
+    if svc_updates:
+        if m.serving_service_id:
+            await repo.update_serving_service(session, m.serving_service_id, **svc_updates)
+        else:
+            svc = await repo.create_serving_service(
+                session,
+                name=m.name,
+                project_id=m.project_id,
+                requested_by_id=m.deployed_by_id,
+                task_yaml="",
+                status="stopped",
+                **svc_updates,
+            )
+            await repo.update_deployed_model(
+                session, model_id, serving_service_id=svc.id,
+            )
 
     m = await repo.get_deployed_model(session, model_id)
     svc = None
@@ -302,9 +311,7 @@ async def list_models(
     )
 
     results: list[DeployedModelResponse] = []
-    status_counts: dict[str, int] = {
-        "serving": 0, "deploying": 0, "error": 0, "stopped": 0,
-    }
+    status_counts: dict[str, int] = {}
 
     for m in db_models:
         svc = None
@@ -344,8 +351,7 @@ async def scale_model(
     session: AsyncSession,
     model_id: str,
     *,
-    min_replicas: Optional[int] = None,
-    max_replicas: Optional[int] = None,
+    replicas: int,
 ) -> Optional[DeployedModelResponse]:
     """Scale a deployed model's replicas."""
     m = await repo.get_deployed_model(session, model_id)
@@ -354,17 +360,87 @@ async def scale_model(
     if not m.serving_service_id:
         raise ValueError("Model is not currently serving")
 
-    updates: dict = {}
-    if min_replicas is not None:
-        updates["min_replicas"] = min_replicas
-    if max_replicas is not None:
-        updates["max_replicas"] = max_replicas
-
-    if updates:
-        await repo.update_serving_service(session, m.serving_service_id, **updates)
-        logger.info(f"Scaled model {model_id} replicas: {updates} (SkyPilot scaling not yet wired)")
+    await repo.update_serving_service(
+        session, m.serving_service_id, replicas=replicas,
+    )
+    logger.info(f"Scaled model {model_id} to {replicas} replicas (SkyPilot scaling not yet wired)")
 
     svc = await repo.get_serving_service(session, m.serving_service_id)
+    return build_model_response(m, svc)
+
+
+def _build_task_yaml(
+    model: DeployedModel,
+    svc: ServingService,
+) -> str:
+    """Generate a SkyPilot serving task YAML for llama.cpp."""
+
+    # TODO: add --lora for serving a lora adapter, hf token and sampling params
+    run_cmd = "cd /app && ./llama-server --metrics --host 0.0.0.0 --port 8080"
+    run_cmd += f" -m {model.base_model}"
+
+    if model.context_window and model.context_window > 0:
+        run_cmd += f" -c {model.context_window}"
+
+    resources: dict = {
+        "image_id": "docker:ghcr.io/invergent-ai/sky-llama-cpp:full-cuda12",
+        "ports": 8080,
+        "infra": svc.infra or "k8s",
+        "use_spot": svc.use_spot or False,
+    }
+    if svc.accelerators:
+        resources["accelerators"] = svc.accelerators
+
+    task: dict = {
+        "resources": resources,
+        "secrets": {
+            "HF_TOKEN": ""
+        },
+        "service": {
+            "readiness_probe": svc.readiness_path or "/health",
+            "replicas": svc.replicas,
+            "ports": 8080,
+        },
+        "run": run_cmd,
+    }
+    if svc.load_balancing_policy:
+        task["service"]["load_balancing_policy"] = svc.load_balancing_policy
+
+    return yaml.dump(task, default_flow_style=False)
+
+
+async def start_model(
+    session: AsyncSession, model_id: str,
+) -> Optional[DeployedModelResponse]:
+    """Start serving a stopped model by generating a task YAML and launching via SkyPilot."""
+    m = await repo.get_deployed_model(session, model_id)
+    if m is None:
+        raise ValueError(f"Model {model_id} not found")
+
+    if not m.serving_service_id:
+        raise ValueError(f"No serving service configured for model {model_id}")
+
+    svc = await repo.get_serving_service(session, m.serving_service_id)
+    if svc is None:
+        raise ValueError(f"No serving service configured for model {model_id}")
+
+    # Terminate if still running
+    if svc.status not in ("shutting_down", "failed", "failed_cleanup", "stopped"):
+        try:
+            await sky_service.terminate_serving_service(session, m.serving_service_id)
+        except Exception:
+            logger.warning(f"Failed to terminate old service for model {model_id}", exc_info=True)
+
+    task_yaml = _build_task_yaml(m, svc)
+
+    svc = await sky_service.launch_serving_service(session, svc, task_yaml)
+
+    await repo.update_deployed_model(
+        session, model_id,
+        last_deployed_at=datetime.now(timezone.utc),
+    )
+
+    m = await repo.get_deployed_model(session, model_id)
     return build_model_response(m, svc)
 
 
@@ -382,68 +458,74 @@ async def stop_model(session: AsyncSession, model_id: str) -> None:
 async def restart_model(
     session: AsyncSession, model_id: str
 ) -> Optional[DeployedModelResponse]:
-    """Restart a model by re-launching its ServingService."""
+    """Restart a model by stopping then starting it."""
     m = await repo.get_deployed_model(session, model_id)
     if m is None:
         raise ValueError(f"Model {model_id} not found")
 
-    # Get task_yaml from the old service
-    task_yaml = None
-    old_svc = None
     if m.serving_service_id:
-        old_svc = await repo.get_serving_service(session, m.serving_service_id)
-        if old_svc:
-            task_yaml = old_svc.task_yaml
-
-    if not task_yaml:
-        raise ValueError("No task configuration available for restart")
-
-    # Terminate old service if still active
-    if old_svc and old_svc.status not in ("shutting_down", "failed", "failed_cleanup"):
         try:
-            await sky_service.terminate_serving_service(session, m.serving_service_id)
-        except Exception:
-            logger.warning(f"Failed to terminate old service for model {model_id}", exc_info=True)
+            await stop_model(session, model_id)
+        except ValueError:
+            pass  # already stopped
 
-    # Launch new service
-    svc = await sky_service.launch_serving_service(
-        session,
-        task_yaml=task_yaml,
-        service_name=f"{m.name}-{int(datetime.now(timezone.utc).timestamp())}",
-        project_id=m.project_id,
-        requested_by_id=m.deployed_by_id,
-        accelerators=old_svc.accelerators if old_svc else None,
-        cloud=old_svc.cloud if old_svc else None,
-        use_spot=old_svc.use_spot if old_svc else False,
-        min_replicas=old_svc.min_replicas if old_svc else 1,
-        max_replicas=old_svc.max_replicas if old_svc else None,
-        readiness_path=old_svc.readiness_path if old_svc else None,
-        load_balancing_policy=old_svc.load_balancing_policy if old_svc else None,
-    )
+    return await start_model(session, model_id)
 
-    await repo.update_deployed_model(
-        session, model_id,
-        serving_service_id=svc.id,
-        last_deployed_at=datetime.now(timezone.utc),
-    )
 
-    # Re-read the model to get updated state
+async def get_model_logs(
+    session: AsyncSession,
+    model_id: str,
+    *,
+    target: str = "controller",
+    replica_id: Optional[int] = None,
+    tail: int = 200,
+) -> dict:
+    """Fetch logs for a deployed model's serving service."""
     m = await repo.get_deployed_model(session, model_id)
-    return build_model_response(m, svc)
+    if m is None:
+        raise ValueError(f"Model {model_id} not found")
+    if not m.serving_service_id:
+        raise ValueError("Model has no serving service")
+
+    svc = await repo.get_serving_service(session, m.serving_service_id)
+    if svc is None:
+        raise ValueError("Serving service not found")
+
+    lines = await sky_service.tail_serving_logs(
+        svc.name, target=target, replica_id=replica_id, tail=tail,
+    )
+    return {"model_id": model_id, "target": target, "lines": lines}
 
 
 async def delete_model(session: AsyncSession, model_id: str) -> None:
-    """Terminate serving and delete the model record."""
+    """Delete the model and its ServingService, tearing down SkyPilot in the background."""
     m = await repo.get_deployed_model(session, model_id)
     if m is None:
         raise ValueError(f"Model {model_id} not found")
 
-    if m.serving_service_id:
-        svc = await repo.get_serving_service(session, m.serving_service_id)
-        if svc and svc.status not in ("shutting_down", "failed", "failed_cleanup"):
-            try:
-                await sky_service.terminate_serving_service(session, m.serving_service_id)
-            except Exception:
-                logger.warning(f"Failed to terminate service for model {model_id}", exc_info=True)
+    serving_service_id = m.serving_service_id
+    service_name: str | None = None
+    if serving_service_id:
+        svc = await repo.get_serving_service(session, serving_service_id)
+        if svc is not None:
+            service_name = svc.name
 
+    # Delete DB records immediately so the UI can move on
     await repo.delete_deployed_model(session, model_id)
+    if serving_service_id:
+        await repo.delete_serving_service(session, serving_service_id)
+
+    # Tear down the SkyPilot service in the background
+    if service_name:
+        asyncio.create_task(_teardown_sky_service(service_name))
+
+
+async def _teardown_sky_service(service_name: str) -> None:
+    """Best-effort SkyPilot service teardown — runs as a background task."""
+    from sky.serve.server import core as serve_core
+
+    try:
+        await asyncio.to_thread(serve_core.down, service_names=service_name, purge=False)
+        logger.info("SkyPilot service '%s' torn down", service_name)
+    except Exception:
+        logger.warning("Failed to tear down SkyPilot service '%s'", service_name, exc_info=True)

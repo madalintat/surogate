@@ -16,7 +16,7 @@ from typing import Optional
 import yaml
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from surogate.core.db.models.compute import CloudWorkloadType
+from surogate.core.db.models.compute import CloudWorkloadType, ServingService
 from surogate.core.db.repository import compute as repo
 from surogate.utils.logger import get_logger
 
@@ -41,8 +41,9 @@ _SKY_STATUS_MAP = {
 }
 
 
-def _map_status(sky_status: str) -> str:
-    return _SKY_STATUS_MAP.get(str(sky_status).upper(), "unknown")
+def _map_status(sky_status) -> str:
+    key = sky_status.name if hasattr(sky_status, "name") else str(sky_status)
+    return _SKY_STATUS_MAP.get(key.upper(), "unknown")
 
 
 # ── Managed Jobs ─────────────────────────────────────────────────────
@@ -180,160 +181,46 @@ async def cancel_job(session: AsyncSession, job_id: str):
 
 # ── SkyPilot Serve ──────────────────────────────────────────────────
 
-_SKY_SERVING_SERVICE_STATUS_MAP = {
-    "CONTROLLER_INIT": "controller_init",
-    "REPLICA_INIT": "replica_init",
-    "CONTROLLER_FAILED": "controller_failed",
-    "READY": "ready",
-    "SHUTTING_DOWN": "shutting_down",
-    "FAILED": "failed",
-    "FAILED_CLEANUP": "failed_cleanup",
-    "NO_REPLICA": "no_replica",
-}
-
-
-def _map_serving_service_status(sky_status: str) -> str:
-    return _SKY_SERVING_SERVICE_STATUS_MAP.get(str(sky_status).upper(), "unknown")
-
-
 async def launch_serving_service(
     session: AsyncSession,
-    *,
+    svc: ServingService,
     task_yaml: str,
-    service_name: str,
-    project_id: str,
-    requested_by_id: str,
-    accelerators: Optional[str] = None,
-    cloud: Optional[str] = None,
-    use_spot: bool = False,
-    min_replicas: int = 1,
-    max_replicas: Optional[int] = None,
-    readiness_path: Optional[str] = None,
-    load_balancing_policy: Optional[str] = None,
 ):
-    """Launch a SkyPilot serving service and record it in the platform DB."""
+    """Launch a SkyPilot serving service and update the existing DB record."""
     import sky
-    from sky import serve as sky_serve
+    from sky.serve.server import core as serve_core
 
     task_config = yaml.safe_load(task_yaml)
     task = sky.Task.from_yaml_config(task_config)
 
-    if accelerators:
-        task.set_resources(
-            sky.Resources(accelerators=accelerators, use_spot=use_spot)
-        )
-
-    # Build service section if not already in the YAML
-    service_config: dict = task_config.get("service", {})
-    if readiness_path:
-        service_config["readiness_probe"] = readiness_path
-    if min_replicas:
-        service_config.setdefault("replica_policy", {})["min_replicas"] = min_replicas
-    if max_replicas:
-        service_config.setdefault("replica_policy", {})["max_replicas"] = max_replicas
-    if load_balancing_policy:
-        service_config["load_balancing_policy"] = load_balancing_policy
-
-    if service_config and not task_config.get("service"):
-        task_config["service"] = service_config
-        task = sky.Task.from_yaml_config(task_config)
-
     endpoint = None
     status = "controller_init"
     try:
-        request_id = await asyncio.to_thread(
-            sky_serve.up, task, service_name=service_name
+        _, endpoint = await asyncio.to_thread(
+            serve_core.up, task, service_name=svc.name
         )
-        # sky.serve.up returns a RequestId; resolve it to get (name, endpoint)
-        if request_id is not None:
-            result = await asyncio.to_thread(request_id.get)
-            if result and len(result) >= 2:
-                endpoint = result[1]
-    except Exception:
+    except Exception as exc:
         logger.warning(
-            f"SkyPilot serve launch failed for {service_name}", exc_info=True
+            f"SkyPilot serve launch failed for {svc.name}: {exc}",
+            exc_info=True,
         )
         status = "failed"
 
-    svc = await repo.create_serving_service(
-        session,
-        name=service_name,
-        project_id=project_id,
-        requested_by_id=requested_by_id,
+    await repo.update_serving_service(
+        session, svc.id,
         task_yaml=task_yaml,
         status=status,
         endpoint=endpoint,
-        accelerators=accelerators,
-        cloud=cloud,
-        use_spot=use_spot,
-        min_replicas=min_replicas,
-        max_replicas=max_replicas,
-        readiness_path=readiness_path,
-        load_balancing_policy=load_balancing_policy,
     )
-    return svc
-
-
-async def list_serving_services(
-    session: AsyncSession,
-    *,
-    project_id: Optional[str] = None,
-    status_filter: Optional[str] = None,
-    limit: int = 50,
-):
-    """List serving services merged from SkyPilot state + platform DB."""
-    db_services = await repo.list_serving_services(
-        session,
-        project_id=project_id,
-        status=status_filter,
-        limit=limit,
-    )
-
-    # Sync status from SkyPilot
-    try:
-        sky_statuses = await _get_serve_statuses()
-    except Exception:
-        logger.debug("Could not fetch SkyPilot serve statuses", exc_info=True)
-        sky_statuses = {}
-
-    results = []
-    status_counts: dict[str, int] = {}
-    for svc in db_services:
-        if svc.name in sky_statuses:
-            info = sky_statuses[svc.name]
-            new_status = _map_serving_service_status(info.get("status", ""))
-            updates: dict = {}
-            if new_status != svc.status:
-                updates["status"] = new_status
-                if new_status == "ready" and svc.started_at is None:
-                    updates["started_at"] = datetime.utcnow()
-                if new_status in ("failed", "failed_cleanup", "controller_failed"):
-                    updates["terminated_at"] = datetime.utcnow()
-            ep = info.get("endpoint")
-            if ep and ep != svc.endpoint:
-                updates["endpoint"] = ep
-            if updates:
-                await repo.update_serving_service(session, svc.id, **updates)
-                for k, v in updates.items():
-                    setattr(svc, k, v)
-
-        status_counts[svc.status] = status_counts.get(svc.status, 0) + 1
-        results.append(svc)
-
-    return {
-        "services": results,
-        "total": len(results),
-        "status_counts": status_counts,
-    }
+    return await repo.get_serving_service(session, svc.id)
 
 
 async def get_serving_service_status(service_name: str) -> Optional[dict]:
     """Get detailed status for a single serving service from SkyPilot."""
-    from sky import serve as sky_serve
+    from sky.serve.server import core as serve_core
 
     try:
-        request_id = await asyncio.to_thread(sky_serve.status, service_name)
-        result = await asyncio.to_thread(request_id.get)
+        result = await asyncio.to_thread(serve_core.status, service_names=service_name)
         if result and len(result) > 0:
             return result[0]
     except Exception:
@@ -350,7 +237,7 @@ async def update_serving_service(
 ):
     """Update a serving service with a new task configuration."""
     import sky
-    from sky import serve as sky_serve
+    from sky.serve.server import core as serve_core
     from sky.serve import serve_utils
 
     svc = await repo.get_serving_service(session, service_id)
@@ -367,7 +254,7 @@ async def update_serving_service(
     )
 
     await asyncio.to_thread(
-        sky_serve.update, task, service_name=svc.name, mode=update_mode
+        serve_core.update, task, service_name=svc.name, mode=update_mode
     )
 
     await repo.update_serving_service(
@@ -378,22 +265,24 @@ async def update_serving_service(
 
 async def terminate_serving_service(session: AsyncSession, service_id: str, purge: bool = False):
     """Tear down a serving service."""
-    from sky import serve as sky_serve
+    from sky.serve.server import core as serve_core
 
     svc = await repo.get_serving_service(session, service_id)
     if svc is None:
         raise ValueError(f"Serving service {service_id} not found")
 
     try:
-        await asyncio.to_thread(sky_serve.down, svc.name, purge=purge)
+        await asyncio.to_thread(serve_core.down, service_names=svc.name, purge=purge)
+        status = "stopped"
     except Exception:
         logger.warning(
             f"SkyPilot serve down failed for {svc.name}", exc_info=True
         )
+        status = "failed_cleanup"
 
     await repo.update_serving_service(
         session, svc.id,
-        status="shutting_down",
+        status=status,
         terminated_at=datetime.utcnow(),
     )
 
@@ -402,10 +291,10 @@ async def terminate_serving_service_replica(
     service_name: str, replica_id: int, purge: bool = False
 ):
     """Terminate a specific replica of a serving service."""
-    from sky import serve as sky_serve
+    from sky.serve.server import core as serve_core
 
     await asyncio.to_thread(
-        sky_serve.terminate_replica,
+        serve_core.terminate_replica,
         service_name=service_name,
         replica_id=replica_id,
         purge=purge,
@@ -439,14 +328,92 @@ async def terminate_cluster(cluster_name: str):
 # ── Helpers ──────────────────────────────────────────────────────────
 
 
+async def tail_serving_logs(
+    service_name: str,
+    *,
+    target: str = "controller",
+    replica_id: Optional[int] = None,
+    tail: int = 200,
+) -> list[str]:
+    """Read the last N lines of logs for a serving service.
+
+    *target* is one of ``"controller"``, ``"load_balancer"``, or
+    ``"replica"`` (requires *replica_id*).
+    """
+    from sky.serve import serve_utils
+    from sky import backends
+    from sky.backends import backend_utils
+    from sky.utils import controller_utils
+
+    component_map = {
+        "controller": serve_utils.ServiceComponent.CONTROLLER,
+        "load_balancer": serve_utils.ServiceComponent.LOAD_BALANCER,
+        "replica": serve_utils.ServiceComponent.REPLICA,
+    }
+    component = component_map.get(target)
+    if component is None:
+        raise ValueError(f"Unknown log target: {target!r}")
+
+    if component == serve_utils.ServiceComponent.REPLICA:
+        if replica_id is None:
+            raise ValueError("`replica_id` required for replica logs")
+        code = serve_utils.ServeCodeGen.stream_replica_logs(
+            service_name, replica_id, follow=False, tail=tail, pool=False,
+        )
+    else:
+        code = serve_utils.ServeCodeGen.stream_serve_process_logs(
+            service_name,
+            stream_controller=(component == serve_utils.ServiceComponent.CONTROLLER),
+            follow=False,
+            tail=tail,
+            pool=False,
+        )
+
+    def _fetch() -> str:
+        controller_type = controller_utils.get_controller_for_pool(False)
+        handle = backend_utils.is_controller_accessible(
+            controller=controller_type,
+            stopped_message=controller_type.value.default_hint_if_non_existent,
+        )
+        backend = backend_utils.get_backend_from_handle(handle)
+        assert isinstance(backend, backends.CloudVmRayBackend)
+        _, stdout, _ = backend.run_on_head(
+            handle, code,
+            stream_logs=False,
+            require_outputs=True,
+            separate_stderr=True,
+        )
+        return stdout
+
+    try:
+        stdout = await asyncio.to_thread(_fetch)
+    except Exception:
+        logger.debug(
+            "Could not fetch logs for serving service %s", service_name,
+            exc_info=True,
+        )
+        return []
+
+    lines = stdout.splitlines()
+    return lines[-tail:] if len(lines) > tail else lines
+
+
 async def _get_serve_statuses() -> dict[str, dict]:
     """Fetch current status for all serving services from SkyPilot."""
     try:
-        from sky import serve as sky_serve
+        from sky.serve.server import core as serve_core
 
-        request_id = await asyncio.to_thread(sky_serve.status, None)
-        records = await asyncio.to_thread(request_id.get)
-        return {r["name"]: r for r in records} if records else {}
+        records = await asyncio.to_thread(serve_core.status, service_names=None)
+        if not records:
+            return {}
+        out: dict[str, dict] = {}
+        for r in records:
+            # SkyPilot returns ServiceStatus enums; convert to plain strings
+            # so they can be bound as SQL parameters.
+            if hasattr(r.get("status"), "value"):
+                r["status"] = r["status"].value.lower()
+            out[r["name"]] = r
+        return out
     except Exception:
         return {}
 

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
 import { Navbar } from "@/components/navbar";
+import { useMonitorSocket } from "@/hooks/use-monitor-socket";
 import {
   Outlet,
   createRootRoute,
@@ -16,6 +17,7 @@ const HIDDEN_NAVBAR_ROUTES = ["/onboarding", "/login", "/change-password"];
 function RootLayout() {
   const pathname = useRouterState({ select: (s) => s.location.pathname });
   const hideNavbar = HIDDEN_NAVBAR_ROUTES.includes(pathname);
+  useMonitorSocket();
 
   return (
     <AppProvider>

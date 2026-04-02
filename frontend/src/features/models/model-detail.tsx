@@ -17,10 +17,18 @@ import { useAppStore } from "@/stores/app-store";
 import type { Model } from "./models-data";
 
 export function ModelDetail({ model }: { model: Model }) {
+  const startModel = useAppStore((s) => s.startModel);
   const stopModel = useAppStore((s) => s.stopModel);
   const restartModel = useAppStore((s) => s.restartModel);
   const deleteModel = useAppStore((s) => s.deleteModel);
+  const pending = useAppStore((s) => s.modelPending[model.id] ?? null);
   const [deleteOpen, setDeleteOpen] = useState(false);
+
+  const handleStart = () => {
+    if (confirm(`Deploy ${model.displayName} via SkyPilot?`)) {
+      startModel(model.id);
+    }
+  };
 
   const handleStop = () => {
     if (confirm("Stop serving this model?")) {
@@ -43,9 +51,9 @@ export function ModelDetail({ model }: { model: Model }) {
             <div
               className="w-11 h-11 rounded-[10px] shrink-0 flex items-center justify-center text-xl border"
               style={{
-                backgroundColor: model.status === "serving" ? "#3B82F618" : undefined,
-                borderColor: model.status === "serving" ? "#3B82F630" : undefined,
-                color: model.status === "serving" ? "#3B82F6" : undefined,
+                backgroundColor: model.status === "ready" ? "#3B82F618" : undefined,
+                borderColor: model.status === "ready" ? "#3B82F630" : undefined,
+                color: model.status === "ready" ? "#3B82F6" : undefined,
               }}
             >
               &#x25C7;
@@ -71,9 +79,9 @@ export function ModelDetail({ model }: { model: Model }) {
                   <span
                     className={cn(
                       "font-medium",
-                      model.status === "error"
+                      toStatus(model.status) === "error"
                         ? "text-destructive"
-                        : model.status === "serving"
+                        : model.status === "ready"
                           ? "text-green-500"
                           : "text-muted-foreground",
                     )}
@@ -140,22 +148,22 @@ export function ModelDetail({ model }: { model: Model }) {
             </div>
           </div>
           <div className="flex gap-1.5 shrink-0">
-            {model.status === "serving" && (
-              <Button variant="outline" size="xs" onClick={handleStop}>
-                Stop
+            {toStatus(model.status) !== "stopped" && toStatus(model.status) !== "error" && (
+              <Button variant="outline" size="xs" onClick={handleStop} disabled={!!pending}>
+                {pending ? "Stopping\u2026" : "Stop"}
               </Button>
             )}
-            {(model.status === "stopped" || model.status === "configured") && (
-              <Button variant="outline" size="xs" onClick={handleRestart}>
-                Deploy
+            {toStatus(model.status) === "stopped" && (
+              <Button variant="outline" size="xs" onClick={handleStart} disabled={!!pending}>
+                {pending ? "Starting\u2026" : "Start"}
               </Button>
             )}
-            {model.status === "error" && (
-              <Button variant="destructive" size="xs" onClick={handleRestart}>
-                Restart
+            {toStatus(model.status) === "error" && (
+              <Button variant="destructive" size="xs" onClick={handleRestart} disabled={!!pending}>
+                {pending ? "Restarting\u2026" : "Restart"}
               </Button>
             )}
-            {model.status === "serving" && (
+            {model.status === "ready" && (
               <Button variant="outline" size="xs">
                 &#x25B7; Playground
               </Button>

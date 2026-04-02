@@ -44,6 +44,7 @@ class LocalTaskManager:
     def __init__(self, config):
         self._config = config
         self._active: dict[str, subprocess.Popen] = {}
+        self._create_watch = None  # set by ServingMonitor
         TASKS_LOG_DIR.mkdir(parents=True, exist_ok=True)
 
     # ── Spawn ────────────────────────────────────────────────────────
@@ -105,8 +106,13 @@ class LocalTaskManager:
         self._active[task.id] = proc
         logger.info("Task %s spawned (pid=%d, type=%s)", task.id, proc.pid, task_type)
 
-        # Background watcher that updates DB when process exits
-        asyncio.create_task(self._watch(task.id, proc, log_file))
+        # Background watcher that updates DB when process exits.
+        # If a monitor has registered a wrapper, delegate to it so it
+        # can fire transition callbacks; otherwise fall back to direct.
+        if self._create_watch:
+            self._create_watch(task.id, task.name, proc, log_file)
+        else:
+            asyncio.create_task(self._watch(task.id, proc, log_file))
         return task
 
     # ── Cancel ───────────────────────────────────────────────────────
