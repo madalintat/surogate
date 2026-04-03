@@ -198,26 +198,17 @@ else
     echo "Successfully installed surogate $VERSION"
 fi
 
-# Clone examples
+# Download examples
 EXAMPLES_DIR="examples"
 if [ ! -d "$EXAMPLES_DIR" ]; then
     echo ""
     echo "Downloading examples..."
-    mkdir -p "$EXAMPLES_DIR"
 
-    # Download SFT examples using GitHub API to get directory contents
-    EXAMPLES_API_URL="https://api.github.com/repos/${REPO}/contents/examples/sft?ref=main"
-    EXAMPLES_JSON=$(curl -sL "$EXAMPLES_API_URL")
-
-    if echo "$EXAMPLES_JSON" | grep -q '"download_url"'; then
-        mkdir -p "$EXAMPLES_DIR/sft"
-        # Extract file URLs and download each file
-        echo "$EXAMPLES_JSON" | grep -oP '"download_url":\s*"\K[^"]+' | while read -r file_url; do
-            filename=$(basename "$file_url")
-            echo "  Downloading $filename..."
-            curl -sL "$file_url" -o "$EXAMPLES_DIR/sft/$filename"
-        done
-        echo "Examples downloaded to $EXAMPLES_DIR/sft/"
+    # Extract just the examples/ directory from the repo tarball
+    REPO_NAME=$(echo "$REPO" | cut -d/ -f2)
+    if curl -sL "https://github.com/${REPO}/archive/refs/heads/main.tar.gz" \
+        | tar -xz --strip-components=1 "${REPO_NAME}-main/examples"; then
+        echo "Examples downloaded to $EXAMPLES_DIR/"
     else
         echo "Warning: Could not download examples from GitHub."
     fi
@@ -228,5 +219,5 @@ fi
 echo ""
 echo "To run your first Qwen3-0.6B fine-tune run:"
 echo "  source $VENV_DIR/bin/activate"
-echo "  surogate sft examples/sft/qwen3-lora-bf16.yaml"
+echo "  surogate sft examples/sft/qwen3/qwen3-lora-bf16.yaml"
 echo ""
