@@ -1,116 +1,30 @@
 // Copyright (c) 2026, Invergent SA, developed by Flavius Burca
 // SPDX-License-Identifier: AGPL-3.0-only
 //
-import React, { useState, useMemo, useEffect } from "react";
+import React, { useState, useMemo } from "react";
 import { Card } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { StatusDot } from "@/components/ui/status-dot";
 import { useAppStore } from "@/stores/app-store";
-import { WORKLOAD_COLORS, STATUS_COLORS, PROVIDER_COLORS } from "./compute-data";
-import type { LocalTask } from "@/api/tasks";
-import type { Model } from "@/types/model";
+import { STATUS_COLORS, PROVIDER_COLORS } from "./compute-data";
 import { TaskDetail } from "./task-detail";
 import { ModelDetail } from "./model-detail";
-import { statusForDot } from "./detail-shared";
+import { statusForDot, EXTENDED_WORKLOAD_COLORS } from "./detail-shared";
 import type { ExtendedWorkload } from "./detail-shared";
 import { Trash2 } from "lucide-react";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
-
-const TASK_COLOR = "#06B6D4";
-
-function taskToWorkloadItem(t: LocalTask): ExtendedWorkload {
-  return {
-    id: t.id,
-    name: t.name,
-    type: "task",
-    method: t.task_type.replace("_", " "),
-    status: t.status,
-    priority: 3,
-    gpu: "\u2014",
-    gpuCount: 0,
-    location: "local",
-    node: t.pid ? `pid:${t.pid}` : "\u2014",
-    eta: t.progress ?? "\u2014",
-    startedAt: t.started_at ? new Date(t.started_at).toLocaleString() : null,
-    requestedBy: t.requested_by ?? "\u2014",
-    project: t.project_id ?? "\u2014",
-    _task: t,
-  };
-}
-
-function modelToWorkloadItem(m: Model): ExtendedWorkload {
-  const gpuLabel = m.gpu.count > 0 ? `${m.gpu.count}\u00d7 ${m.gpu.type}` : "\u2014";
-  return {
-    id: m.id,
-    name: m.displayName || m.name,
-    type: "serving",
-    method: m.engine !== "\u2014" ? m.engine : "\u2014",
-    status: m.status,
-    priority: 0,
-    gpu: gpuLabel,
-    gpuCount: m.gpu.count,
-    location: "local",
-    node: m.namespace !== "\u2014" ? m.namespace : "\u2014",
-    eta: m.uptime !== "\u2014" ? `up ${m.uptime}` : "\u2014",
-    startedAt: m.lastDeployed !== "\u2014" ? m.lastDeployed : null,
-    requestedBy: m.deployedBy || "\u2014",
-    project: m.projectId ?? "\u2014",
-    _model: m,
-  };
-}
+import { useWorkloadItems } from "./use-workload-items";
 
 const FILTERS = ["all", "training", "serving", "eval", "task"] as const;
-
-const EXTENDED_WORKLOAD_COLORS: Record<string, string> = {
-  ...WORKLOAD_COLORS,
-  task: TASK_COLOR,
-};
 
 export function WorkloadQueueTab() {
   const [filter, setFilter] = useState("all");
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<ExtendedWorkload | null>(null);
-  const tasks = useAppStore((s) => s.tasks);
-  const fetchTasks = useAppStore((s) => s.fetchTasks);
   const deleteTask = useAppStore((s) => s.deleteTask);
-  const models = useAppStore((s) => s.models);
-  const fetchModels = useAppStore((s) => s.fetchModels);
   const deleteModel = useAppStore((s) => s.deleteModel);
-  const activeProjectId = useAppStore((s) => s.activeProjectId);
-  const projects = useAppStore((s) => s.projects);
-  const activeProject = projects.find((p) => p.id === activeProjectId);
 
-  useEffect(() => {
-    void fetchTasks();
-    void fetchModels();
-  }, []);
-
-  const allItems = useMemo<ExtendedWorkload[]>(() => {
-    const taskItems = tasks.map(taskToWorkloadItem);
-    const modelItems = models.map(modelToWorkloadItem);
-    const items = [...taskItems, ...modelItems];
-    // Filter to current project — match on id (real tasks/models) or name (mock data)
-    const projectMatches = activeProject
-      ? items.filter((w) => {
-          if (!w.project) return true; // no project assigned
-          const p = w.project.toLowerCase();
-          return p === activeProject.id
-            || p === activeProject.name.toLowerCase()
-            || p === activeProject.namespace.toLowerCase();
-        })
-      : items;
-    projectMatches.sort((a, b) => {
-      const activeStatuses = ["running", "pending", "serving", "deploying",
-        "ready", "controller_init", "replica_init", "no_replica"];
-      const aActive = activeStatuses.includes(a.status) ? 1 : 0;
-      const bActive = activeStatuses.includes(b.status) ? 1 : 0;
-      if (aActive !== bActive) return bActive - aActive;
-      const aTime = a.startedAt ? new Date(a.startedAt).getTime() : 0;
-      const bTime = b.startedAt ? new Date(b.startedAt).getTime() : 0;
-      return bTime - aTime;
-    });
-    return projectMatches;
-  }, [tasks, models, activeProject]);
+  const allItems = useWorkloadItems();
 
   const filtered = useMemo(
     () => filter === "all" ? allItems : allItems.filter(w => w.type === filter),

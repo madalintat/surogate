@@ -63,10 +63,10 @@ export function CloudTab() {
         ))}
       </div>
 
-      {/* Active SkyPilot instances */}
+      {/* Active Cloud instances */}
       <Card size="sm" className="overflow-hidden">
         <div className="flex items-center justify-between px-4 py-2.5 border-b border-line">
-          <span className="text-sm font-semibold text-foreground font-display">Active SkyPilot Instances</span>
+          <span className="text-sm font-semibold text-foreground font-display">Active Cloud Instances</span>
           <span className="text-sm" style={{ color: "#F59E0B" }}>Total: ${cloudHourlyCost.toFixed(2)}/hr</span>
         </div>
         {CLOUD_INSTANCES.map(inst => (
