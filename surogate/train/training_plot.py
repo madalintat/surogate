@@ -49,12 +49,18 @@ def generate_training_plot(log_file: Union[str, Path], output_file: Union[str, P
     # Plot training loss
     if "step" in log_data and log_data["step"]:
         steps, losses = extract_over_step(log_data["step"], "loss")
+        steps = np.asarray(steps, dtype=np.float64)
+        losses = np.asarray(losses, dtype=np.float64)
         plt.plot(steps, losses, c=cmap(0), linewidth=1, alpha=0.5)
 
-        # Add smoothed training loss
+        # Add smoothed training loss (replace NaN/Inf with interpolated values for convolution)
         smoothing = 10
         if len(losses) > 2 * smoothing + 1:
-            smoothed = np.convolve(losses, np.ones(2 * smoothing + 1) / (2 * smoothing + 1), mode='valid')
+            clean = losses.copy()
+            bad = ~np.isfinite(clean)
+            if bad.any() and not bad.all():
+                clean[bad] = np.interp(np.flatnonzero(bad), np.flatnonzero(~bad), clean[~bad])
+            smoothed = np.convolve(clean, np.ones(2 * smoothing + 1) / (2 * smoothing + 1), mode='valid')
             plt.plot(steps[smoothing:-smoothing], smoothed, c=cmap(0), linewidth=3, label="Training loss")
         else:
             plt.plot(steps, losses, c=cmap(0), linewidth=3, label="Training loss")

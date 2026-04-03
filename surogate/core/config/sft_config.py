@@ -465,7 +465,7 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
         self.lora = cfg.get('lora', self.lora)
         self.lora_rank = cfg.get('lora_rank', self.lora_rank)
         self.lora_alpha = cfg.get('lora_alpha', self.lora_alpha)
-        self.lora_dropout = cfg['lora_dropout'] if 'lora_dropout' in cfg else self.lora_dropout
+        self.lora_dropout = float(cfg['lora_dropout']) if 'lora_dropout' in cfg else self.lora_dropout
         self.lora_dtype = cfg.get('lora_dtype', self.lora_dtype)
         self.lora_target_modules = cfg.get('lora_target_modules', ['all'])
         self.train_router = cfg.get('train_router', self.train_router)

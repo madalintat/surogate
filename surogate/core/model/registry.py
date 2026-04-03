@@ -176,7 +176,7 @@ def safe_snapshot_download(
         model_id_or_path, sub_folder = model_id_or_path
         if sub_folder is not None:
             kwargs['allow_patterns'] = [f"{sub_folder.rstrip('/')}/*"]
-        model_dir = hub.download_model(model_id_or_path, revision, ignore_patterns, token=hub_token, **kwargs)
+        model_dir = hub.download_model(model_id_or_path, revision, ignore_patterns, key=hub_token, **kwargs)
         logger.debug(f'Loading model from local path: {model_dir}')
 
     model_dir = os.path.abspath(os.path.expanduser(model_dir))

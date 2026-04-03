@@ -369,6 +369,12 @@ void DslModel::calculate_lora_gradient_norm(NCCLCommunicator& comm, float grad_c
     float* amax_ptr = buf.template get<float>() + num_block_sums + 2;
     float* prescale_ptr = buf.template get<float>() + num_block_sums + 3;
 
+    if (lrs.norm_num_tensors == 0) {
+        throw std::logic_error("DslModel::calculate_lora_gradient_norm: no LoRA gradient tensors found. "
+                               "Check that lora_target_modules matches actual model projections "
+                               "(e.g. q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj).");
+    }
+
     const auto* data_ptrs = reinterpret_cast<const void* const*>(lrs.norm_data_ptrs.Data);
     const auto* sizes = reinterpret_cast<const size_t*>(lrs.norm_sizes.Data);
     const auto* dtype_flags = lrs.norm_dtype_flags.template get<int>();

@@ -78,7 +78,6 @@ class HuggingFaceHub(HubOperation):
         revision: Optional[str] = None,
         ignore_patterns: Optional[List[str]] = None,
         key: Optional[str] = None, secret: Optional[str] = None,
-        token: Optional[str] = None,
         **kwargs
     ):
         if revision is None or revision == 'master':
@@ -91,4 +90,4 @@ class HuggingFaceHub(HubOperation):
         from huggingface_hub import snapshot_download
         return snapshot_download(
             model_id_or_path, repo_type='model', revision=revision,
-            ignore_patterns=ignore_patterns, token=token or key, **kwargs)
+            ignore_patterns=ignore_patterns, token=key, **kwargs)

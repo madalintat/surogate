@@ -16,6 +16,7 @@
 
 #include "dtype.h"
 #include "utils.h"
+#include "crash_handler.h"
 
 constexpr int MAX_TENSOR_DIM = 5;
 
@@ -74,8 +75,9 @@ struct Tensor {
     template<class TargetType>
     [[nodiscard]] constexpr const TargetType* get() const {
         if(dtype_from_type<TargetType> != DType) {
-            throw std::logic_error(std::string("DType mismatch: expected ") +
-                dtype_to_str(dtype_from_type<TargetType>) + ", got " + dtype_to_str(DType));
+            throw std::logic_error(std::string("DType mismatch (class): expected ") +
+                dtype_to_str(dtype_from_type<TargetType>) + ", got " + dtype_to_str(DType) +
+                "\n" + surogate::capture_stacktrace(2));
         }
 
         return reinterpret_cast<const TargetType*>(Data);
@@ -84,8 +86,9 @@ struct Tensor {
     template<typename TargetType>
     [[nodiscard]] constexpr TargetType* get() {
         if(dtype_from_type<TargetType> != DType) {
-            throw std::logic_error(std::string("DType mismatch: expected ") +
-                dtype_to_str(dtype_from_type<TargetType>) + ", got " + dtype_to_str(DType));
+            throw std::logic_error(std::string("DType mismatch (typename): expected ") +
+                dtype_to_str(dtype_from_type<TargetType>) + ", got " + dtype_to_str(DType) +
+                "\n" + surogate::capture_stacktrace(2));
         }
 
         return reinterpret_cast<TargetType*>(Data);
