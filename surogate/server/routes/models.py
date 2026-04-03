@@ -136,7 +136,7 @@ async def start_model(
     """Start serving a stopped model via SkyPilot."""
     try:
         resp = await models_service.start_model(
-            session, model_id, server_config=request.app.state.config,
+            session, model_id, server_config=request.app.state.config
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))

@@ -212,6 +212,8 @@ async def create_model(
         project_id=project_id,
         requested_by_id=requested_by_id,
         task_yaml="",
+        infra="k8s",
+
         status="stopped",
     )
 
@@ -377,6 +379,7 @@ def _build_task_yaml(
     svc: ServingService,
     *,
     lakefs_s3_endpoint: Optional[str] = None,
+    lakefs_k8s_s3_endpoint: Optional[str] = None,
     lakefs_access_key: Optional[str] = None,
     lakefs_secret_key: Optional[str] = None,
 ) -> str:
@@ -389,6 +392,7 @@ def _build_task_yaml(
         # Download model from LakeFS via rclone, then start server.
         # Auto-detect: use the GGUF file if one exists, else directory.
         run_cmd = (
+            "echo \"Downloading model from ${RCLONE_CONFIG_LAKEFS_ENDPOINT}...\" && "
             f"rclone copy --no-check-certificate lakefs:{hub['repo']}/{hub['branch']}/ {_MODEL_DIR} && "
             f"GGUF=$(find {_MODEL_DIR} -maxdepth 1 -name '*.gguf' | head -1) && "
             f"MODEL_PATH=${{GGUF:-{_MODEL_DIR}}} && "
@@ -429,13 +433,13 @@ def _build_task_yaml(
 
     # Pass rclone config for LakeFS S3 gateway via env vars — same
     # pattern as local_tasks.py uses for subprocess-based imports.
-    if hub and lakefs_s3_endpoint and lakefs_access_key and lakefs_secret_key:
+    if hub and lakefs_access_key and lakefs_secret_key:
         task["envs"] = {
             "RCLONE_CONFIG_LAKEFS_TYPE": "s3",
             "RCLONE_CONFIG_LAKEFS_PROVIDER": "Other",
             "RCLONE_CONFIG_LAKEFS_ENV_AUTH": "false",
             "RCLONE_CONFIG_LAKEFS_NO_CHECK_BUCKET": "true",
-            "RCLONE_CONFIG_LAKEFS_ENDPOINT": lakefs_s3_endpoint,
+            "RCLONE_CONFIG_LAKEFS_ENDPOINT": lakefs_k8s_s3_endpoint if svc.infra == "k8s" else lakefs_s3_endpoint,
             "RCLONE_CONFIG_LAKEFS_ACCESS_KEY_ID": lakefs_access_key,
             "RCLONE_CONFIG_LAKEFS_SECRET_ACCESS_KEY": lakefs_secret_key,
         }
@@ -461,6 +465,7 @@ async def start_model(
 ) -> Optional[DeployedModelResponse]:
     """Start serving a stopped model by generating a task YAML and launching via SkyPilot."""
     m = await repo.get_deployed_model(session, model_id)
+    
     if m is None:
         raise ValueError(f"Model {model_id} not found")
 
@@ -479,6 +484,7 @@ async def start_model(
         if creds and all(creds):
             lakefs_kw = {
                 "lakefs_s3_endpoint": server_config.lakefs_s3_endpoint,
+                "lakefs_k8s_s3_endpoint": server_config.lakefs_k8s_s3_endpoint,
                 "lakefs_access_key": creds[0],
                 "lakefs_secret_key": creds[1],
             }
@@ -491,7 +497,7 @@ async def start_model(
             logger.warning(f"Failed to terminate old service for model {model_id}", exc_info=True)
 
     task_yaml = _build_task_yaml(m, svc, **lakefs_kw)
-
+    
     svc = await sky_service.launch_serving_service(session, svc, task_yaml)
 
     await repo.update_deployed_model(

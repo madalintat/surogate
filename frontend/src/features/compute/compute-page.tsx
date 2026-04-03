@@ -37,9 +37,10 @@ export function ComputePage() {
   const activeTab = ROUTE_TO_TAB[pathname.replace(/\/$/, "")] ?? "overview";
 
   const k8sNodes = useAppStore((s) => s.k8sNodes);
+  const fetchK8Nodes = useAppStore((s) => s.fetchK8Nodes);
   useEffect(() => {
-    return useAppStore.getState().startK8sPolling();
-  }, []);
+    void fetchK8Nodes();
+  }, [fetchK8Nodes]);
 
   const totalGpu = k8sNodes.reduce((s, n) => s + getGpuTotal(n), 0);
   const usedGpu = totalGpu - k8sNodes.reduce((s, n) => s + getGpuFree(n), 0);

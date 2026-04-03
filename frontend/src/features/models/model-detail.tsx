@@ -138,6 +138,12 @@ export function ModelDetail({ model }: { model: Model }) {
                     </span>
                   </span>
                 )}
+                {model.endpoint && model.endpoint !== "\u2014" && (
+                  <span>
+                    endpoint:{" "}
+                    <span className="text-blue-500">{model.endpoint}</span>
+                  </span>
+                )}
                 {model.hubRef && (
                   <span>
                     hub:{" "}

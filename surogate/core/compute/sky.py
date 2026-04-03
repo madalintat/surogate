@@ -196,6 +196,9 @@ async def launch_serving_service(
     endpoint = None
     status = "controller_init"
     try:
+        from surogate.core.compute.skypilot.patcher import _active_project_id
+
+        _active_project_id.set(svc.project_id)
         _, endpoint = await asyncio.to_thread(
             serve_core.up, task, service_name=svc.name
         )
