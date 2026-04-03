@@ -195,8 +195,8 @@ void CompiledExecutor::dispatch_matmul(const CompiledOp& op, const modules::Forw
                     }
                 }
 
-                mRecipe->forward_matmul(ctx);
                 used_recipe = true;
+                mRecipe->forward_matmul(ctx);
                 ctx_ptr = &ctx;
             }
         }
@@ -613,8 +613,8 @@ void CompiledExecutor::dispatch_matmul_backward(const CompiledOp& op, const modu
         used_fp8 = ctx.allow_fp8;
         has_dout_quant = (ctx.dout_quant && ctx.dout_quant->Data);
 
-        mRecipe->backward_matmul(ctx);
         used_recipe = true;
+        mRecipe->backward_matmul(ctx);
     }
 
     if (!used_recipe) {

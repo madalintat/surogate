@@ -359,17 +359,17 @@ void matmul_cublaslt(FloatC* d, const FloatA* a, const FloatB* b, const FloatBia
         cudaGetDevice(&device_id);
         if (fallback_tried) {
             throw std::runtime_error(fmt::format(
-                "cuBLAS ERROR ({}) at {}:{} - device: {}, m: {}, n: {}, k: {}, mode: {}, transA: {}, transB: {}, lda: {}, ldb: {}, ldc: {}, ws_size: {}, A_type: {}, B_type: {}, algos_tried: {}/{}, gemm_status: {}",
+                "cuBLAS ERROR ({}) at {}:{} - device: {}, m: {}, n: {}, k: {}, mode: {}, transA: {}, transB: {}, lda: {}, ldb: {}, ldc: {}, ws_size: {}, A_type: {}, B_type: {}, C_type: {}, algos_tried: {}/{}, gemm_status: {}",
                 (int)matmul_status, __FILE__, __LINE__, device_id, m, n, k,
                 (int)mode, (int)transA, (int)transB, lda, ldb, ldc, workspace_size,
-                (int)to_cuda_lib_type_enum<FloatA>, (int)to_cuda_lib_type_enum<FloatB>, algos_tried, returnedResults,
+                (int)to_cuda_lib_type_enum<FloatA>, (int)to_cuda_lib_type_enum<FloatB>, (int)to_cuda_lib_type_enum<FloatC>, algos_tried, returnedResults,
                 (int)gemm_status));
         }
         throw std::runtime_error(fmt::format(
-            "cuBLAS ERROR ({}) at {}:{} - device: {}, m: {}, n: {}, k: {}, mode: {}, transA: {}, transB: {}, lda: {}, ldb: {}, ldc: {}, ws_size: {}, A_type: {}, B_type: {}, algos_tried: {}/{}",
+            "cuBLAS ERROR ({}) at {}:{} - device: {}, m: {}, n: {}, k: {}, mode: {}, transA: {}, transB: {}, lda: {}, ldb: {}, ldc: {}, ws_size: {}, A_type: {}, B_type: {}, C_type: {}, algos_tried: {}/{}",
             (int)matmul_status, __FILE__, __LINE__, device_id, m, n, k,
             (int)mode, (int)transA, (int)transB, lda, ldb, ldc, workspace_size,
-            (int)to_cuda_lib_type_enum<FloatA>, (int)to_cuda_lib_type_enum<FloatB>, algos_tried, returnedResults));
+            (int)to_cuda_lib_type_enum<FloatA>, (int)to_cuda_lib_type_enum<FloatB>, (int)to_cuda_lib_type_enum<FloatC>, algos_tried, returnedResults));
     }
     CUDA_CHECK(cudaGetLastError());
 

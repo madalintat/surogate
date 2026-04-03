@@ -101,30 +101,59 @@ void FP8HybridRecipe::forward_matmul(modules::MatmulContext& ctx) const {
     }
 
     // Step 2: Prepare weight and perform matmul
+    // Wrap FP8 matmul in try-catch: if cuBLASLt rejects the FP8 configuration
+    // (e.g., unsupported during CUDA graph capture on certain CUDA versions),
+    // fall back to BF16 matmul transparently.
     std::optional<Tensor> bias_opt = ctx.has_bias() ? std::make_optional(*ctx.bias) : std::nullopt;
+
+    // Helper: BF16 fallback matmul (used when FP8 is rejected by cuBLASLt)
+    auto bf16_fallback = [&]() {
+        matmul(*ctx.out, *ctx.weight, *ctx.inp, bias_opt,
+               /*scale_a=*/nullptr, /*scale_b=*/nullptr,
+               rs.CublasLtHandle, rs.CuBlasWorkspace,
+               N, M, K, EMMTranspose::TN, /*accumulate=*/false, ctx.stream);
+    };
 
     // QLoRA-FP8: Check for cached FP8 weight from weight provider first
     // (QLoRA stores weights in FP8 but provides dequantized BF16 via cache)
     if (ctx.cached_weight && ctx.cached_weight->Data && ctx.cached_weight->DType == ETensorDType::FP8_E4M3) {
         // Use pre-cached FP8 weight (from QLoRA weight manager)
         float* weight_scale = const_cast<Tensor*>(ctx.cached_weight)->scale();
-        matmul(*ctx.out, *ctx.cached_weight, inp_fp8, bias_opt,
-               weight_scale, inp_fp8.scale(),
-               rs.CublasLtHandle, rs.CuBlasWorkspace,
-               N, M, K, EMMTranspose::TN, /*accumulate=*/false, ctx.stream);
+        try {
+            matmul(*ctx.out, *ctx.cached_weight, inp_fp8, bias_opt,
+                   weight_scale, inp_fp8.scale(),
+                   rs.CublasLtHandle, rs.CuBlasWorkspace,
+                   N, M, K, EMMTranspose::TN, /*accumulate=*/false, ctx.stream);
+        } catch (const std::runtime_error& e) {
+            static bool warned = false;
+            if (!warned) { fprintf(stderr, "[WARNING] FP8 forward matmul failed, falling back to BF16: %s\n", e.what()); warned = true; }
+            bf16_fallback();
+        }
     } else if (ctx.weight->DType == ETensorDType::FP8_E4M3) {
         // Weight already FP8 (persistent quantization mode)
-        matmul(*ctx.out, *ctx.weight, inp_fp8, bias_opt,
-               ctx.weight->scale(), inp_fp8.scale(),
-               rs.CublasLtHandle, rs.CuBlasWorkspace,
-               N, M, K, EMMTranspose::TN, /*accumulate=*/false, ctx.stream);
+        try {
+            matmul(*ctx.out, *ctx.weight, inp_fp8, bias_opt,
+                   ctx.weight->scale(), inp_fp8.scale(),
+                   rs.CublasLtHandle, rs.CuBlasWorkspace,
+                   N, M, K, EMMTranspose::TN, /*accumulate=*/false, ctx.stream);
+        } catch (const std::runtime_error& e) {
+            static bool warned = false;
+            if (!warned) { fprintf(stderr, "[WARNING] FP8 forward matmul failed, falling back to BF16: %s\n", e.what()); warned = true; }
+            bf16_fallback();
+        }
     } else if (ctx.cached_weight && ctx.cached_weight->Data) {
         // Use pre-cached FP8 weight (from weight manager)
         float* weight_scale = const_cast<Tensor*>(ctx.cached_weight)->scale();
-        matmul(*ctx.out, *ctx.cached_weight, inp_fp8, bias_opt,
-               weight_scale, inp_fp8.scale(),
-               rs.CublasLtHandle, rs.CuBlasWorkspace,
-               N, M, K, EMMTranspose::TN, /*accumulate=*/false, ctx.stream);
+        try {
+            matmul(*ctx.out, *ctx.cached_weight, inp_fp8, bias_opt,
+                   weight_scale, inp_fp8.scale(),
+                   rs.CublasLtHandle, rs.CuBlasWorkspace,
+                   N, M, K, EMMTranspose::TN, /*accumulate=*/false, ctx.stream);
+        } catch (const std::runtime_error& e) {
+            static bool warned = false;
+            if (!warned) { fprintf(stderr, "[WARNING] FP8 forward matmul failed, falling back to BF16: %s\n", e.what()); warned = true; }
+            bf16_fallback();
+        }
     } else if (ctx.weight->DType == ETensorDType::BF16) {
         // Weight is BF16 - quantize on-the-fly for this forward pass
         Tensor weight_fp8 = rs.temp_alloc(ETensorDType::FP8_E4M3, {N, K}, "weight_fp8");
@@ -136,21 +165,28 @@ void FP8HybridRecipe::forward_matmul(modules::MatmulContext& ctx) const {
         quantize_with_abs_max(weight_fp8, weight_fp8.scale(), *ctx.weight, weight_fp8.abs_max(),
                               static_cast<long>(N) * K, rs.DeviceProp, ctx.stream);
 
-        // FP8 x FP8 matmul
-        matmul(*ctx.out, weight_fp8, inp_fp8, bias_opt,
-               weight_fp8.scale(), inp_fp8.scale(),
-               rs.CublasLtHandle, rs.CuBlasWorkspace,
-               N, M, K, EMMTranspose::TN, /*accumulate=*/false, ctx.stream);
+        // FP8 x FP8 matmul with BF16 fallback (free temps in both paths)
+        try {
+            matmul(*ctx.out, weight_fp8, inp_fp8, bias_opt,
+                   weight_fp8.scale(), inp_fp8.scale(),
+                   rs.CublasLtHandle, rs.CuBlasWorkspace,
+                   N, M, K, EMMTranspose::TN, /*accumulate=*/false, ctx.stream);
+        } catch (const std::runtime_error& e) {
+            // Free temps before fallback to keep stack consistent
+            rs.temp_free(weight_stats);
+            rs.temp_free(weight_fp8);
+            static bool warned = false;
+            if (!warned) { fprintf(stderr, "[WARNING] FP8 forward matmul failed, falling back to BF16: %s\n", e.what()); warned = true; }
+            bf16_fallback();
+            return;
+        }
 
         // Free temporary buffers
         rs.temp_free(weight_stats);
         rs.temp_free(weight_fp8);
     } else {
         // Fallback: unsupported weight dtype - use BF16 matmul
-        matmul(*ctx.out, *ctx.weight, *ctx.inp, bias_opt,
-               /*scale_a=*/nullptr, /*scale_b=*/nullptr,
-               rs.CublasLtHandle, rs.CuBlasWorkspace,
-               N, M, K, EMMTranspose::TN, /*accumulate=*/false, ctx.stream);
+        bf16_fallback();
     }
 }
 
