@@ -52,7 +52,7 @@ dependencies = [
     "python-multipart>=0.0.22",
     "sqlalchemy[asyncio]>=2.0",
     "aiosqlite>=0.20.0",
-    "skypilot[all]==0.12.0",
+    "skypilot[kubernetes]==0.12.0",
     "kubernetes>=0.34.0",
     "prometheus-api-client>=0.7.0"
 ]
