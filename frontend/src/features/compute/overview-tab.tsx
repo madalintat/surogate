@@ -6,9 +6,11 @@ import { ProgressBar } from "@/components/ui/progress-bar";
 import { StatusDot } from "@/components/ui/status-dot";
 import { useAppStore } from "@/stores/app-store";
 import {
-  CLOUD_INSTANCES, CLOUD_ACCOUNTS, WORKLOAD_QUEUE,
+  CLOUD_INSTANCES, CLOUD_ACCOUNTS,
   PROVIDER_COLORS,
 } from "./compute-data";
+import { useWorkloadItems } from "./use-workload-items";
+import { statusForDot } from "./detail-shared";
 
 function getGpuTotal(node: { total?: Record<string, number> }): number {
   return node.total?.["accelerator_count"] ?? 0;
@@ -20,6 +22,7 @@ function getGpuFree(node: { free?: Record<string, number> }): number {
 
 export function OverviewTab() {
   const k8sNodes = useAppStore((s) => s.k8sNodes);
+  const workloads = useWorkloadItems();
 
   const totalLocalGpu = k8sNodes.reduce((s, n) => s + getGpuTotal(n), 0);
   const usedLocalGpu = totalLocalGpu - k8sNodes.reduce((s, n) => s + getGpuFree(n), 0);
@@ -29,10 +32,13 @@ export function OverviewTab() {
   const monthlySpend = CLOUD_ACCOUNTS.reduce((s, a) => s + a.monthlySpend, 0);
   const monthlyBudget = CLOUD_ACCOUNTS.reduce((s, a) => s + a.monthlyBudget, 0);
 
+  const running = workloads.filter(w => statusForDot(w.status) === "running").length;
+  const queued = workloads.filter(w => w.status === "queued" || w.status === "pending").length;
+
   const kpis = [
     { label: "Local GPUs", value: `${usedLocalGpu}/${totalLocalGpu}`, sub: `${readyNodes} nodes` },
     { label: "Cloud GPUs", value: totalCloudGpu, sub: `${CLOUD_INSTANCES.filter(c => c.status === "running").length} instances` },
-    { label: "Queue Depth", value: WORKLOAD_QUEUE.filter(w => w.status === "queued").length, sub: `${WORKLOAD_QUEUE.filter(w => w.status === "running").length} running` },
+    { label: "Queue Depth", value: queued, sub: `${running} running` },
     { label: "Cloud $/hr", value: `$${cloudHourlyCost.toFixed(0)}`, sub: "active instances" },
     { label: "Monthly Spend", value: `$${(monthlySpend / 1000).toFixed(1)}K`, sub: `of $${(monthlyBudget / 1000).toFixed(0)}K budget` },
     { label: "Spot Savings", value: "61%", sub: "vs on-demand" },
@@ -170,10 +176,10 @@ export function OverviewTab() {
             <div className="text-sm font-semibold text-foreground font-display mb-2.5">Queue Summary</div>
             <div className="grid grid-cols-2 gap-2">
               {[
-                { label: "Running", value: WORKLOAD_QUEUE.filter(w => w.status === "running").length, color: "#22C55E" },
-                { label: "Queued", value: WORKLOAD_QUEUE.filter(w => w.status === "queued").length, color: "#6B7280" },
-                { label: "Training", value: WORKLOAD_QUEUE.filter(w => w.type === "training").length, color: "#F59E0B" },
-                { label: "Serving", value: WORKLOAD_QUEUE.filter(w => w.type === "serving").length, color: "#22C55E" },
+                { label: "Running", value: running, color: "#22C55E" },
+                { label: "Queued", value: queued, color: "#6B7280" },
+                { label: "Tasks", value: workloads.filter(w => w.type === "task").length, color: "#06B6D4" },
+                { label: "Serving", value: workloads.filter(w => w.type === "serving").length, color: "#22C55E" },
               ].map(s => (
                 <div key={s.label} className="flex justify-between py-1 text-[11px]">
                   <span className="text-faint">{s.label}</span>

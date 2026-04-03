@@ -14,6 +14,7 @@ class ServerConfig:
     database_url: str = 'sqlite+aiosqlite:///surogate.db'
     lakefs_endpoint: Optional[str] = None
     lakefs_s3_endpoint: Optional[str] = None
+    lakefs_k8s_s3_endpoint: Optional[str] = 'http://lakefs-s3.lakefs.svc'
     lakefs_access_key: Optional[str] = None
     prometheus_endpoint: Optional[str] = 'https://metrics.k8s.localhost'
     
