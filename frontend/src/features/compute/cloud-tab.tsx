@@ -1,14 +1,16 @@
 // Copyright (c) 2026, Invergent SA, developed by Flavius Burca
 // SPDX-License-Identifier: AGPL-3.0-only
 //
-import { Card, CardContent } from "@/components/ui/card";
+import { Card } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { StatusDot } from "@/components/ui/status-dot";
 import { ProgressBar } from "@/components/ui/progress-bar";
-import { CLOUD_ACCOUNTS, CLOUD_INSTANCES, PROVIDER_COLORS, STATUS_COLORS } from "./compute-data";
+import { CLOUD_ACCOUNTS, CLOUD_INSTANCES, PROVIDER_COLORS } from "./compute-data";
+import { AddCloudCard } from "./add-cloud-card";
 
 export function CloudTab() {
   const cloudHourlyCost = CLOUD_INSTANCES.filter(c => c.status === "running").reduce((s, c) => s + c.costPerHour, 0);
+  const connectedKeys = new Set(CLOUD_ACCOUNTS.map(a => a.provider));
 
   return (
     <div className="space-y-5 animate-in fade-in duration-200">
@@ -96,6 +98,10 @@ export function CloudTab() {
           </div>
         ))}
       </Card>
+
+      {/* Supported cloud providers */}
+      <AddCloudCard />
+
     </div>
   );
 }

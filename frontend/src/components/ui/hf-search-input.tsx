@@ -7,7 +7,6 @@ import { cn } from "@/utils/cn";
 import {
   Tooltip,
   TooltipContent,
-  TooltipProvider,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import {
@@ -129,8 +128,7 @@ export function HfSearchInput({
     : ggufs;
 
   return (
-    <TooltipProvider>
-    <div ref={containerRef} className={cn("relative min-w-0 w-full", className)}>
+   <div ref={containerRef} className={cn("relative min-w-0 w-full", className)}>
       {/* Trigger */}
       <Tooltip>
         <TooltipTrigger asChild>
@@ -301,6 +299,5 @@ export function HfSearchInput({
         </div>
       )}
     </div>
-    </TooltipProvider>
   );
 }

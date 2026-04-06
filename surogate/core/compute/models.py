@@ -433,9 +433,11 @@ def _build_task_yaml(
     resources: dict = {
         "image_id": "docker:ghcr.io/invergent-ai/sky-llama-cpp:full-cuda12",
         "ports": 8080,
-        "infra": svc.infra or "k8s",
-        "use_spot": svc.use_spot or False,
-        "accelerators": "RTX4070-LAPTOP-GPU:1",
+        # "infra": svc.infra or "k8s",
+        "infra": "nebius",
+        "use_spot": svc.use_spot or True,
+        # "accelerators": "RTX4070-LAPTOP-GPU:1",
+        "accelerators": "H100:1"
     }
     if svc.accelerators:
         resources["accelerators"] = svc.accelerators

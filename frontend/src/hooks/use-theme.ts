@@ -1,27 +1,42 @@
 // Copyright (c) 2026, Invergent SA, developed by Flavius Burca
 // SPDX-License-Identifier: AGPL-3.0-only
 //
-import { useState, useEffect, useCallback } from "react";
+import { useSyncExternalStore, useCallback } from "react";
+
+const listeners = new Set<() => void>();
+
+function subscribe(cb: () => void) {
+  listeners.add(cb);
+  return () => {
+    listeners.delete(cb);
+  };
+}
+
+function getSnapshot() {
+  return document.documentElement.classList.contains("dark");
+}
+
+function notify() {
+  for (const cb of listeners) cb();
+}
+
+// Initialise theme on module load
+const stored = localStorage.getItem("theme");
+const prefersDark = window.matchMedia(
+  "(prefers-color-scheme: dark)",
+).matches;
+const initialDark = stored === "dark" || (!stored && prefersDark);
+document.documentElement.classList.toggle("dark", initialDark);
 
 export function useTheme() {
-  const [isDark, setIsDark] = useState(() =>
-    document.documentElement.classList.contains("dark")
-  );
-
-  useEffect(() => {
-    const stored = localStorage.getItem("theme");
-    const prefersDark = window.matchMedia("(prefers-color-scheme: dark)").matches;
-    const dark = stored === "dark" || (!stored && prefersDark);
-    document.documentElement.classList.toggle("dark", dark);
-    setIsDark(dark);
-  }, []);
+  const isDark = useSyncExternalStore(subscribe, getSnapshot);
 
   const toggle = useCallback(() => {
-    const next = !isDark;
+    const next = !document.documentElement.classList.contains("dark");
     document.documentElement.classList.toggle("dark", next);
     localStorage.setItem("theme", next ? "dark" : "light");
-    setIsDark(next);
-  }, [isDark]);
+    notify();
+  }, []);
 
   return { isDark, toggle };
 }

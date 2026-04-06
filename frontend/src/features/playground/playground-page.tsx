@@ -53,11 +53,9 @@ const SingleContent = memo(function SingleContent({
       initialThreadId={threadId}
       newThreadNonce={newThreadNonce}
     >
-      <TooltipProvider>
-        <div className="flex h-full flex-col overflow-hidden">
-          <Thread />
-        </div>
-      </TooltipProvider>
+      <div className="flex h-full flex-col overflow-hidden">
+        <Thread />
+      </div>
     </PlaygroundRuntimeProvider>
   );
 });
@@ -97,10 +95,8 @@ const CompareContent = memo(function CompareContent({
             </div>
             <div className="min-h-0 flex-1">
               <PlaygroundRuntimeProvider pairId={pairId}>
-                <TooltipProvider>
-                  <RegisterCompareHandle name="left" />
-                  <Thread hideComposer hideWelcome />
-                </TooltipProvider>
+                <RegisterCompareHandle name="left" />
+                <Thread hideComposer hideWelcome />
               </PlaygroundRuntimeProvider>
             </div>
           </div>
@@ -115,10 +111,8 @@ const CompareContent = memo(function CompareContent({
             </div>
             <div className="min-h-0 flex-1">
               <PlaygroundRuntimeProvider pairId={pairId}>
-                <TooltipProvider>
-                  <RegisterCompareHandle name="right" />
-                  <Thread hideComposer hideWelcome />
-                </TooltipProvider>
+                <RegisterCompareHandle name="right" />
+                <Thread hideComposer hideWelcome />
               </PlaygroundRuntimeProvider>
             </div>
           </div>

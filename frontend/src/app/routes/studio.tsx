@@ -91,6 +91,12 @@ const PoliciesTab = lazy(() =>
   })),
 );
 
+const ConnectCloudPage = lazy(() =>
+  import("@/features/compute/connect-cloud-page").then((m) => ({
+    default: m.ConnectCloudPage,
+  })),
+);
+
 const MonitoringPage = lazy(() =>
   import("@/features/monitoring/monitoring-page").then((m) => ({
     default: m.MonitoringPage,
@@ -275,6 +281,15 @@ export const computePoliciesRoute = createRoute({
   getParentRoute: () => computeRoute,
   path: "/policies",
   component: PoliciesTab,
+});
+
+export const connectCloudRoute = createRoute({
+  getParentRoute: () => Route,
+  path: "/connect-cloud",
+  component: ConnectCloudPage,
+  validateSearch: (search: Record<string, unknown>) => ({
+    provider: (search.provider as string) || "",
+  }),
 });
 
 export const monitoringRoute = createRoute({

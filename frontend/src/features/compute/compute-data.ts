@@ -93,7 +93,24 @@ export const WORKLOAD_COLORS: Record<string, string> = {
 
 export const PROVIDER_COLORS: Record<string, string> = {
   aws: "#FF9900", gcp: "#4285F4", azure: "#0078D4",
+  lambda: "#8B5CF6", coreweave: "#06B6D4", nebius: "#EC4899",
 };
+
+export type SupportedProvider = {
+  key: string;
+  name: string;
+  description: string;
+  logoDark: string;
+  logoWhite: string;
+};
+
+export const SUPPORTED_PROVIDERS: SupportedProvider[] = [
+  { key: "aws", name: "Amazon Web Services", description: "P4d, P5, G5 instances", logoDark: "/aws-dark.svg", logoWhite: "/aws-light.svg" },
+  { key: "azure", name: "Microsoft Azure", description: "NC, ND-series VMs", logoDark: "/azure-dark.svg", logoWhite: "/azure-light.svg" },
+  { key: "gcp", name: "Google Cloud Platform", description: "A2, A3, G2 VMs", logoDark: "/gcp-dark.svg", logoWhite: "/gcp-light.svg" },
+  { key: "runpod", name: "RunPod", description: "GPU-native cloud", logoDark: "/runpod-dark.svg", logoWhite: "/runpod-light.svg" },
+  { key: "nebius", name: "Nebius", description: "GPU cloud with flexible billing", logoDark: "/nebius-dark.svg", logoWhite: "/nebius-light.svg" },
+];
 
 // ── Mock data ───────────────────────────────────────────────────────
 
@@ -127,7 +144,6 @@ export const CLOUD_INSTANCES: CloudInstance[] = [
 export const CLOUD_ACCOUNTS: CloudAccount[] = [
   { provider: "aws", name: "AWS Production", status: "connected", quotaGpu: 64, usedGpu: 16, regions: ["us-east-1", "us-west-2", "eu-west-1"], monthlyBudget: 15000, monthlySpend: 4820 },
   { provider: "gcp", name: "GCP Research", status: "connected", quotaGpu: 32, usedGpu: 0, regions: ["us-central1", "europe-west4"], monthlyBudget: 8000, monthlySpend: 1200 },
-  { provider: "azure", name: "Azure (backup)", status: "disconnected", quotaGpu: 0, usedGpu: 0, regions: [], monthlyBudget: 0, monthlySpend: 0 },
 ];
 
 export const WORKLOAD_QUEUE: WorkloadItem[] = [

@@ -45,20 +45,18 @@ export function ProjectSelector() {
           {p.name}
         </button>
       ))}
-      <TooltipProvider>
-        <Tooltip>
-          <TooltipTrigger asChild>
-            <button
-              type="button"
-              onClick={() => setCreateOpen(true)}
-              className="px-2 py-1 rounded border border-dashed border-border bg-transparent text-faint cursor-pointer hover:text-muted-foreground"
-            >
-              <Plus size={14} />
-            </button>
-          </TooltipTrigger>
-          <TooltipContent>Create a new Project</TooltipContent>
-        </Tooltip>
-      </TooltipProvider>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <button
+            type="button"
+            onClick={() => setCreateOpen(true)}
+            className="px-2 py-1 rounded border border-dashed border-border bg-transparent text-faint cursor-pointer hover:text-muted-foreground"
+          >
+            <Plus size={14} />
+          </button>
+        </TooltipTrigger>
+        <TooltipContent>Create a new Project</TooltipContent>
+      </Tooltip>
       <CreateProjectDialog open={createOpen} onOpenChange={setCreateOpen} />
     </div>
   );

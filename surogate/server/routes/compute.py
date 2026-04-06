@@ -243,7 +243,6 @@ async def list_nodes(
 
 # ── Cloud ────────────────────────────────────────────────────────────
 
-
 @router.get("/cloud/accounts", response_model=list[CloudAccountResponse])
 async def list_cloud_accounts(
     current_subject: str = Depends(get_current_subject),
