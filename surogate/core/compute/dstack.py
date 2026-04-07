@@ -692,6 +692,76 @@ async def get_run_logs(
         return []
 
 
+# ── Events ─────────────────────────────────────────────────────────
+
+
+async def get_run_events(
+    run_name: str,
+    project_name: str,
+    *,
+    limit: int = 100,
+) -> list[dict]:
+    """Fetch dstack events for a run (and its jobs)."""
+    from surogate.core.compute import get_dstack_admin
+    from dstack._internal.server.db import get_session_ctx as dstack_session_ctx
+    from dstack._internal.server.services.projects import get_project_model_by_name
+    from dstack._internal.server.services.runs import get_run
+    from dstack._internal.server.services.events import list_events
+
+    try:
+        async with dstack_session_ctx() as dstack_session:
+            project = await get_project_model_by_name(
+                session=dstack_session, project_name=project_name,
+            )
+            if project is None:
+                return []
+
+            run = await get_run(
+                session=dstack_session, project=project, run_name=run_name,
+            )
+            if run is None:
+                return []
+
+            admin = get_dstack_admin()
+            events = await list_events(
+                session=dstack_session,
+                user=admin,
+                target_projects=None,
+                target_users=None,
+                target_fleets=None,
+                target_instances=None,
+                target_runs=None,
+                target_jobs=None,
+                target_volumes=None,
+                target_gateways=None,
+                target_secrets=None,
+                within_projects=None,
+                within_fleets=None,
+                within_runs=[run.id],
+                include_target_types=None,
+                actors=None,
+                prev_recorded_at=None,
+                prev_id=None,
+                limit=limit,
+                ascending=True,
+            )
+
+        return [
+            {
+                "time": e.recorded_at.isoformat(),
+                "text": e.message,
+                "type": next(
+                    (t.type for t in e.targets if t.type in ("run", "job")),
+                    "system",
+                ),
+            }
+            for e in events
+        ]
+    except Exception:
+        logger.debug("Could not fetch events for run %s", run_name, exc_info=True)
+        return []
+
+
 # ── Instance Operations ─────────────────────────────────────────────
 
 

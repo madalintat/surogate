@@ -14,6 +14,7 @@ from surogate.server.models.models import (
     DeployedModelResponse,
     DeployedModelScaleRequest,
     DeployedModelUpdateRequest,
+    ModelEventsResponse,
     ModelLogsResponse,
 )
 
@@ -186,6 +187,22 @@ async def get_model_logs(
     try:
         return await models_service.get_model_logs(
             session, model_id, tail=tail,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@router.get("/{model_id}/events", response_model=ModelEventsResponse)
+async def get_model_events(
+    model_id: str,
+    current_subject: str = Depends(get_current_subject),
+    session: AsyncSession = Depends(get_session),
+    limit: int = Query(100, le=500),
+):
+    """Get dstack events for a model's serving service."""
+    try:
+        return await models_service.get_model_events(
+            session, model_id, limit=limit,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))

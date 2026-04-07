@@ -6,15 +6,19 @@ import { Button } from "@/components/ui/button";
 import { StatusDot } from "@/components/ui/status-dot";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { useAppStore } from "@/stores/app-store";
-import { getModelLogs } from "@/api/models";
+import { getModelLogs, getModelEvents } from "@/api/models";
+import type { ModelEvent } from "@/api/models";
 import { STATUS_COLORS } from "./compute-data";
-import { X, Terminal, Clock, User, Folder, Cpu, MapPin, ChevronRight, Globe, Layers, Gauge, Server } from "lucide-react";
+import { X, Terminal, Clock, User, Folder, Cpu, MapPin, ChevronRight, Globe, Layers, Gauge, Server, CalendarClock } from "lucide-react";
 import { statusForDot, InfoRow, EXTENDED_WORKLOAD_COLORS } from "./detail-shared";
 import type { ExtendedWorkload } from "./detail-shared";
 
 export function ModelDetail({ item, onClose }: { item: ExtendedWorkload; onClose: () => void }) {
   const [logs, setLogs] = useState<string[]>([]);
   const [logsLoading, setLogsLoading] = useState(false);
+  const [events, setEvents] = useState<ModelEvent[]>([]);
+  const [eventsLoading, setEventsLoading] = useState(false);
+  const [rightTab, setRightTab] = useState<"logs" | "events">("logs");
   const stopModel = useAppStore((s) => s.stopModel);
   const startModel = useAppStore((s) => s.startModel);
   const restartModel = useAppStore((s) => s.restartModel);
@@ -39,6 +43,23 @@ export function ModelDetail({ item, onClose }: { item: ExtendedWorkload; onClose
     const interval = isActive ? setInterval(() => void fetchLogs(), 3000) : undefined;
     return () => { cancelled = true; clearInterval(interval); };
   }, [item.id, isActive]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const fetchEvents = async () => {
+      setEventsLoading(true);
+      try {
+        const res = await getModelEvents(item.id, { limit: 200 });
+        if (!cancelled) setEvents(res.events);
+      } catch {
+        if (!cancelled) setEvents([]);
+      } finally {
+        if (!cancelled) setEventsLoading(false);
+      }
+    };
+    void fetchEvents();
+    return () => { cancelled = true; };
+  }, [item.id]);
 
   const color = EXTENDED_WORKLOAD_COLORS[item.type] ?? "#6B7280";
 
@@ -114,37 +135,93 @@ export function ModelDetail({ item, onClose }: { item: ExtendedWorkload; onClose
             </div>
           </div>
 
-          {/* Right: log viewer */}
+          {/* Right: logs / events */}
           <div className="flex-1 min-w-0 flex flex-col">
-            <div className="flex items-center gap-2 px-3 py-1.5 border-b border-line shrink-0">
-              <Terminal size={11} className="text-faint" />
-              <span className="text-[10px] font-semibold text-muted-foreground font-display uppercase tracking-wider">Log Output</span>
-              {isActive && <span className="w-1.5 h-1.5 rounded-full bg-success animate-pulse" />}
-            </div>
-            <ScrollArea className="h-70 bg-background">
-              <div className="p-3">
-                {logsLoading && logs.length === 0 ? (
-                  <div className="text-[11px] text-faint animate-pulse">Loading logs...</div>
-                ) : logs.length === 0 ? (
-                  <div className="text-[11px] text-faint">No log output yet</div>
-                ) : (
-                  <pre className="text-[11px] leading-[1.6] text-muted-foreground font-mono whitespace-pre-wrap break-all">
-                    {logs.map((line, i) => (
-                      <div
-                        key={i}
-                        className={
-                          line.startsWith("ERROR:") ? "text-destructive font-semibold" :
-                          line.startsWith("Warning:") ? "text-[#F59E0B]" :
-                          ""
-                        }
-                      >
-                        {line}
-                      </div>
-                    ))}
-                  </pre>
+            <div className="flex items-center gap-3 px-3 py-1.5 border-b border-line shrink-0">
+              <button
+                type="button"
+                onClick={() => setRightTab("logs")}
+                className="flex items-center gap-1.5 cursor-pointer"
+                style={{ opacity: rightTab === "logs" ? 1 : 0.45 }}
+              >
+                <Terminal size={11} className="text-faint" />
+                <span className="text-[10px] font-semibold text-muted-foreground font-display uppercase tracking-wider">Logs</span>
+                {isActive && rightTab === "logs" && <span className="w-1.5 h-1.5 rounded-full bg-success animate-pulse" />}
+              </button>
+              <button
+                type="button"
+                onClick={() => setRightTab("events")}
+                className="flex items-center gap-1.5 cursor-pointer"
+                style={{ opacity: rightTab === "events" ? 1 : 0.45 }}
+              >
+                <CalendarClock size={11} className="text-faint" />
+                <span className="text-[10px] font-semibold text-muted-foreground font-display uppercase tracking-wider">Events</span>
+                {events.length > 0 && (
+                  <span className="text-[9px] px-1 rounded bg-muted text-faint">{events.length}</span>
                 )}
-              </div>
-            </ScrollArea>
+              </button>
+            </div>
+
+            {rightTab === "logs" ? (
+              <ScrollArea className="h-70 bg-background">
+                <div className="p-3">
+                  {logsLoading && logs.length === 0 ? (
+                    <div className="text-[11px] text-faint animate-pulse">Loading logs...</div>
+                  ) : logs.length === 0 ? (
+                    <div className="text-[11px] text-faint">No log output yet</div>
+                  ) : (
+                    <pre className="text-[11px] leading-[1.6] text-muted-foreground font-mono whitespace-pre-wrap break-all">
+                      {logs.map((line, i) => (
+                        <div
+                          key={i}
+                          className={
+                            line.startsWith("ERROR:") ? "text-destructive font-semibold" :
+                            line.startsWith("Warning:") ? "text-[#F59E0B]" :
+                            ""
+                          }
+                        >
+                          {line}
+                        </div>
+                      ))}
+                    </pre>
+                  )}
+                </div>
+              </ScrollArea>
+            ) : (
+              <ScrollArea className="h-70 bg-background">
+                <div className="p-3">
+                  {eventsLoading && events.length === 0 ? (
+                    <div className="text-[11px] text-faint animate-pulse">Loading events...</div>
+                  ) : events.length === 0 ? (
+                    <div className="text-[11px] text-faint">No events recorded</div>
+                  ) : (
+                    <div className="space-y-1.5">
+                      {events.map((ev, i) => (
+                        <div key={i} className="flex items-start gap-2 text-[11px]">
+                          <span className="shrink-0 text-faint tabular-nums">
+                            {new Date(ev.time).toLocaleString(undefined, {
+                              month: "short", day: "numeric",
+                              hour: "2-digit", minute: "2-digit", second: "2-digit",
+                            })}
+                          </span>
+                          <span
+                            className="shrink-0 text-[9px] px-1 py-0.5 rounded font-medium uppercase border"
+                            style={{
+                              color: ev.type === "job" ? "#3B82F6" : ev.type === "run" ? "#8B5CF6" : "var(--faint)",
+                              background: ev.type === "job" ? "#3B82F610" : ev.type === "run" ? "#8B5CF610" : "var(--muted)",
+                              borderColor: ev.type === "job" ? "#3B82F620" : ev.type === "run" ? "#8B5CF620" : "var(--border)",
+                            }}
+                          >
+                            {ev.type}
+                          </span>
+                          <span className="text-muted-foreground">{ev.text}</span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              </ScrollArea>
+            )}
           </div>
         </div>
       </div>

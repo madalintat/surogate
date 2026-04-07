@@ -322,6 +322,34 @@ export async function getModelLogs(
   return (await response.json()) as ModelLogsResponse;
 }
 
+// ── Events ──────────────────────────────────────────────────
+
+export interface ModelEvent {
+  time: string;
+  text: string;
+  type: string;
+}
+
+export interface ModelEventsResponse {
+  model_id: string;
+  events: ModelEvent[];
+}
+
+export async function getModelEvents(
+  modelId: string,
+  params?: { limit?: number },
+): Promise<ModelEventsResponse> {
+  const qs = new URLSearchParams();
+  if (params?.limit != null) qs.set("limit", String(params.limit));
+  const url = `/api/models/${modelId}/events${qs.toString() ? `?${qs}` : ""}`;
+  const response = await authFetch(url);
+  if (!response.ok) {
+    const err = (await response.json().catch(() => null)) as { detail?: string } | null;
+    throw new Error(err?.detail ?? "Failed to get model events");
+  }
+  return (await response.json()) as ModelEventsResponse;
+}
+
 export async function deleteModel(modelId: string): Promise<void> {
   const response = await authFetch(`/api/models/${modelId}`, {
     method: "DELETE",

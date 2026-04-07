@@ -153,3 +153,8 @@ class DeployedModelListResponse(BaseModel):
 class ModelLogsResponse(BaseModel):
     model_id: str
     lines: list[str]
+
+
+class ModelEventsResponse(BaseModel):
+    model_id: str
+    events: list[EventInfo]

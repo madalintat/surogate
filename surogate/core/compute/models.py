@@ -578,6 +578,32 @@ async def get_model_logs(
     return {"model_id": model_id, "lines": lines}
 
 
+async def get_model_events(
+    session: AsyncSession,
+    model_id: str,
+    *,
+    limit: int = 100,
+) -> dict:
+    """Fetch dstack events for a deployed model's serving service."""
+    m = await repo.get_deployed_model(session, model_id)
+    if m is None:
+        raise ValueError(f"Model {model_id} not found")
+    if not m.serving_service_id:
+        return {"model_id": model_id, "events": []}
+
+    svc = await repo.get_serving_service(session, m.serving_service_id)
+    if svc is None:
+        return {"model_id": model_id, "events": []}
+
+    if not svc.dstack_run_name or not svc.dstack_project_name:
+        return {"model_id": model_id, "events": []}
+
+    events = await dstack_service.get_run_events(
+        svc.dstack_run_name, svc.dstack_project_name, limit=limit,
+    )
+    return {"model_id": model_id, "events": events}
+
+
 async def delete_model(session: AsyncSession, model_id: str) -> None:
     """Delete the model and its ServingService, tearing down dstack in the background."""
     m = await repo.get_deployed_model(session, model_id)
