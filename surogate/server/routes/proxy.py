@@ -38,6 +38,7 @@ from dstack._internal.utils.common import concat_url_path
 
 from surogate.core.db.engine import get_session_factory
 from surogate.server.services.trace import record_turn
+from surogate.server.services.metrics import record_metric
 from surogate.utils.logger import get_logger
 
 logger = get_logger()
@@ -195,10 +196,20 @@ async def _proxy_chat_completion(
             "chat_completion timeout request_id=%s project=%s service=%s",
             request_id, project_name, run_name,
         )
+        _schedule_record_metric(
+            project_name=project_name, run_name=run_name, model=model_name,
+            latency_ms=(time.monotonic() - t0) * 1000,
+            status_code=504, is_streaming=is_streaming,
+        )
         raise ProxyError("Timed out requesting upstream", status.HTTP_504_GATEWAY_TIMEOUT)
     except httpx.RequestError as exc:
         logger.warning(
             "chat_completion upstream_error request_id=%s error=%r", request_id, exc,
+        )
+        _schedule_record_metric(
+            project_name=project_name, run_name=run_name, model=model_name,
+            latency_ms=(time.monotonic() - t0) * 1000,
+            status_code=502, is_streaming=is_streaming,
         )
         raise ProxyError("Error requesting upstream", status.HTTP_502_BAD_GATEWAY)
 
@@ -217,10 +228,28 @@ async def _proxy_chat_completion(
     elapsed_ms = (time.monotonic() - t0) * 1000
 
     resp_json = _parse_json(resp_body)
-    usage = resp_json.get("usage", {}) if resp_json else {}
     assistant_reply = _extract_assistant_message(resp_json)
 
-    _log_chat_response(request_id, project_name, run_name, model_name, resp_body, elapsed_ms)
+    prompt_tokens = _estimate_prompt_tokens(messages)
+    completion_tokens = _count_response_completion_tokens(resp_json)
+    usage = {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": prompt_tokens + completion_tokens,
+    }
+
+    # Record metric (fire-and-forget)
+    _schedule_record_metric(
+        project_name=project_name,
+        run_name=run_name,
+        model=model_name,
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        total_tokens=prompt_tokens + completion_tokens,
+        latency_ms=elapsed_ms,
+        status_code=upstream_resp.status_code,
+        is_streaming=False,
+    )
 
     # Record turn (fire-and-forget in background)
     if messages and assistant_reply:
@@ -278,16 +307,35 @@ async def _stream_chat_response(
     except httpx.RequestError:
         pass
 
-    _log_chat_stream_done(request_id, project_name, run_name, model_name, chunks, elapsed_ms)
-
     # Reconstruct assistant reply from SSE deltas and record the turn
-    usage = _extract_stream_usage(chunks)
     assistant_reply = _assemble_stream_reply(chunks)
+
+    prompt_tokens = _estimate_prompt_tokens(messages)
+    completion_tokens = _count_stream_completion_tokens(chunks)
+    usage = {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": prompt_tokens + completion_tokens,
+    }
+
+    # Record metric (fire-and-forget)
+    _schedule_record_metric(
+        project_name=project_name,
+        run_name=run_name,
+        model=model_name,
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        total_tokens=prompt_tokens + completion_tokens,
+        latency_ms=elapsed_ms,
+        status_code=response.status_code,
+        is_streaming=True,
+    )
+
     if messages and assistant_reply:
         # Build a synthetic response body so the detail view can show messages
         synthetic_resp = {
             "choices": [{"index": 0, "message": assistant_reply, "finish_reason": "stop"}],
-            "usage": usage or None,
+            "usage": usage,
         }
         _schedule_record_turn(
             messages=messages,
@@ -373,63 +421,39 @@ class _FastAPIBodyAdaptor:
 
 
 # ---------------------------------------------------------------------------
-# Observability logging
+# Token counting (backend-independent)
 # ---------------------------------------------------------------------------
 
-def _log_chat_response(
-    request_id: str,
-    project_name: str,
-    run_name: str,
-    model_name: str,
-    resp_body: bytes,
-    elapsed_ms: float,
-) -> None:
-    usage = _extract_usage(resp_body)
-    logger.info(
-        "chat_completion done request_id=%s project=%s service=%s model=%s "
-        "prompt_tokens=%s completion_tokens=%s total_tokens=%s latency_ms=%.1f",
-        request_id, project_name, run_name, model_name,
-        usage.get("prompt_tokens", "?"),
-        usage.get("completion_tokens", "?"),
-        usage.get("total_tokens", "?"),
-        elapsed_ms,
-    )
+def _estimate_prompt_tokens(messages: list[dict]) -> int:
+    """Estimate prompt token count from the chat messages.
+
+    Uses a ~4 chars/token heuristic which is reasonable across most
+    LLM tokenizers (BPE averages 3.5–4.5 chars/token for English).
+    """
+    total_chars = 0
+    for msg in messages:
+        content = msg.get("content", "")
+        if isinstance(content, str):
+            total_chars += len(content)
+        elif isinstance(content, list):
+            # Multimodal messages: list of content parts
+            for part in content:
+                if isinstance(part, dict):
+                    total_chars += len(part.get("text", ""))
+        # Count role/name overhead (~4 tokens per message for framing)
+        total_chars += 16
+    return max(1, total_chars // 4)
 
 
-def _log_chat_stream_done(
-    request_id: str,
-    project_name: str,
-    run_name: str,
-    model_name: str,
-    chunks: list[bytes],
-    elapsed_ms: float,
-) -> None:
-    # Try to extract usage from the final SSE chunk (vLLM / OpenAI include it)
-    usage = _extract_stream_usage(chunks)
-    logger.info(
-        "chat_completion stream_done request_id=%s project=%s service=%s model=%s "
-        "prompt_tokens=%s completion_tokens=%s total_tokens=%s latency_ms=%.1f",
-        request_id, project_name, run_name, model_name,
-        usage.get("prompt_tokens", "?"),
-        usage.get("completion_tokens", "?"),
-        usage.get("total_tokens", "?"),
-        elapsed_ms,
-    )
+def _count_stream_completion_tokens(chunks: list[bytes]) -> int:
+    """Count completion tokens by counting SSE content deltas.
 
-
-def _extract_usage(resp_body: bytes) -> dict:
-    """Extract usage from a non-streaming chat completion response."""
-    try:
-        data = json.loads(resp_body)
-        return data.get("usage", {})
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        return {}
-
-
-def _extract_stream_usage(chunks: list[bytes]) -> dict:
-    """Extract usage from SSE stream (typically in the last data chunk)."""
+    Each SSE delta with a non-empty ``content`` or ``reasoning_content``
+    field corresponds to one token emitted by the model.
+    """
     raw = b"".join(chunks).decode("utf-8", errors="replace")
-    for line in reversed(raw.splitlines()):
+    count = 0
+    for line in raw.splitlines():
         line = line.strip()
         if not line.startswith("data:"):
             continue
@@ -438,12 +462,33 @@ def _extract_stream_usage(chunks: list[bytes]) -> dict:
             continue
         try:
             obj = json.loads(payload)
-            usage = obj.get("usage")
-            if usage:
-                return usage
         except (json.JSONDecodeError, ValueError):
             continue
-    return {}
+        for choice in obj.get("choices", []):
+            delta = choice.get("delta", {})
+            if delta.get("content"):
+                count += 1
+            if delta.get("reasoning_content"):
+                count += 1
+    return max(1, count) if count > 0 else 0
+
+
+def _count_response_completion_tokens(resp_json: Optional[dict]) -> int:
+    """Count completion tokens from a non-streaming response body."""
+    if not resp_json:
+        return 0
+    choices = resp_json.get("choices", [])
+    if not choices:
+        return 0
+    msg = choices[0].get("message", {})
+    total_chars = 0
+    content = msg.get("content", "")
+    if content:
+        total_chars += len(content)
+    reasoning = msg.get("reasoning_content", "")
+    if reasoning:
+        total_chars += len(reasoning)
+    return max(1, total_chars // 4) if total_chars > 0 else 0
 
 
 # ---------------------------------------------------------------------------
@@ -554,3 +599,17 @@ async def _do_record_turn(**kwargs: Any) -> None:
             await record_turn(session, **kwargs)
     except Exception:
         logger.warning("failed to record chat turn", exc_info=True)
+
+
+def _schedule_record_metric(**kwargs: Any) -> None:
+    """Fire-and-forget: record a ModelMetric in the background."""
+    asyncio.create_task(_do_record_metric(**kwargs))
+
+
+async def _do_record_metric(**kwargs: Any) -> None:
+    try:
+        factory = get_session_factory()
+        async with factory() as session:
+            await record_metric(session, **kwargs)
+    except Exception:
+        logger.warning("failed to record model metric", exc_info=True)

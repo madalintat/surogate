@@ -1,10 +1,13 @@
 // Copyright (c) 2026, Invergent SA, developed by Flavius Burca
 // SPDX-License-Identifier: AGPL-3.0-only
 //
+import { useEffect, useState } from "react";
 import { Sparkline } from "@/components/ui/sparkline";
+import { Skeleton } from "@/components/ui/skeleton";
 import { StatusDot } from "@/components/ui/status-dot";
 import { toStatus } from "./models-data";
 import type { Model } from "./models-data";
+import { getMetrics, getMetricsSummary, type MetricsBucket, type MetricsSummary } from "@/api/metrics";
 
 // ── Gauge ring (SVG donut) ─────────────────────────────────────
 
@@ -76,9 +79,36 @@ function GaugeRing({
   );
 }
 
+function sparkData(data: number[]): number[] {
+  return data.length === 1 ? [data[0], data[0]] : data;
+}
+
 // ── Overview tab ───────────────────────────────────────────────
 
 export function OverviewTab({ model }: { model: Model }) {
+  const [buckets, setBuckets] = useState<MetricsBucket[]>([]);
+  const [summary, setSummary] = useState<MetricsSummary | null>(null);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    Promise.all([
+      getMetrics({ model: model.name, period: "hour" }),
+      getMetricsSummary({ model: model.name, hours: 24 }),
+    ]).then(([m, s]) => {
+      if (cancelled) return;
+      setBuckets(m.buckets);
+      setSummary(s);
+      setLoading(false);
+    }).catch(() => { if (!cancelled) setLoading(false); });
+    return () => { cancelled = true; };
+  }, [model.name]);
+
+  const tpsSpark = buckets.map(b => b.tokens_per_sec);
+  const latencySpark = buckets.map(b => b.avg_latency_ms);
+  const reqSpark = buckets.map(b => b.request_count);
+
   return (
     <div className="animate-in fade-in duration-150">
       {/* Key metrics */}
@@ -86,33 +116,30 @@ export function OverviewTab({ model }: { model: Model }) {
         {[
           {
             label: "Throughput",
-            value: model.tps > 0 ? model.tps.toLocaleString() : "\u2014",
+            value: summary ? summary.tokens_per_sec.toFixed(1) : "\u2014",
             unit: "tok/s",
-            spark: model.metricsHistory.tps,
+            spark: tpsSpark,
             color: "#22C55E",
           },
           {
-            label: "P99 Latency",
-            value: model.p99,
-            unit: "",
-            spark: model.metricsHistory.latency,
+            label: "Avg Latency",
+            value: summary ? `${summary.avg_latency_ms.toFixed(0)}` : "\u2014",
+            unit: "ms",
+            spark: latencySpark,
             color: "#3B82F6",
           },
           {
             label: "Queue Depth",
             value: model.queueDepth,
             unit: "reqs",
-            spark: model.metricsHistory.queue,
+            spark: [],
             color: "#F59E0B",
           },
           {
             label: "Requests (24h)",
-            value:
-              model.requests24h > 0
-                ? model.requests24h.toLocaleString()
-                : "0",
+            value: summary ? summary.request_count.toLocaleString() : "0",
             unit: "",
-            spark: model.metricsHistory.tps,
+            spark: reqSpark,
             color: "#8B5CF6",
           },
         ].map((m) => (
@@ -124,16 +151,22 @@ export function OverviewTab({ model }: { model: Model }) {
               <div className="text-[9px] text-muted-foreground/50 uppercase tracking-wide mb-1 font-display">
                 {m.label}
               </div>
-              <div className="text-xl font-bold text-foreground tracking-tight">
-                {m.value}{" "}
-                {m.unit && (
-                  <span className="text-[10px] text-muted-foreground font-normal">
-                    {m.unit}
-                  </span>
-                )}
-              </div>
+              {loading ? (
+                <Skeleton className="h-6 w-16 rounded" />
+              ) : (
+                <div className="text-xl font-bold text-foreground tracking-tight">
+                  {m.value}{" "}
+                  {m.unit && (
+                    <span className="text-[10px] text-muted-foreground font-normal">
+                      {m.unit}
+                    </span>
+                  )}
+                </div>
+              )}
             </div>
-            <Sparkline data={m.spark} color={m.color} height={28} width={70} />
+            {m.spark.length > 0 && (
+              <Sparkline data={sparkData(m.spark)} color={m.color} height={28} width={70} />
+            )}
           </div>
         ))}
       </div>
@@ -216,7 +249,7 @@ export function OverviewTab({ model }: { model: Model }) {
                 },
                 { label: "Namespace", value: model.namespace },
                 { label: "Uptime", value: model.uptime },
-                { label: "Error Rate", value: model.errorRate },
+                { label: "Error Rate", value: summary ? `${((1 - summary.success_rate) * 100).toFixed(1)}%` : model.errorRate },
                 { label: "Last Deploy", value: model.lastDeployed },
                 { label: "By", value: model.deployedBy },
               ].map((f) => (
@@ -275,27 +308,34 @@ export function OverviewTab({ model }: { model: Model }) {
             <div className="text-xs font-semibold text-foreground font-display mb-3">
               Tokens (24h)
             </div>
-            <div className="flex justify-between items-center">
-              <div className="text-center">
-                <div className="text-lg font-bold text-green-500 tracking-tight">
-                  {model.tokensIn24h}
+            {loading ? (
+              <div className="flex justify-between items-center">
+                <Skeleton className="h-8 w-20 rounded" />
+                <Skeleton className="h-8 w-20 rounded" />
+              </div>
+            ) : (
+              <div className="flex justify-between items-center">
+                <div className="text-center">
+                  <div className="text-lg font-bold text-green-500 tracking-tight">
+                    {summary ? summary.total_prompt_tokens.toLocaleString() : "0"}
+                  </div>
+                  <div className="text-[9px] text-muted-foreground/40 mt-0.5 font-display">
+                    Input
+                  </div>
                 </div>
-                <div className="text-[9px] text-muted-foreground/40 mt-0.5 font-display">
-                  Input
+                <div className="text-muted-foreground/20 text-base">
+                  &rarr;
+                </div>
+                <div className="text-center">
+                  <div className="text-lg font-bold text-blue-500 tracking-tight">
+                    {summary ? summary.total_completion_tokens.toLocaleString() : "0"}
+                  </div>
+                  <div className="text-[9px] text-muted-foreground/40 mt-0.5 font-display">
+                    Output
+                  </div>
                 </div>
               </div>
-              <div className="text-muted-foreground/20 text-base">
-                &rarr;
-              </div>
-              <div className="text-center">
-                <div className="text-lg font-bold text-blue-500 tracking-tight">
-                  {model.tokensOut24h}
-                </div>
-                <div className="text-[9px] text-muted-foreground/40 mt-0.5 font-display">
-                  Output
-                </div>
-              </div>
-            </div>
+            )}
           </section>
 
           {/* Model Card */}
