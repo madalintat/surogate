@@ -100,6 +100,8 @@ async def update_model(
         serving_config=req.serving_config,
         generation_defaults=req.generation_defaults,
         infra=req.infra,
+        instance_type=req.instance_type,
+        region=req.region,
         accelerators=req.accelerators,
         use_spot=req.use_spot,
     )

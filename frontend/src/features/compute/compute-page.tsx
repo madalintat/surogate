@@ -11,7 +11,6 @@ import {
 } from "@/components/ui/dialog";
 import { Plus } from "lucide-react";
 import { useAppStore } from "@/stores/app-store";
-import { CLOUD_INSTANCES } from "./compute-data";
 import { AddCloudCard } from "./add-cloud-card";
 
 const TAB_ROUTES: Record<string, string> = {
@@ -35,14 +34,18 @@ export function ComputePage() {
 
   const k8sNodes = useAppStore((s) => s.k8sNodes);
   const fetchK8Nodes = useAppStore((s) => s.fetchK8Nodes);
+  const cloudInstances = useAppStore((s) => s.cloudInstances);
+  const fetchCloudInstances = useAppStore((s) => s.fetchCloudInstances);
   useEffect(() => {
     void fetchK8Nodes();
-  }, [fetchK8Nodes]);
+    void fetchCloudInstances();
+  }, [fetchK8Nodes, fetchCloudInstances]);
 
   const totalGpu = k8sNodes.reduce((s, n) => s + n.accelerator_count, 0);
   const usedGpu = totalGpu - k8sNodes.reduce((s, n) => s + n.accelerator_available, 0);
-  const runningCloud = CLOUD_INSTANCES.filter((c) => c.status === "running").length;
-  const cloudCost = CLOUD_INSTANCES.filter((c) => c.status === "running").reduce((s, c) => s + c.costPerHour, 0);
+  const activeInstances = cloudInstances.filter((c) => c.status === "idle" || c.status === "busy");
+  const runningCloud = activeInstances.length;
+  const cloudCost = cloudInstances.reduce((s, c) => s + c.cost_per_hour, 0);
 
   return (
     <div className="flex-1 flex flex-col overflow-hidden bg-background">

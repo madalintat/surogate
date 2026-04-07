@@ -6,22 +6,26 @@ import { Card } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { StatusDot } from "@/components/ui/status-dot";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
-import { CLOUD_INSTANCES, PROVIDER_COLORS, SUPPORTED_PROVIDERS } from "./compute-data";
+import { PROVIDER_COLORS, SUPPORTED_PROVIDERS } from "./compute-data";
 import { AddCloudCard } from "./add-cloud-card";
 import { useAppStore } from "@/stores/app-store";
 import { useNavigate } from "@tanstack/react-router";
 import { Trash2 } from "lucide-react";
 
 export function CloudTab() {
-  const cloudHourlyCost = CLOUD_INSTANCES.filter(c => c.status === "running").reduce((s, c) => s + c.costPerHour, 0);
   const backends = useAppStore((s) => s.cloudBackends);
   const fetchBackends = useAppStore((s) => s.fetchCloudBackends);
+  const cloudInstances = useAppStore((s) => s.cloudInstances);
+  const fetchCloudInstances = useAppStore((s) => s.fetchCloudInstances);
+  const terminateInstance = useAppStore((s) => s.terminateCloudInstance);
   const deleteBackend = useAppStore((s) => s.deleteCloudBackend);
   const activeProjectId = useAppStore((s) => s.activeProjectId);
   const navigate = useNavigate();
   const [deleteTarget, setDeleteTarget] = useState<string | null>(null);
 
-  useEffect(() => { fetchBackends(); }, [activeProjectId, fetchBackends]);
+  useEffect(() => { fetchBackends(); fetchCloudInstances(); }, [activeProjectId, fetchBackends, fetchCloudInstances]);
+
+  const cloudHourlyCost = cloudInstances.reduce((s, c) => s + c.cost_per_hour, 0);
 
   // Exclude kubernetes — that's the local cluster, not a cloud backend
   const cloudBackends = backends.filter(b => b.type !== "kubernetes");
@@ -95,32 +99,47 @@ export function CloudTab() {
           <span className="text-sm font-semibold text-foreground font-display">Active Cloud Instances</span>
           <span className="text-sm" style={{ color: "#F59E0B" }}>Total: ${cloudHourlyCost.toFixed(2)}/hr</span>
         </div>
-        {CLOUD_INSTANCES.map(inst => (
-          <div key={inst.id} className="px-4 py-3.5 border-b border-line last:border-0 flex items-start justify-between">
-            <div>
-              <div className="flex items-center gap-2 mb-1">
-                <StatusDot status={inst.status === "running" ? "running" : "deploying"} />
-                <span className="text-sm font-semibold text-foreground">{inst.workload}</span>
-                {inst.status === "provisioning" && (
-                  <span className="text-[10px] px-1.5 py-px rounded bg-[#06B6D412] text-[#06B6D4] animate-pulse">PROVISIONING</span>
-                )}
+        {cloudInstances.length === 0 && (
+          <div className="px-4 py-6 text-center text-sm text-faint">No active cloud instances</div>
+        )}
+        {cloudInstances.map(inst => {
+          const isRunning = inst.status === "idle" || inst.status === "busy";
+          return (
+            <div key={inst.id} className="px-4 py-3.5 border-b border-line last:border-0 flex items-start justify-between">
+              <div>
+                <div className="flex items-center gap-2 mb-1">
+                  <StatusDot status={isRunning ? "running" : "deploying"} />
+                  <span className="text-sm font-semibold text-foreground">{inst.workload || inst.name}</span>
+                  {inst.status === "provisioning" && (
+                    <span className="text-[10px] px-1.5 py-px rounded bg-[#06B6D412] text-[#06B6D4] animate-pulse">PROVISIONING</span>
+                  )}
+                  {inst.status === "pending" && (
+                    <span className="text-[10px] px-1.5 py-px rounded bg-[#F59E0B12] text-[#F59E0B] animate-pulse">PENDING</span>
+                  )}
+                </div>
+                <div className="flex gap-3 text-[11px] text-faint">
+                  <span style={{ color: PROVIDER_COLORS[inst.provider] }}>{inst.provider.toUpperCase()} · {inst.region}</span>
+                  {inst.instance_type && <span>{inst.instance_type}</span>}
+                  {inst.gpu && <span>{inst.gpu}</span>}
+                  {inst.spot_instance && <span className="text-success">Spot</span>}
+                  {inst.started_at && <span>started {new Date(inst.started_at).toLocaleString()}</span>}
+                </div>
               </div>
-              <div className="flex gap-3 text-[11px] text-faint">
-                <span style={{ color: PROVIDER_COLORS[inst.provider] }}>{inst.provider.toUpperCase()} · {inst.region}</span>
-                <span>{inst.type}</span>
-                <span>{inst.gpu}</span>
-                {inst.spotInstance && <span className="text-success">Spot (\u2013{inst.spotSavings})</span>}
-                <span>started {inst.startedAt}</span>
+              <div className="text-right shrink-0">
+                <div className="text-lg font-bold" style={{ color: "#F59E0B" }}>${inst.cost_per_hour}/hr</div>
+                {inst.estimated_total > 0 && <div className="text-[11px] text-faint">est: ${inst.estimated_total.toFixed(0)} total</div>}
+                <Button
+                  variant="outline"
+                  size="xs"
+                  className="mt-1.5 text-destructive border-destructive/30"
+                  onClick={() => terminateInstance(inst.id, inst.project_name)}
+                >
+                  Terminate
+                </Button>
               </div>
             </div>
-            <div className="text-right shrink-0">
-              <div className="text-lg font-bold" style={{ color: "#F59E0B" }}>${inst.costPerHour}/hr</div>
-              {inst.estimatedTotal > 0 && <div className="text-[11px] text-faint">est: ${inst.estimatedTotal.toFixed(0)} total</div>}
-              {inst.autoTerminate && <div className="text-[11px] text-destructive mt-0.5">auto-terminate: {inst.autoTerminate}</div>}
-              <Button variant="outline" size="xs" className="mt-1.5 text-destructive border-destructive/30">Terminate</Button>
-            </div>
-          </div>
-        ))}
+          );
+        })}
       </Card>
 
       {/* Supported cloud providers */}

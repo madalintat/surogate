@@ -83,7 +83,7 @@ export function TaskDetail({ item, onClose }: { item: ExtendedWorkload; onClose:
             <div className="grid grid-cols-2 gap-x-4 gap-y-2.5">
               <InfoRow icon={Folder} label="Project" value={item.project} />
               <InfoRow icon={User} label="Requested by" value={item.requestedBy} />
-              <InfoRow icon={MapPin} label="Location" value={item.location === "aws" ? "AWS Cloud" : "Local"} />
+              <InfoRow icon={MapPin} label="Location" value="Local" />
               <InfoRow icon={Cpu} label="GPU" value={item.gpu} />
               {item.node !== "\u2014" && <InfoRow icon={ChevronRight} label="Node" value={item.node} />}
               {item.startedAt && <InfoRow icon={Clock} label="Started" value={item.startedAt} />}

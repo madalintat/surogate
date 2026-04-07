@@ -161,7 +161,7 @@ export function ConfigTab({ model }: { model: Model }) {
 
   const handleSave = async () => {
     setSaving(true);
-    const acc = computeIdx === 1 && selectedOffer
+    const acc = computeIdx === 1 && selectedOffer && selectedOffer.gpu_name
       ? `${selectedOffer.gpu_name}:${selectedOffer.gpu_count}`
       : computeIdx === 0
         ? `GPU:${localGpuCount}`
@@ -170,6 +170,8 @@ export function ConfigTab({ model }: { model: Model }) {
       engine: engine || undefined,
       accelerators: acc,
       infra: computeIdx === 1 ? (cloud || undefined) : "k8s",
+      instance_type: computeIdx === 1 && selectedOffer ? selectedOffer.instance : undefined,
+      region: computeIdx === 1 && selectedOffer ? selectedOffer.region : undefined,
       use_spot: selectedOffer?.spot ?? false,
       serving_config: Object.keys(editedServing).length > 0 ? editedServing : undefined,
       generation_defaults: Object.keys(editedGen).length > 0 ? editedGen : undefined,

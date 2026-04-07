@@ -253,6 +253,12 @@ class ServingService(UUIDMixin, Base):
     infra: Mapped[Optional[str]] = mapped_column(
         sa.String(128), nullable=True
     )
+    instance_type: Mapped[Optional[str]] = mapped_column(
+        sa.String(128), nullable=True
+    )
+    region: Mapped[Optional[str]] = mapped_column(
+        sa.String(128), nullable=True
+    )
     use_spot: Mapped[bool] = mapped_column(sa.Boolean, default=False)
     replicas: Mapped[int] = mapped_column(sa.Integer, default=1)
     readiness_path: Mapped[Optional[str]] = mapped_column(

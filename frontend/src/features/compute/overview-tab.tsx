@@ -6,7 +6,7 @@ import { ProgressBar } from "@/components/ui/progress-bar";
 import { StatusDot } from "@/components/ui/status-dot";
 import { useAppStore } from "@/stores/app-store";
 import {
-  CLOUD_INSTANCES, CLOUD_ACCOUNTS,
+  CLOUD_ACCOUNTS,
   PROVIDER_COLORS,
 } from "./compute-data";
 import { useWorkloadItems } from "./use-workload-items";
@@ -14,13 +14,14 @@ import { statusForDot } from "./detail-shared";
 
 export function OverviewTab() {
   const k8sNodes = useAppStore((s) => s.k8sNodes);
+  const cloudInstances = useAppStore((s) => s.cloudInstances);
   const workloads = useWorkloadItems();
 
   const totalLocalGpu = k8sNodes.reduce((s, n) => s + n.accelerator_count, 0);
   const usedLocalGpu = totalLocalGpu - k8sNodes.reduce((s, n) => s + n.accelerator_available, 0);
   const readyNodes = k8sNodes.filter((n) => n.is_ready).length;
-  const totalCloudGpu = CLOUD_INSTANCES.reduce((s, c) => s + parseInt(c.gpu), 0);
-  const cloudHourlyCost = CLOUD_INSTANCES.filter(c => c.status === "running").reduce((s, c) => s + c.costPerHour, 0);
+  const activeInstances = cloudInstances.filter(c => c.status === "idle" || c.status === "busy");
+  const cloudHourlyCost = cloudInstances.reduce((s, c) => s + c.cost_per_hour, 0);
   const monthlySpend = CLOUD_ACCOUNTS.reduce((s, a) => s + a.monthlySpend, 0);
   const monthlyBudget = CLOUD_ACCOUNTS.reduce((s, a) => s + a.monthlyBudget, 0);
 
@@ -29,11 +30,11 @@ export function OverviewTab() {
 
   const kpis = [
     { label: "Local GPUs", value: `${usedLocalGpu}/${totalLocalGpu}`, sub: `${readyNodes} nodes` },
-    { label: "Cloud GPUs", value: totalCloudGpu, sub: `${CLOUD_INSTANCES.filter(c => c.status === "running").length} instances` },
+    { label: "Cloud Instances", value: activeInstances.length, sub: `${cloudInstances.length} total` },
     { label: "Queue Depth", value: queued, sub: `${running} running` },
     { label: "Cloud $/hr", value: `$${cloudHourlyCost.toFixed(0)}`, sub: "active instances" },
     { label: "Monthly Spend", value: `$${(monthlySpend / 1000).toFixed(1)}K`, sub: `of $${(monthlyBudget / 1000).toFixed(0)}K budget` },
-    { label: "Spot Savings", value: "61%", sub: "vs on-demand" },
+    { label: "Spot Savings", value: "\u2014", sub: "" },
   ];
 
   return (
@@ -120,30 +121,31 @@ export function OverviewTab() {
           <Card size="sm">
             <div className="flex items-center gap-2 px-4 py-2.5 border-b border-line">
               <span className="text-sm font-semibold text-foreground font-display">Cloud Instances</span>
-              <span className="text-[11px] px-1.5 py-px rounded bg-muted text-faint">{CLOUD_INSTANCES.length}</span>
+              <span className="text-[11px] px-1.5 py-px rounded bg-muted text-faint">{cloudInstances.length}</span>
             </div>
-            {CLOUD_INSTANCES.map(inst => (
-              <div key={inst.id} className="px-4 py-2.5 border-b border-line last:border-0">
-                <div className="flex items-center justify-between mb-1">
-                  <div className="flex items-center gap-1.5">
-                    <StatusDot status={inst.status === "running" ? "running" : "deploying"} />
-                    <span className="text-sm text-foreground font-medium">{inst.workload}</span>
+            {cloudInstances.length === 0 && (
+              <div className="px-4 py-4 text-center text-[11px] text-faint">No active cloud instances</div>
+            )}
+            {cloudInstances.map(inst => {
+              const isRunning = inst.status === "idle" || inst.status === "busy";
+              return (
+                <div key={inst.id} className="px-4 py-2.5 border-b border-line last:border-0">
+                  <div className="flex items-center justify-between mb-1">
+                    <div className="flex items-center gap-1.5">
+                      <StatusDot status={isRunning ? "running" : "deploying"} />
+                      <span className="text-sm text-foreground font-medium">{inst.workload || inst.name}</span>
+                    </div>
+                    <span className="text-sm font-semibold" style={{ color: "#F59E0B" }}>${inst.cost_per_hour}/hr</span>
                   </div>
-                  <span className="text-sm font-semibold" style={{ color: "#F59E0B" }}>${inst.costPerHour}/hr</span>
-                </div>
-                <div className="flex gap-2 text-[11px] text-faint">
-                  <span style={{ color: PROVIDER_COLORS[inst.provider] }}>{inst.provider.toUpperCase()}</span>
-                  <span>{inst.region}</span>
-                  <span>{inst.gpu}</span>
-                  {inst.spotInstance && <span className="text-success">spot (\u2013{inst.spotSavings})</span>}
-                </div>
-                {inst.autoTerminate && inst.status === "running" && (
-                  <div className="text-[11px] text-faint mt-0.5">
-                    Auto-terminate in <span className="text-primary">{inst.autoTerminate}</span>
+                  <div className="flex gap-2 text-[11px] text-faint">
+                    <span style={{ color: PROVIDER_COLORS[inst.provider] }}>{inst.provider.toUpperCase()}</span>
+                    <span>{inst.region}</span>
+                    {inst.gpu && <span>{inst.gpu}</span>}
+                    {inst.spot_instance && <span className="text-success">spot</span>}
                   </div>
-                )}
-              </div>
-            ))}
+                </div>
+              );
+            })}
           </Card>
 
           {/* Budget gauge */}

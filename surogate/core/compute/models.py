@@ -269,6 +269,8 @@ async def update_model_config(
     serving_config: Optional[dict] = None,
     generation_defaults: Optional[dict] = None,
     infra: Optional[str] = None,
+    instance_type: Optional[str] = None,
+    region: Optional[str] = None,
     accelerators: Optional[str] = None,
     use_spot: Optional[bool] = None,
 ) -> Optional[DeployedModelResponse]:
@@ -292,6 +294,10 @@ async def update_model_config(
     svc_updates: dict = {}
     if infra is not None:
         svc_updates["infra"] = infra
+    if instance_type is not None:
+        svc_updates["instance_type"] = instance_type
+    if region is not None:
+        svc_updates["region"] = region
     if accelerators is not None:
         svc_updates["accelerators"] = accelerators
     if use_spot is not None:
@@ -480,8 +486,6 @@ async def start_model(
     missing: list[str] = []
     if not m.engine:
         missing.append("engine")
-    if not svc.accelerators:
-        missing.append("accelerators (GPU)")
     if not svc.infra:
         missing.append("infra (compute target)")
     if missing:

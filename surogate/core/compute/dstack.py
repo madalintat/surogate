@@ -262,6 +262,9 @@ async def _create_fleet_for_run(
     name: str,
     gpu_spec=None,
     use_spot: bool = False,
+    backends: Optional[list[str]] = None,
+    instance_types: Optional[list[str]] = None,
+    regions: Optional[list[str]] = None,
 ) -> None:
     """Create a fleet tailored to a run's resource requirements.
 
@@ -299,11 +302,19 @@ async def _create_fleet_for_run(
 
     from dstack._internal.core.models.fleets import FleetNodesSpec
 
+    from dstack._internal.core.models.backends.base import BackendType
+
     fleet_config = FleetConfiguration(
         name=name,
         nodes=FleetNodesSpec(min=0, max=1),
         spot_policy=SpotPolicy.SPOT if use_spot else SpotPolicy.ONDEMAND,
     )
+    if backends:
+        fleet_config.backends = [BackendType(b) for b in backends]
+    if instance_types:
+        fleet_config.instance_types = instance_types
+    if regions:
+        fleet_config.regions = regions
     if gpu_spec:
         fleet_config.resources = ResourcesSpec(gpu=gpu_spec)
 
@@ -541,6 +552,7 @@ async def launch_service(
         gateway=False,
         auth=False,
         env=env or {},
+        backends=[svc.infra] if svc.infra else None,
         spot_policy=SpotPolicy.SPOT if svc.use_spot else SpotPolicy.ONDEMAND,
         probes=[ProbeConfig(type="http", url=readiness_probe)],
     )
@@ -559,8 +571,14 @@ async def launch_service(
     try:
         # Create a fleet matching this service's requirements
         fleet_name = _dstack_name(svc.name, prefix="f")
+        fleet_backends = [svc.infra] if svc.infra and svc.infra != "k8s" else None
+        fleet_instance_types = [svc.instance_type] if svc.instance_type else None
+        fleet_regions = [svc.region] if svc.region else None
         await _create_fleet_for_run(
             dstack_project, name=fleet_name, gpu_spec=gpu_spec, use_spot=svc.use_spot,
+            backends=fleet_backends,
+            instance_types=fleet_instance_types,
+            regions=fleet_regions,
         )
 
         async with dstack_session_ctx() as dstack_session:
@@ -766,41 +784,123 @@ async def get_run_events(
 
 
 async def list_instances() -> list[dict]:
-    """List all active dstack instances across all projects."""
+    """List all active dstack instances across all projects with full details."""
+    import json
+    from datetime import datetime, timezone
     from dstack._internal.core.models.instances import InstanceStatus
     from dstack._internal.server.db import get_session_ctx as dstack_session_ctx
-    from dstack._internal.server.models import InstanceModel
+    from dstack._internal.server.models import InstanceModel, JobModel, ProjectModel
 
     try:
         async with dstack_session_ctx() as dstack_session:
-            from sqlalchemy import select
-            stmt = select(InstanceModel).where(
-                InstanceModel.status.notin_([
-                    InstanceStatus.TERMINATED.value,
-                    InstanceStatus.TERMINATING.value,
-                ])
+            # Flat column query — avoids relationship loading issues
+            stmt = (
+                sa.select(
+                    InstanceModel.id,
+                    InstanceModel.name,
+                    InstanceModel.status,
+                    InstanceModel.backend,
+                    InstanceModel.region,
+                    InstanceModel.price,
+                    InstanceModel.offer,
+                    InstanceModel.started_at,
+                    InstanceModel.project_id,
+                )
+                .where(
+                    InstanceModel.deleted == False,
+                    InstanceModel.status.notin_([
+                        InstanceStatus.TERMINATED,
+                        InstanceStatus.TERMINATING,
+                    ]),
+                )
             )
-            result = await dstack_session.execute(stmt)
-            instances = result.scalars().all()
+            rows = (await dstack_session.execute(stmt)).all()
+
+            # Batch-fetch project names
+            project_ids = {r.project_id for r in rows}
+            project_names: dict = {}
+            if project_ids:
+                pstmt = sa.select(ProjectModel.id, ProjectModel.name).where(
+                    ProjectModel.id.in_(project_ids)
+                )
+                for pr in (await dstack_session.execute(pstmt)).all():
+                    project_names[pr.id] = pr.name
+
+            # Batch-fetch workload names (one job per instance)
+            instance_ids = [r.id for r in rows]
+            workload_map: dict = {}
+            if instance_ids:
+                jstmt = (
+                    sa.select(JobModel.instance_id, JobModel.run_name)
+                    .where(JobModel.instance_id.in_(instance_ids))
+                )
+                for jr in (await dstack_session.execute(jstmt)).all():
+                    workload_map.setdefault(jr.instance_id, jr.run_name)
 
             out = []
-            for inst in instances:
+            for r in rows:
+                status = r.status.value if hasattr(r.status, "value") else str(r.status)
+                backend = r.backend.value if r.backend and hasattr(r.backend, "value") else str(r.backend or "")
+
+                # Parse offer JSON for GPU and instance type info
+                gpu_label = ""
+                instance_type = ""
+                spot = False
+                if r.offer:
+                    try:
+                        offer = json.loads(r.offer)
+                        res = offer.get("instance", {}).get("resources", {})
+                        gpus = res.get("gpus", [])
+                        spot = res.get("spot", False)
+                        if gpus:
+                            g = gpus[0]
+                            count = len(gpus)
+                            gpu_label = f"{count}\u00d7 {g.get('name', '?')}"
+                            mem = g.get("memory_mib")
+                            if mem and mem >= 1024:
+                                gpu_label += f" {mem // 1024}GB"
+                        instance_type = offer.get("instance", {}).get("name", "")
+                    except (json.JSONDecodeError, KeyError):
+                        pass
+
+                hours_running = 0.0
+                started_at_str = None
+                if r.started_at:
+                    started = r.started_at.replace(tzinfo=None) if r.started_at.tzinfo else r.started_at
+                    hours_running = (datetime.now(timezone.utc).replace(tzinfo=None) - started).total_seconds() / 3600
+                    started_at_str = r.started_at.isoformat() + ("Z" if not r.started_at.tzinfo else "")
+
+                price = r.price or 0.0
+
                 out.append({
-                    "id": str(inst.id),
-                    "name": inst.name,
-                    "status": inst.status.value if hasattr(inst.status, "value") else str(inst.status),
-                    "project_id": str(inst.project_id),
+                    "id": str(r.id),
+                    "name": r.name,
+                    "provider": backend,
+                    "region": r.region or "",
+                    "instance_type": instance_type,
+                    "gpu": gpu_label,
+                    "status": status,
+                    "workload": workload_map.get(r.id, ""),
+                    "started_at": started_at_str,
+                    "cost_per_hour": round(price, 2),
+                    "estimated_total": round(price * hours_running, 2),
+                    "spot_instance": spot,
+                    "project_id": str(r.project_id),
+                    "project_name": project_names.get(r.project_id, ""),
                 })
             return out
-    except Exception:
-        logger.debug("Could not list dstack instances", exc_info=True)
+    except Exception as ex:
+        logger.warning("Could not list dstack instances: %s", ex, exc_info=True)
         return []
 
 
-async def terminate_instance(instance_id: str, project_name: str):
-    """Terminate a dstack instance."""
+async def terminate_instance(session: AsyncSession, instance_id: str, project_name: str):
+    """Terminate a dstack instance and stop the associated service/run."""
     from dstack._internal.server.db import get_session_ctx as dstack_session_ctx
+    from dstack._internal.server.models import InstanceModel, JobModel
+    from dstack._internal.core.models.instances import InstanceStatus
     from dstack._internal.server.services.projects import get_project_model_by_name
+    from dstack._internal.server.services.runs import stop_runs
 
     async with dstack_session_ctx() as dstack_session:
         project = await get_project_model_by_name(
@@ -809,15 +909,45 @@ async def terminate_instance(instance_id: str, project_name: str):
         if project is None:
             raise ValueError(f"dstack project {project_name} not found")
 
-        # Mark instance for termination
-        from dstack._internal.server.models import InstanceModel
-        from dstack._internal.core.models.instances import InstanceStatus
-        await dstack_session.execute(
-            sa.update(InstanceModel)
-            .where(InstanceModel.id == instance_id)
-            .values(status=InstanceStatus.TERMINATING)
+        # Find the run name associated with this instance
+        jstmt = sa.select(JobModel.run_name).where(JobModel.instance_id == instance_id).limit(1)
+        jr = (await dstack_session.execute(jstmt)).first()
+        run_name = jr.run_name if jr else None
+
+        # Stop the dstack run (which terminates instance + job)
+        if run_name:
+            admin = get_dstack_admin()
+            try:
+                await stop_runs(
+                    session=dstack_session,
+                    user=admin,
+                    project=project,
+                    runs_names=[run_name],
+                    abort=True,
+                )
+            except Exception as ex:
+                logger.warning("stop_runs failed for instance %s: %s", instance_id, ex)
+        else:
+            # No run found — just mark instance for termination directly
+            await dstack_session.execute(
+                sa.update(InstanceModel)
+                .where(InstanceModel.id == instance_id)
+                .values(status=InstanceStatus.TERMINATING)
+            )
+            await dstack_session.commit()
+
+    # Update the surogate serving service if one is linked to this run
+    if run_name:
+        from surogate.core.db.models.compute import ServingService
+        result = await session.execute(
+            sa.select(ServingService.id).where(ServingService.dstack_run_name == run_name)
         )
-        await dstack_session.commit()
+        svc_row = result.first()
+        if svc_row:
+            await repo.update_serving_service(
+                session, svc_row.id,
+                status="stopped",
+            )
 
 
 # ── Replica URL Discovery (for proxy) ──────────────────────────────

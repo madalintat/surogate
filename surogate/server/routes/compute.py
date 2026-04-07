@@ -13,6 +13,7 @@ from surogate.core.db.repository import compute as compute_repo
 from surogate.server.auth.authentication import get_current_subject, get_current_user_id
 from surogate.server.models.compute import (
     CloudAccountResponse,
+    CloudInstanceResponse,
     ConnectNebiusRequest,
     K8NodeResponse,
     K8NodeMetricsResponse,
@@ -214,7 +215,7 @@ async def cancel_job(
 # ── Instances ───────────────────────────────────────────────────────
 
 
-@router.get("/cloud/instances")
+@router.get("/cloud/instances", response_model=list[CloudInstanceResponse])
 async def list_cloud_instances(
     current_subject: str = Depends(get_current_subject),
 ):
@@ -227,12 +228,13 @@ async def terminate_cloud_instance(
     instance_id: str,
     project_name: Optional[str] = Query(None),
     current_subject: str = Depends(get_current_subject),
+    session: AsyncSession = Depends(get_session),
 ):
-    """Terminate a dstack instance."""
+    """Terminate a dstack instance and its associated service."""
     if not project_name:
         raise HTTPException(status_code=400, detail="project_name query param required")
     try:
-        await dstack_service.terminate_instance(instance_id, project_name)
+        await dstack_service.terminate_instance(session, instance_id, project_name)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
     return {"status": "terminated"}

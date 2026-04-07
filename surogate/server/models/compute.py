@@ -166,8 +166,8 @@ class CloudInstanceResponse(BaseModel):
     cost_per_hour: float = 0
     estimated_total: float = 0
     spot_instance: bool = False
-    spot_savings: Optional[str] = None
-    auto_terminate: Optional[str] = None
+    project_id: str = ""
+    project_name: str = ""
 
     class Config:
         orm_mode = True

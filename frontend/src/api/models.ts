@@ -29,6 +29,8 @@ export interface UpdateModelRequest {
   engine?: string;
   accelerators?: string;
   infra?: string | null;
+  instance_type?: string;
+  region?: string;
   use_spot?: boolean;
   serving_config?: Record<string, unknown>;
   generation_defaults?: Record<string, unknown>;

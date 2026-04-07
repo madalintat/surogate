@@ -120,8 +120,8 @@ export function WorkloadQueueTab() {
                     </td>
                     <td className="px-3 py-2.5 text-[11px] text-muted-foreground">{w.gpu}</td>
                     <td className="px-3 py-2.5">
-                      <span className="text-[11px]" style={{ color: w.location === "aws" ? PROVIDER_COLORS.aws : "var(--primary)" }}>
-                        {w.location === "aws" ? "\u2601 AWS" : "\u229e Local"}
+                      <span className="text-[11px]" style={{ color: PROVIDER_COLORS[w.location] ?? "var(--primary)" }}>
+                        {w.location === "local" ? "\u229e Local" : `\u2601 ${w.location.charAt(0).toUpperCase() + w.location.slice(1)}`}
                       </span>
                       {w.node !== "\u2014" && <div className="text-[10px] text-faint">{w.node}</div>}
                     </td>

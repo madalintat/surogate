@@ -53,6 +53,35 @@ export async function fetchBackendOffers(projectId: string): Promise<InstanceOff
     return (await response.json()) as InstanceOffer[];
 }
 
+export type CloudInstance = {
+    id: string;
+    provider: string;
+    region: string;
+    instance_type: string;
+    gpu: string;
+    status: string;
+    workload: string;
+    started_at: string | null;
+    cost_per_hour: number;
+    estimated_total: number;
+    spot_instance: boolean;
+    project_id: string;
+    project_name: string;
+};
+
+export async function fetchCloudInstances(): Promise<CloudInstance[]> {
+    const response = await authFetch(`/api/compute/cloud/instances`);
+    if (!response.ok) return [];
+    return (await response.json()) as CloudInstance[];
+}
+
+export async function terminateCloudInstance(instanceId: string, projectName: string): Promise<void> {
+    await authFetch(
+        `/api/compute/cloud/instances/${encodeURIComponent(instanceId)}/terminate?project_name=${encodeURIComponent(projectName)}`,
+        { method: "POST" },
+    );
+}
+
 export type ConnectBackendResult = {
     status: string;
     provider: string;

@@ -136,11 +136,6 @@ export const LOCAL_NODES: LocalNode[] = [
   { id: "gpu-node-07", hostname: "gpu-node-07.internal", pool: "training", status: "cordoned", gpu: { type: "A100 80GB", count: 4, used: 0, utilization: 0 }, cpu: { cores: 64, used: 0, utilization: 0 }, mem: { total: 256, used: 0, unit: "Gi" }, workloads: [] },
 ];
 
-export const CLOUD_INSTANCES: CloudInstance[] = [
-  { id: "sky-a1b2c3", provider: "aws", region: "us-east-1", type: "p4d.24xlarge", gpu: "8\u00d7 A100 80GB", status: "running", workload: "Code RL Phase 2", startedAt: "6h ago", costPerHour: 32.77, estimatedTotal: 196.62, spotInstance: true, spotSavings: "62%", autoTerminate: "2h 14m" },
-  { id: "sky-d4e5f6", provider: "aws", region: "us-west-2", type: "p4d.24xlarge", gpu: "8\u00d7 A100 80GB", status: "provisioning", workload: "Queued: Qwen eval suite", startedAt: "2m ago", costPerHour: 32.77, estimatedTotal: 0, spotInstance: true, spotSavings: "58%", autoTerminate: "4h" },
-];
-
 export const CLOUD_ACCOUNTS: CloudAccount[] = [
   { provider: "aws", name: "AWS Production", status: "connected", quotaGpu: 64, usedGpu: 16, regions: ["us-east-1", "us-west-2", "eu-west-1"], monthlyBudget: 15000, monthlySpend: 4820 },
   { provider: "gcp", name: "GCP Research", status: "connected", quotaGpu: 32, usedGpu: 0, regions: ["us-central1", "europe-west4"], monthlyBudget: 8000, monthlySpend: 1200 },

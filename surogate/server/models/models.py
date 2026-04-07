@@ -31,6 +31,8 @@ class DeployedModelUpdateRequest(BaseModel):
     engine: Optional[str] = None
     accelerators: Optional[str] = None
     infra: Optional[str] = None
+    instance_type: Optional[str] = None
+    region: Optional[str] = None
     use_spot: Optional[bool] = None
     serving_config: Optional[dict] = None
     generation_defaults: Optional[dict] = None
