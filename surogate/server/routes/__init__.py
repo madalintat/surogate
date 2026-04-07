@@ -9,6 +9,7 @@ from routes.tasks import router as tasks_router
 from routes.skills import router as skills_router
 from routes.models import router as models_router
 from routes.proxy import router as proxy_router
+from routes.conversations import router as conversations_router
 
 __all__ = [
     "auth_router",
@@ -19,4 +20,5 @@ __all__ = [
     "skills_router",
     "models_router",
     "proxy_router",
+    "conversations_router",
 ]

@@ -34,7 +34,7 @@ from surogate.core.db.repository import auth as auth_repository
 from surogate.core.compute import init_dstack, shutdown_dstack
 from surogate.core.compute.kubernetes import init_kubernetes
 
-from routes import auth_router, project_router, hub_router, compute_router, tasks_router, skills_router, models_router, proxy_router
+from routes import auth_router, project_router, hub_router, compute_router, tasks_router, skills_router, models_router, proxy_router, conversations_router
 
 logger = get_logger()
 
@@ -107,6 +107,7 @@ app.include_router(compute_router, prefix = "/api/nebius", tags = ["nebius"])
 app.include_router(tasks_router, prefix = "/api/tasks", tags = ["tasks"])
 app.include_router(skills_router, prefix = "/api/skills", tags = ["skills"])
 app.include_router(models_router, prefix = "/api/models", tags = ["models"])
+app.include_router(conversations_router, prefix = "/api/conversations", tags = ["conversations"])
 
 # Mount service proxy with chat-completion observability
 from dstack._internal.server.services.proxy.deps import ServerProxyDependencyInjector

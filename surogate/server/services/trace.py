@@ -43,9 +43,26 @@ def _sha256(data: str) -> str:
     return hashlib.sha256(data.encode("utf-8")).hexdigest()
 
 
+# Fields that clients actually send back for assistant messages.
+# Extra fields (reasoning_content, etc.) must be stripped before hashing
+# so that our state_hash matches the next turn's parent_hash.
+_CLIENT_MSG_KEYS = {"role", "content", "tool_calls"}
+
+
+def _normalize_for_hash(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Strip assistant messages down to the fields clients send back."""
+    out = []
+    for msg in messages:
+        if msg.get("role") == "assistant":
+            out.append({k: v for k, v in msg.items() if k in _CLIENT_MSG_KEYS})
+        else:
+            out.append(msg)
+    return out
+
+
 def hash_messages(messages: list[dict[str, Any]]) -> str:
-    """Hash a full message array."""
-    return _sha256(_canonical(messages))
+    """Hash a full message array (normalized for client round-trip)."""
+    return _sha256(_canonical(_normalize_for_hash(messages)))
 
 
 def _compute_tail_hash(
@@ -53,7 +70,7 @@ def _compute_tail_hash(
     assistant_reply: dict[str, Any],
 ) -> str:
     """Hash the [user, assistant] pair that anchors the conversation tail."""
-    return _sha256(_canonical([last_user_msg, assistant_reply]))
+    return _sha256(_canonical(_normalize_for_hash([last_user_msg, assistant_reply])))
 
 
 def _find_last_user_msg(messages: list[dict[str, Any]]) -> Optional[dict[str, Any]]:

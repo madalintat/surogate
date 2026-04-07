@@ -1,24 +1,23 @@
 // Copyright (c) 2026, Invergent SA, developed by Flavius Burca
 // SPDX-License-Identifier: AGPL-3.0-only
 //
-import { Badge } from "@/components/ui/badge";
+import { useState } from "react";
 import { Button } from "@/components/ui/button";
+import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
-import { SENTIMENT_COLORS } from "./conversations-data";
+import { useAppStore } from "@/stores/app-store";
 import { ThreadTab } from "./thread-tab";
 import { TrajectoryTab } from "./trajectory-tab";
 import { MetadataTab } from "./metadata-tab";
-import type { Conversation } from "./conversations-data";
-
-// ── Conversation detail panel ─────────────────────────────────
+import type { ConversationDetail as ConversationDetailType } from "./conversations-data";
 
 export function ConversationDetail({
   convo,
-  onExport,
 }: {
-  convo: Conversation;
-  onExport: () => void;
+  convo: ConversationDetailType;
 }) {
+  const deleteConversation = useAppStore((s) => s.deleteConversation);
+  const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
   return (
     <div className="flex-1 flex flex-col overflow-hidden">
       {/* Header */}
@@ -26,86 +25,65 @@ export function ConversationDetail({
         <div className="flex items-start justify-between mb-2">
           <div>
             <div className="flex items-center gap-2 mb-0.5">
-              <span
-                className="inline-block w-2 h-2 rounded-full shrink-0"
-                style={{
-                  backgroundColor: SENTIMENT_COLORS[convo.sentiment],
-                }}
-              />
               <span className="text-sm font-bold text-foreground font-display tracking-tight">
-                {convo.agent}
+                {convo.model || convo.runName}
               </span>
-              <span className="text-[11px] text-muted-foreground/30">
-                &harr;
-              </span>
+              <span className="text-[11px] text-muted-foreground/30">&harr;</span>
               <span className="text-[12px] text-muted-foreground font-medium">
-                {convo.user}
+                {convo.projectName}
               </span>
               <code className="text-[9px] text-muted-foreground/30 bg-muted px-1.5 py-px rounded">
-                {convo.id}
+                {convo.id.substring(0, 8)}...
               </code>
-              {convo.status === "active" && (
-                <span className="inline-flex items-center gap-1 text-[9px] text-green-500 font-semibold">
-                  <span className="w-[5px] h-[5px] rounded-full bg-green-500 animate-pulse" />
-                  LIVE
+              {convo.hasCompaction && (
+                <span
+                  className="text-[8px] px-1.5 py-px rounded font-semibold font-display border"
+                  style={{
+                    background: "#F59E0B12",
+                    color: "#F59E0B",
+                    borderColor: "#F59E0B30",
+                  }}
+                >
+                  COMPACTED
                 </span>
               )}
             </div>
             <div className="flex items-center gap-3 text-[10px] text-muted-foreground/30">
-              <span>{convo.turns} turns</span>
+              <span>{convo.turnCount} turns</span>
               <span>{convo.duration}</span>
-              <span>avg {convo.latencyAvg}ms</span>
-              <span>{convo.toolCalls} tool calls</span>
+              {convo.avgLatencyMs != null && (
+                <span>avg {Math.round(convo.avgLatencyMs)}ms</span>
+              )}
               <span>
-                sentiment:{" "}
-                <span
-                  style={{ color: SENTIMENT_COLORS[convo.sentiment] }}
-                >
-                  {convo.sentiment} (
-                  {(convo.sentimentScore * 100).toFixed(0)}%)
-                </span>
+                {convo.tokensIn + convo.tokensOut} tokens
               </span>
             </div>
           </div>
 
-          {/* Actions */}
-          <div className="flex gap-1.5 shrink-0">
-            <Button variant="outline" size="xs">
-              {convo.starred ? "\u2605" : "\u2606"}
-            </Button>
+          <div className="shrink-0">
             <Button
-              variant={convo.flagged ? "destructive" : "outline"}
+              variant="destructive"
               size="xs"
+              onClick={() => setShowDeleteConfirm(true)}
             >
-              &#x2691; Flag
-            </Button>
-            <Button size="xs" onClick={onExport}>
-              &rarr; Dataset
-            </Button>
-            <Button variant="ghost" size="icon-xs">
-              &#x22EF;
+              Delete
             </Button>
           </div>
         </div>
-
-        {/* Tags */}
-        <div className="flex gap-1 mb-2">
-          {convo.tags.map((t) => (
-            <span
-              key={t}
-              className="text-[8px] px-1.5 py-0.5 rounded bg-muted text-muted-foreground/50"
-            >
-              {t}
-            </span>
-          ))}
-          <button
-            type="button"
-            className="text-[8px] px-1.5 py-0.5 rounded border border-dashed border-border bg-transparent text-muted-foreground/30 cursor-pointer hover:text-muted-foreground/50"
-          >
-            + tag
-          </button>
-        </div>
       </div>
+
+      <ConfirmDialog
+        open={showDeleteConfirm}
+        title="Delete conversation"
+        description={<>This will permanently delete all <strong>{convo.turnCount} turns</strong> in this conversation. This action cannot be undone.</>}
+        confirmLabel="Delete"
+        variant="destructive"
+        onConfirm={async () => {
+          await deleteConversation(convo.id);
+          setShowDeleteConfirm(false);
+        }}
+        onCancel={() => setShowDeleteConfirm(false)}
+      />
 
       {/* Tabs */}
       <Tabs
@@ -136,8 +114,6 @@ export function ConversationDetail({
   );
 }
 
-// ── Empty state ───────────────────────────────────────────────
-
 export function ConversationEmptyState() {
   return (
     <div className="flex-1 flex items-center justify-center text-muted-foreground/40">
@@ -147,8 +123,8 @@ export function ConversationEmptyState() {
           Select a conversation to inspect
         </div>
         <div className="text-[10px] mt-1 max-w-[300px] leading-relaxed text-muted-foreground/30">
-          Browse, filter, and review agent conversations. Export to datasets for
-          fine-tuning.
+          Conversations are automatically captured from chat completion requests
+          flowing through the proxy.
         </div>
       </div>
     </div>

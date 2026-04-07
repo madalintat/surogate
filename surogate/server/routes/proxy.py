@@ -58,6 +58,7 @@ def _is_chat_completion(path: str) -> bool:
     return any(lower.endswith(s) for s in _CHAT_COMPLETION_SUFFIXES)
 
 
+
 # ---------------------------------------------------------------------------
 # Redirect bare service URLs to trailing-slash variant
 # ---------------------------------------------------------------------------
@@ -283,6 +284,11 @@ async def _stream_chat_response(
     usage = _extract_stream_usage(chunks)
     assistant_reply = _assemble_stream_reply(chunks)
     if messages and assistant_reply:
+        # Build a synthetic response body so the detail view can show messages
+        synthetic_resp = {
+            "choices": [{"index": 0, "message": assistant_reply, "finish_reason": "stop"}],
+            "usage": usage or None,
+        }
         _schedule_record_turn(
             messages=messages,
             assistant_reply=assistant_reply,
@@ -294,7 +300,7 @@ async def _stream_chat_response(
             latency_ms=elapsed_ms,
             usage=usage,
             request_body=req_json,
-            response_body=None,
+            response_body=synthetic_resp,
         )
 
 
@@ -474,10 +480,15 @@ def _extract_assistant_message(resp_json: Optional[dict]) -> Optional[dict[str, 
 
 
 def _assemble_stream_reply(chunks: list[bytes]) -> Optional[dict[str, Any]]:
-    """Reassemble a complete assistant message from SSE stream deltas."""
+    """Reassemble a complete assistant message from SSE stream deltas.
+
+    Handles both standard ``content`` and ``reasoning_content`` fields
+    (used by Qwen3, DeepSeek and other thinking models).
+    """
     raw = b"".join(chunks).decode("utf-8", errors="replace")
     role = "assistant"
     content_parts: list[str] = []
+    reasoning_parts: list[str] = []
     tool_calls_by_idx: dict[int, dict] = {}
 
     for line in raw.splitlines():
@@ -497,6 +508,8 @@ def _assemble_stream_reply(chunks: list[bytes]) -> Optional[dict[str, Any]]:
                 role = delta["role"]
             if "content" in delta and delta["content"]:
                 content_parts.append(delta["content"])
+            if "reasoning_content" in delta and delta["reasoning_content"]:
+                reasoning_parts.append(delta["reasoning_content"])
             for tc in delta.get("tool_calls", []):
                 idx = tc.get("index", 0)
                 if idx not in tool_calls_by_idx:
@@ -514,10 +527,12 @@ def _assemble_stream_reply(chunks: list[bytes]) -> Optional[dict[str, Any]]:
                 if fn.get("arguments"):
                     entry["function"]["arguments"] += fn["arguments"]
 
-    if not content_parts and not tool_calls_by_idx:
+    if not content_parts and not reasoning_parts and not tool_calls_by_idx:
         return None
 
     msg: dict[str, Any] = {"role": role, "content": "".join(content_parts)}
+    if reasoning_parts:
+        msg["reasoning_content"] = "".join(reasoning_parts)
     if tool_calls_by_idx:
         msg["tool_calls"] = [tool_calls_by_idx[i] for i in sorted(tool_calls_by_idx)]
     return msg
