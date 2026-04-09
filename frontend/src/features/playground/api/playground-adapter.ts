@@ -8,6 +8,7 @@ import { toast } from "sonner";
 import { streamChatCompletions } from "./playground-api";
 import { usePlaygroundStore } from "../stores/playground-store";
 import { useAppStore } from "@/stores/app-store";
+import { isProxyModel } from "@/utils/model";
 import {
   hasClosedThinkTag,
   parseAssistantContent,
@@ -202,7 +203,7 @@ export function createPlaygroundAdapter(): ChatModelAdapter {
         const stream = streamChatCompletions(
           model.endpoint,
           {
-            model: model.name,
+            model: isProxyModel(model) ? model.base : model.name,
             messages: outboundMessages,
             stream: true,
             temperature: params.temperature,

@@ -65,6 +65,10 @@ class ChatTurn(UUIDMixin, Base):
     )
 
     # ── Request / response metadata ──────────────────────────────────
+    deployed_model_id: Mapped[Optional[str]] = mapped_column(
+        sa.String(36), index=True, nullable=True,
+        doc="FK-style pointer to the DeployedModel that served this turn.",
+    )
     project_name: Mapped[str] = mapped_column(sa.String(255))
     run_name: Mapped[str] = mapped_column(sa.String(255))
     model: Mapped[str] = mapped_column(sa.String(255), default="")

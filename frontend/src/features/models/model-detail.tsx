@@ -14,6 +14,7 @@ import { OverviewTab } from "./overview-tab";
 import { PerformanceTab } from "./performance-tab";
 import { ConfigTab } from "./config-tab";
 import { FinetunesTab } from "./finetunes-tab";
+import { ConversationsTab } from "./conversations-tab";
 import { useAppStore } from "@/stores/app-store";
 import type { Model } from "./models-data";
 import { isProxyModel } from "@/utils/model";
@@ -228,6 +229,7 @@ export function ModelDetail({ model }: { model: Model }) {
             <TabsTrigger value="overview">Overview</TabsTrigger>
             <TabsTrigger value="performance">Performance</TabsTrigger>
             <TabsTrigger value="config">Config</TabsTrigger>
+            <TabsTrigger value="conversations">Conversations</TabsTrigger>
             {!isProxy && <TabsTrigger value="finetunes">Fine-tunes</TabsTrigger>}
           </TabsList>
         </div>
@@ -241,6 +243,9 @@ export function ModelDetail({ model }: { model: Model }) {
           </TabsContent>
           <TabsContent value="config" className="mt-0">
             <ConfigTab model={model} />
+          </TabsContent>
+          <TabsContent value="conversations" className="mt-0">
+            <ConversationsTab model={model} />
           </TabsContent>
           {!isProxy && (
             <TabsContent value="finetunes" className="mt-0">

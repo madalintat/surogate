@@ -11,6 +11,7 @@ from routes.models import router as models_router
 from routes.proxy import router as proxy_router
 from routes.conversations import router as conversations_router
 from routes.metrics import router as metrics_router
+from routes.agents import router as agents_router
 
 __all__ = [
     "auth_router",
@@ -23,4 +24,5 @@ __all__ = [
     "proxy_router",
     "conversations_router",
     "metrics_router",
+    "agents_router",
 ]

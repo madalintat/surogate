@@ -19,6 +19,7 @@ async def list_conversations(
     session: AsyncSession = Depends(get_session),
     project_name: Optional[str] = Query(None),
     model: Optional[str] = Query(None),
+    deployed_model_id: Optional[str] = Query(None),
     search: Optional[str] = Query(None),
     limit: int = Query(50, le=200),
     offset: int = Query(0),
@@ -35,6 +36,7 @@ async def list_conversations(
         func.sum(ChatTurn.total_tokens).label("total_tokens"),
         func.avg(ChatTurn.latency_ms).label("avg_latency_ms"),
         func.max(ChatTurn.model).label("model"),
+        func.max(ChatTurn.deployed_model_id).label("deployed_model_id"),
         func.max(ChatTurn.project_name).label("project_name"),
         func.max(ChatTurn.run_name).label("run_name"),
         func.bool_or(ChatTurn.compacted).label("has_compaction"),
@@ -42,7 +44,9 @@ async def list_conversations(
 
     if project_name:
         base = base.where(ChatTurn.project_name == project_name)
-    if model:
+    if deployed_model_id:
+        base = base.where(ChatTurn.deployed_model_id == deployed_model_id)
+    elif model:
         base = base.where(ChatTurn.model == model)
 
     # Wrap as subquery for ordering/pagination
@@ -71,6 +75,7 @@ async def list_conversations(
             "total_tokens": r.total_tokens or 0,
             "avg_latency_ms": round(r.avg_latency_ms, 1) if r.avg_latency_ms else None,
             "model": r.model or "",
+            "deployed_model_id": r.deployed_model_id or None,
             "project_name": r.project_name or "",
             "run_name": r.run_name or "",
             "has_compaction": r.has_compaction or False,
@@ -110,16 +115,28 @@ async def get_conversation(
     for t in turns:
         req = t.request_body or {}
         turn_messages = req.get("messages", [])
-        # Only add the last user message (the prompt for this turn)
+        # Find the last user message in the request (may not be the final
+        # message when tool results follow a tool-call turn)
         if turn_messages:
-            last_msg = turn_messages[-1]
-            if last_msg.get("role") == "user":
-                messages.append({
-                    "role": "user",
-                    "content": last_msg.get("content", ""),
-                    "timestamp": t.created_at.isoformat() if t.created_at else None,
-                    "tokens": t.prompt_tokens,
-                })
+            for msg in reversed(turn_messages):
+                if msg.get("role") == "user":
+                    messages.append({
+                        "role": "user",
+                        "content": msg.get("content", ""),
+                        "timestamp": t.created_at.isoformat() if t.created_at else None,
+                        "tokens": t.prompt_tokens,
+                    })
+                    break
+            # Include tool-result messages so the thread shows the full flow
+            for msg in turn_messages:
+                if msg.get("role") == "tool":
+                    messages.append({
+                        "role": "tool",
+                        "content": msg.get("content", ""),
+                        "tool_call_id": msg.get("tool_call_id"),
+                        "timestamp": t.created_at.isoformat() if t.created_at else None,
+                        "tokens": None,
+                    })
 
         # Add assistant response from response_body
         resp = t.response_body
@@ -129,10 +146,12 @@ async def get_conversation(
                 assistant_msg = choices[0].get("message", {})
                 content = assistant_msg.get("content", "")
                 reasoning = assistant_msg.get("reasoning_content", "")
+                tool_calls = assistant_msg.get("tool_calls")
                 messages.append({
                     "role": "assistant",
                     "content": content,
                     "reasoning_content": reasoning or None,
+                    "tool_calls": tool_calls or None,
                     "timestamp": t.created_at.isoformat() if t.created_at else None,
                     "tokens": t.completion_tokens,
                     "latency": round(t.latency_ms) if t.latency_ms else None,

@@ -16,8 +16,9 @@ import uuid
 from typing import Any, AsyncGenerator, AsyncIterator, Optional
 
 import httpx
-from fastapi import APIRouter, Depends, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.datastructures import URL
+from sqlalchemy.ext.asyncio import AsyncSession
 from fastapi.responses import RedirectResponse, Response, StreamingResponse
 from starlette.requests import ClientDisconnect
 from typing_extensions import Annotated
@@ -58,6 +59,219 @@ def _is_chat_completion(path: str) -> bool:
     lower = path.lower().rstrip("/")
     return any(lower.endswith(s) for s in _CHAT_COMPLETION_SUFFIXES)
 
+
+
+
+# ---------------------------------------------------------------------------
+# Proxy-model upstream routing (OpenRouter / OpenAI-compatible URL)
+#
+# IMPORTANT: these routes MUST be registered before the dstack catch-all
+# /{project_name}/{run_name}/{path:path} routes below, otherwise FastAPI
+# would match "_model" as a project name.
+# ---------------------------------------------------------------------------
+
+_UPSTREAM_BASES: dict[str, str] = {
+    "openrouter": "https://openrouter.ai/api",
+}
+
+from surogate.core.db.engine import get_session as _get_session
+from surogate.core.db.repository import compute as _compute_repo
+from surogate.server.auth.authentication import get_current_subject as _get_current_subject
+
+
+class _ProxyModelInfo:
+    __slots__ = ("client", "headers", "base_url", "model_id")
+
+    def __init__(
+        self,
+        client: httpx.AsyncClient,
+        headers: dict[str, str],
+        base_url: str,
+        model_id: str,
+    ):
+        self.client = client
+        self.headers = headers
+        self.base_url = base_url
+        self.model_id = model_id
+
+
+async def _get_proxy_model_info(
+    model_id: str,
+    session: AsyncSession,
+) -> _ProxyModelInfo:
+    """Build an httpx client + headers targeting the upstream API.
+
+    Raises HTTPException if model is not a proxy model or config is incomplete.
+    """
+    model = await _compute_repo.get_deployed_model(session, model_id)
+    if model is None:
+        raise HTTPException(status_code=404, detail="Model not found")
+
+    engine = model.engine
+    if engine not in ("openrouter", "openai_compat"):
+        raise HTTPException(status_code=400, detail="Model is not a proxy model")
+
+    serving_config = model.serving_config or {}
+    api_key = serving_config.get("api_key", "")
+    if not api_key:
+        raise HTTPException(status_code=400, detail="No API key configured for this model")
+
+    if engine == "openrouter":
+        base_url = _UPSTREAM_BASES["openrouter"]
+    else:
+        base_url = serving_config.get("endpoint", "")
+        if not base_url:
+            raise HTTPException(status_code=400, detail="No endpoint configured for this model")
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+
+    # Match the OpenRouter SDK approach: no base_url on the client,
+    # full URL built per-request. Headers passed per-request too.
+    client = httpx.AsyncClient(
+        follow_redirects=True,
+        timeout=httpx.Timeout(timeout=120.0, connect=10.0),
+    )
+
+    return _ProxyModelInfo(client, headers, base_url, model_id)
+
+
+@router.get("/_model/{model_id}/{path:path}")
+@router.post("/_model/{model_id}/{path:path}")
+@router.put("/_model/{model_id}/{path:path}")
+@router.delete("/_model/{model_id}/{path:path}")
+@router.patch("/_model/{model_id}/{path:path}")
+@router.head("/_model/{model_id}/{path:path}")
+@router.options("/_model/{model_id}/{path:path}")
+async def proxy_model_upstream(
+    model_id: str,
+    path: str,
+    request: Request,
+    current_subject: str = Depends(_get_current_subject),
+    session: AsyncSession = Depends(_get_session),
+) -> Response:
+    """Proxy requests for upstream models (OpenRouter, OpenAI-compat URL).
+
+    Streams the upstream response directly to the client, with
+    chat-completion observability (metrics + tracing).
+    """
+    info = await _get_proxy_model_info(model_id, session)
+    upstream_url = f"{info.base_url.rstrip('/')}/{path.lstrip('/')}"
+
+    body = await request.body()
+    req_json = json.loads(body) if body else {}
+    is_streaming = req_json.get("stream", False)
+    model_name = req_json.get("model", "")
+    messages = req_json.get("messages", [])
+    caller_hash = _hash_caller(request)
+    t0 = time.monotonic()
+
+    upstream_resp = await info.client.send(
+        info.client.build_request(
+            request.method,
+            upstream_url,
+            headers=info.headers,
+            content=body,
+        ),
+        stream=True,
+    )
+
+    if is_streaming:
+        async def generate():
+            chunks: list[bytes] = []
+            try:
+                async for chunk in upstream_resp.aiter_bytes():
+                    chunks.append(chunk)
+                    yield chunk
+            finally:
+                await upstream_resp.aclose()
+                await info.client.aclose()
+
+                # Record observability in the background
+                elapsed_ms = (time.monotonic() - t0) * 1000
+                assistant_reply = _assemble_stream_reply(chunks)
+                prompt_tokens = _estimate_prompt_tokens(messages)
+                completion_tokens = _count_stream_completion_tokens(chunks)
+                _schedule_record_metric(
+                    project_name="_proxy", run_name=model_id,
+                    model=model_name,
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                    total_tokens=prompt_tokens + completion_tokens,
+                    latency_ms=elapsed_ms,
+                    status_code=upstream_resp.status_code,
+                    is_streaming=True,
+                )
+                if messages and assistant_reply:
+                    usage = {
+                        "prompt_tokens": prompt_tokens,
+                        "completion_tokens": completion_tokens,
+                        "total_tokens": prompt_tokens + completion_tokens,
+                    }
+                    synthetic_resp = {
+                        "choices": [{"index": 0, "message": assistant_reply, "finish_reason": "stop"}],
+                        "usage": usage,
+                    }
+                    _schedule_record_turn(
+                        messages=messages, assistant_reply=assistant_reply,
+                        project_name="_proxy", run_name=model_id,
+                        model=model_name, is_streaming=True,
+                        deployed_model_id=model_id,
+                        caller_hash=caller_hash, latency_ms=elapsed_ms,
+                        usage=usage,
+                        request_body=req_json, response_body=synthetic_resp,
+                    )
+
+        return StreamingResponse(
+            generate(),
+            status_code=upstream_resp.status_code,
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
+    # Non-streaming
+    try:
+        resp_body = b""
+        async for chunk in upstream_resp.aiter_bytes():
+            resp_body += chunk
+    finally:
+        await upstream_resp.aclose()
+        await info.client.aclose()
+
+    elapsed_ms = (time.monotonic() - t0) * 1000
+    resp_json = _parse_json(resp_body)
+    assistant_reply = _extract_assistant_message(resp_json)
+    prompt_tokens = _estimate_prompt_tokens(messages)
+    completion_tokens = _count_response_completion_tokens(resp_json)
+    _schedule_record_metric(
+        project_name="_proxy", run_name=model_id, model=model_name,
+        prompt_tokens=prompt_tokens, completion_tokens=completion_tokens,
+        total_tokens=prompt_tokens + completion_tokens,
+        latency_ms=elapsed_ms, status_code=upstream_resp.status_code,
+        is_streaming=False,
+    )
+    if messages and assistant_reply:
+        _schedule_record_turn(
+            messages=messages, assistant_reply=assistant_reply,
+            project_name="_proxy", run_name=model_id,
+            model=model_name, is_streaming=False,
+            deployed_model_id=model_id,
+            caller_hash=caller_hash, latency_ms=elapsed_ms,
+            usage={
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": prompt_tokens + completion_tokens,
+            },
+            request_body=req_json, response_body=resp_json,
+        )
+
+    return Response(
+        content=resp_body,
+        status_code=upstream_resp.status_code,
+        media_type="application/json",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -110,8 +324,19 @@ async def service_reverse_proxy(
 
     # ── Chat completion observability path ─────────────────────────────
     if _is_chat_completion(path) and request.method == "POST":
+        # Resolve deployed model ID from dstack run_name (best-effort)
+        deployed_model_id: Optional[str] = None
+        try:
+            factory = get_session_factory()
+            async with factory() as obs_session:
+                dm = await _compute_repo.get_deployed_model_by_run_name(obs_session, run_name)
+                if dm is not None:
+                    deployed_model_id = dm.id
+        except Exception:
+            pass
         return await _proxy_chat_completion(
             request, path, client, project_name, run_name,
+            deployed_model_id=deployed_model_id,
         )
 
     # ── Generic pass-through ───────────────────────────────────────────
@@ -156,6 +381,8 @@ async def _proxy_chat_completion(
     client: httpx.AsyncClient,
     project_name: str,
     run_name: str,
+    *,
+    deployed_model_id: Optional[str] = None,
 ) -> Response:
     request_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
     t0 = time.monotonic()
@@ -218,6 +445,7 @@ async def _proxy_chat_completion(
             _stream_chat_response(
                 upstream_resp, request_id, project_name, run_name, model_name, t0,
                 messages=messages, caller_hash=caller_hash, req_json=req_json,
+                deployed_model_id=deployed_model_id,
             ),
             status_code=upstream_resp.status_code,
             headers=upstream_resp.headers,
@@ -260,6 +488,7 @@ async def _proxy_chat_completion(
             run_name=run_name,
             model=model_name,
             is_streaming=False,
+            deployed_model_id=deployed_model_id,
             caller_hash=caller_hash,
             latency_ms=elapsed_ms,
             usage=usage,
@@ -290,6 +519,7 @@ async def _stream_chat_response(
     messages: list[dict],
     caller_hash: Optional[str],
     req_json: Optional[dict],
+    deployed_model_id: Optional[str] = None,
 ) -> AsyncGenerator[bytes, None]:
     """Yield SSE chunks while accumulating them for logging and tracing."""
     chunks: list[bytes] = []
@@ -344,6 +574,7 @@ async def _stream_chat_response(
             run_name=run_name,
             model=model_name,
             is_streaming=True,
+            deployed_model_id=deployed_model_id,
             caller_hash=caller_hash,
             latency_ms=elapsed_ms,
             usage=usage,
@@ -613,3 +844,5 @@ async def _do_record_metric(**kwargs: Any) -> None:
             await record_metric(session, **kwargs)
     except Exception:
         logger.warning("failed to record model metric", exc_info=True)
+
+

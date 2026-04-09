@@ -1,7 +1,7 @@
 // Copyright (c) 2026, Invergent SA, developed by Flavius Burca
 // SPDX-License-Identifier: AGPL-3.0-only
 //
-import type { ConversationDetail } from "./conversations-data";
+import type { ConversationDetail } from "@/types/conversation";
 
 export function TrajectoryTab({ convo }: { convo: ConversationDetail }) {
   return (
@@ -14,9 +14,12 @@ export function TrajectoryTab({ convo }: { convo: ConversationDetail }) {
       <div className="relative pl-7">
         {convo.messages.map((msg, i) => {
           const isUser = msg.role === "user";
-          const dotColor = isUser
-            ? "var(--color-muted-foreground)"
-            : "#3B82F6";
+          const isTool = msg.role === "tool";
+          const dotColor = isTool
+            ? "#F59E0B"
+            : isUser
+              ? "var(--color-muted-foreground)"
+              : "#3B82F6";
 
           return (
             <div key={i} className="relative mb-1">
@@ -33,9 +36,9 @@ export function TrajectoryTab({ convo }: { convo: ConversationDetail }) {
                 <div className="flex items-center gap-1.5 text-[10px]">
                   <span
                     className="font-medium font-display"
-                    style={{ color: isUser ? "var(--color-muted-foreground)" : "#3B82F6" }}
+                    style={{ color: dotColor }}
                   >
-                    {isUser ? "User" : "Agent"}
+                    {isTool ? "Tool" : isUser ? "User" : "Agent"}
                   </span>
                   <span className="text-muted-foreground/30 text-[9px]">
                     {msg.timestamp}

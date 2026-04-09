@@ -26,6 +26,7 @@ import { type ReactElement, type ReactNode, useEffect, useMemo } from "react";
 import { extractText, getDocumentProxy } from "unpdf";
 import { authFetch } from "@/api/auth";
 import { useAppStore } from "@/stores/app-store";
+import { isProxyModel } from "@/utils/model";
 import { createPlaygroundAdapter } from "./api/playground-adapter";
 import { db } from "./db";
 import { usePlaygroundStore } from "./stores/playground-store";
@@ -338,7 +339,7 @@ async function generateTitleWithModel(payload: {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        model: model.name,
+        model: isProxyModel(model) ? model.base : model.name,
         stream: false,
         temperature: 0.2,
         top_p: 0.9,

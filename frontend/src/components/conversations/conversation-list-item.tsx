@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
 import { cn } from "@/utils/cn";
-import type { Conversation } from "./conversations-data";
+import type { Conversation } from "@/types/conversation";
 
 export function ConversationListItem({
   convo,

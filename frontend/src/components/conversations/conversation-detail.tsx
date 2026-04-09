@@ -9,14 +9,17 @@ import { useAppStore } from "@/stores/app-store";
 import { ThreadTab } from "./thread-tab";
 import { TrajectoryTab } from "./trajectory-tab";
 import { MetadataTab } from "./metadata-tab";
-import type { ConversationDetail as ConversationDetailType } from "./conversations-data";
+import type { ConversationDetail as ConversationDetailType } from "@/types/conversation";
 
 export function ConversationDetail({
   convo,
+  onDelete,
 }: {
   convo: ConversationDetailType;
+  onDelete?: (id: string) => Promise<unknown>;
 }) {
-  const deleteConversation = useAppStore((s) => s.deleteConversation);
+  const storeDelete = useAppStore((s) => s.deleteConversation);
+  const deleteConversation = onDelete ?? storeDelete;
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
   return (
     <div className="flex-1 flex flex-col overflow-hidden">

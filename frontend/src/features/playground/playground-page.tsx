@@ -7,6 +7,7 @@ import { Button } from "@/components/ui/button";
 import { Separator } from "@/components/ui/separator";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { useAppStore } from "@/stores/app-store";
+import { isProxyModel } from "@/utils/model";
 import { cn } from "@/utils/cn";
 import {
   ColumnsIcon,
@@ -159,7 +160,7 @@ export function PlaygroundPage() {
   }, [fetchModels]);
 
   const servingModels = useMemo(
-    () => allModels.filter((m) => m.status === "running"),
+    () => allModels.filter((m) => m.status === "running" || isProxyModel(m)),
     [allModels],
   );
 

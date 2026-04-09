@@ -4,6 +4,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { HfSearchInput } from "@/components/ui/hf-search-input";
 import { HubRepoSelector, type HubRefSelection } from "@/components/ui/hub-repo-selector";
+import { OpenRouterSearchInput } from "@/components/ui/openrouter-search-input";
 import {
   Dialog,
   DialogContent,
@@ -38,6 +39,7 @@ export function ServeModelDialog({
   const [openRouterApiKey, setOpenRouterApiKey] = useState("");
   const [openRouterModel, setOpenRouterModel] = useState("");
   const [urlEndpoint, setUrlEndpoint] = useState("");
+  const [urlApiKey, setUrlApiKey] = useState("");
   const [urlModel, setUrlModel] = useState("");
 
   const isHub = sourceIdx === 0;
@@ -68,7 +70,10 @@ export function ServeModelDialog({
 
     const servingConfig: Record<string, unknown> = {};
     if (isOpenRouter) servingConfig.api_key = openRouterApiKey.trim();
-    if (isUrl) servingConfig.endpoint = urlEndpoint.trim();
+    if (isUrl) {
+      servingConfig.endpoint = urlEndpoint.trim();
+      if (urlApiKey.trim()) servingConfig.api_key = urlApiKey.trim();
+    }
 
     setSaving(true);
     const source = isHub ? "local_hub" : isHuggingFace ? "huggingface" : isOpenRouter ? "openrouter" : "url";
@@ -99,6 +104,7 @@ export function ServeModelDialog({
       setOpenRouterApiKey("");
       setOpenRouterModel("");
       setUrlEndpoint("");
+      setUrlApiKey("");
       setUrlModel("");
       onOpenChange(false);
     }
@@ -151,9 +157,9 @@ export function ServeModelDialog({
             />
           ) : isOpenRouter ? (
             <>
-              <Input
+              <OpenRouterSearchInput
                 value={openRouterModel}
-                onChange={(e) => setOpenRouterModel(e.target.value)}
+                onChange={setOpenRouterModel}
                 placeholder="openai/gpt-4o"
                 className="h-8 text-xs"
               />
@@ -177,6 +183,13 @@ export function ServeModelDialog({
                 value={urlModel}
                 onChange={(e) => setUrlModel(e.target.value)}
                 placeholder="meta-llama/Llama-3.1-8B-Instruct"
+                className="h-8 text-xs"
+              />
+              <Input
+                value={urlApiKey}
+                onChange={(e) => setUrlApiKey(e.target.value)}
+                placeholder="API Key (optional)"
+                type="password"
                 className="h-8 text-xs"
               />
             </>

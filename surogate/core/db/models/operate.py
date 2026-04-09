@@ -58,16 +58,6 @@ class McpStatus(enum.Enum):
     error = "error"
 
 
-class ModelType(enum.Enum):
-    base = "base"
-    fine_tuned = "fine-tuned"
-
-
-class ModelStatus(enum.Enum):
-    serving = "serving"
-    stopped = "stopped"
-    error = "error"
-
 
 # ── Association tables ─────────────────────────────────────────────────
 
@@ -108,10 +98,13 @@ class Agent(UUIDMixin, TimestampMixin, Base):
         sa.ForeignKey("projects.id"), index=True
     )
     name: Mapped[str] = mapped_column(sa.String(255))
+    harness: Mapped[str] = mapped_column(sa.String(64))
     display_name: Mapped[str] = mapped_column(sa.String(255))
     description: Mapped[str] = mapped_column(sa.Text, default="")
     version: Mapped[str] = mapped_column(sa.String(64))
-    model_id: Mapped[str] = mapped_column(sa.ForeignKey("models.id"))
+    model_id: Mapped[Optional[str]] = mapped_column(
+        sa.ForeignKey("deployed_models.id"), nullable=True
+    )
     status: Mapped[AgentStatus] = mapped_column(sa.Enum(AgentStatus))
     replicas: Mapped[Optional[dict[str, Any]]] = mapped_column(
         sa.JSON, nullable=True
@@ -131,7 +124,7 @@ class Agent(UUIDMixin, TimestampMixin, Base):
     )
 
     project: Mapped["Project"] = relationship()  # noqa: F821
-    model: Mapped[Model] = relationship()
+    model: Mapped[Optional["DeployedModel"]] = relationship()  # noqa: F821
     created_by: Mapped["User"] = relationship()  # noqa: F821
     versions: Mapped[list[AgentVersion]] = relationship(back_populates="agent")
     skills: Mapped[list[Skill]] = relationship(
@@ -250,53 +243,6 @@ class McpServer(UUIDMixin, Base):
     )
 
 
-class Model(UUIDMixin, TimestampMixin, Base):
-    __tablename__ = "models"
-
-    project_id: Mapped[str] = mapped_column(
-        sa.ForeignKey("projects.id"), index=True
-    )
-    name: Mapped[str] = mapped_column(sa.String(255))
-    description: Mapped[str] = mapped_column(sa.String(255))
-    architecture: Mapped[str] = mapped_column(sa.String(128))
-    parameters: Mapped[str] = mapped_column(sa.String(32))
-    type: Mapped[ModelType] = mapped_column(sa.Enum(ModelType))
-    base_model_ref: Mapped[Optional[str]] = mapped_column(
-        sa.String(512), nullable=True
-    )
-    quantization: Mapped[Optional[str]] = mapped_column(
-        sa.String(32), nullable=True
-    )
-    context_window: Mapped[int] = mapped_column(sa.Integer)
-    status: Mapped[ModelStatus] = mapped_column(sa.Enum(ModelStatus))
-    compute_target_id: Mapped[Optional[str]] = mapped_column(
-        sa.String(36), nullable=True
-    )
-    serving_config: Mapped[Optional[dict[str, Any]]] = mapped_column(
-        sa.JSON, nullable=True
-    )
-    generation_defaults: Mapped[Optional[dict[str, Any]]] = mapped_column(
-        sa.JSON, nullable=True
-    )
-    training_run_id: Mapped[Optional[str]] = mapped_column(
-        sa.String(36), nullable=True
-    )
-    hub_ref: Mapped[Optional[str]] = mapped_column(
-        sa.String(512), nullable=True
-    )
-    deployed_at: Mapped[Optional[datetime]] = mapped_column(
-        sa.DateTime, nullable=True
-    )
-    deployed_by_id: Mapped[Optional[str]] = mapped_column(
-        sa.ForeignKey("users.id"), nullable=True
-    )
-    deployed_endpoint: Mapped[Optional[str]] = mapped_column(
-        sa.String(2048), nullable=True
-    )
-
-    deployed_by: Mapped[Optional["User"]] = relationship()  # noqa: F821
-
-
 __all__ = [
     "AgentStatus",
     "AgentVersionStatus",
@@ -305,8 +251,6 @@ __all__ = [
     "ToolStatus",
     "McpTransport",
     "McpStatus",
-    "ModelType",
-    "ModelStatus",
     "agent_skills",
     "agent_tools",
     "agent_mcp_servers",
@@ -315,5 +259,4 @@ __all__ = [
     "Skill",
     "Tool",
     "McpServer",
-    "Model",
 ]

@@ -10,10 +10,11 @@ import { createComputeSlice, type ComputeSlice } from "./compute-slice";
 import { createModelsSlice, type ModelsSlice } from "./models-slice";
 import { createMetricsSlice, type MetricsSlice } from "./metrics-slice";
 import { createConversationsSlice, type ConversationsSlice } from "./conversations-slice";
+import { createAgentsSlice, type AgentsSlice } from "./agents-slice";
 
 export type { WorkloadMetrics, MetricsSnapshot } from "./metrics-slice";
 
-export type AppState = ProjectsSlice & TasksSlice & HubSlice & SkillsSlice & ComputeSlice & ModelsSlice & MetricsSlice & ConversationsSlice & {
+export type AppState = ProjectsSlice & TasksSlice & HubSlice & SkillsSlice & ComputeSlice & ModelsSlice & MetricsSlice & ConversationsSlice & AgentsSlice & {
   loading: boolean;
   error: string | null;
 };
@@ -29,4 +30,5 @@ export const useAppStore = create<AppState>((...a) => ({
   ...createModelsSlice(...a),
   ...createMetricsSlice(...a),
   ...createConversationsSlice(...a),
+  ...createAgentsSlice(...a),
 }));

@@ -8,6 +8,7 @@
         "./venv/lib/python3.12/site-packages/sky/**/*.py",
         "./venv/lib/python3.12/site-packages/prometheus_api_client/**/*.pyi",
     ],
+    "python.terminal.activateEnvInCurrentTerminal": false,
     "python.analysis.exclude": ["**"],
     "python.analysis.indexing": false,
     "python.analysis.diagnosticMode": "openFilesOnly",

@@ -2,14 +2,20 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
 
-// ── Types ───────────────────────────────────────────────────────
+export interface ToolCall {
+  id: string;
+  type: string;
+  function: { name: string; arguments: string };
+}
 
 export interface ConversationMessage {
-  role: "user" | "assistant";
+  role: "user" | "assistant" | "tool";
   content: string;
   reasoningContent?: string | null;
+  toolCalls?: ToolCall[] | null;
+  toolCallId?: string | null;
   timestamp: string | null;
-  tokens: number;
+  tokens: number | null;
   latency?: number;
 }
 
@@ -52,36 +58,3 @@ export interface ConversationDetail extends Conversation {
   messages: ConversationMessage[];
   turns: ConversationTurn[];
 }
-
-// ── Constants ──────────────────────────────────────────────────
-
-export const SENTIMENT_COLORS: Record<string, string> = {
-  positive: "#22C55E",
-  neutral: "#6B7585",
-  negative: "#EF4444",
-};
-
-export const ANNOTATION_STYLES: Record<
-  string,
-  { bg: string; fg: string; border: string; label: string }
-> = {
-  skill_gap: {
-    bg: "#F59E0B12",
-    fg: "#F59E0B",
-    border: "#F59E0B30",
-    label: "SKILL GAP",
-  },
-  trajectory_correction: {
-    bg: "#3B82F612",
-    fg: "#3B82F6",
-    border: "#3B82F630",
-    label: "TRAJECTORY",
-  },
-  quality_issue: {
-    bg: "#EF444412",
-    fg: "#EF4444",
-    border: "#EF444430",
-    label: "QUALITY",
-  },
-};
-

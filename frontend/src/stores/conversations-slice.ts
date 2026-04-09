@@ -3,7 +3,7 @@
 //
 import type { StateCreator } from "zustand";
 import type { AppState } from "./app-store";
-import type { Conversation, ConversationDetail } from "@/features/conversations/conversations-data";
+import type { Conversation, ConversationDetail } from "@/types/conversation";
 import * as conversationsApi from "@/api/conversations";
 
 export type ConversationsSlice = {

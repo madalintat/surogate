@@ -21,6 +21,9 @@ _surogate_home = str(Path.home() / ".surogate" / "dstack")
 os.environ.setdefault("DSTACK_SERVER_DIR", _surogate_home)
 os.environ.setdefault("DSTACK_DO_NOT_UPDATE_DEFAULT_PROJECT", "1")
 os.environ.setdefault("DSTACK_SERVER_CONFIG_DISABLED", "1")
+os.environ.setdefault("DSTACK_DB_POOL_SIZE", "50")
+os.environ.setdefault("DSTACK_SERVER_BACKGROUND_PROCESSING_FACTOR", "2")
+
 # TODO: raise back to WARNING once dstack integration is stable
 os.environ.setdefault("DSTACK_SERVER_LOG_LEVEL", "DEBUG")
 # Prevent dstack's SSH client from offering agent keys — only use the project key file.
@@ -78,6 +81,8 @@ async def init_dstack(database_url: str | None = None) -> None:
     if database_url:
         os.environ["DSTACK_DATABASE_URL"] = database_url
 
+    from sqlalchemy import AsyncAdaptedQueuePool
+    from sqlalchemy.ext.asyncio import create_async_engine
     from dstack._internal.server.db import Database, get_session_ctx, migrate, override_db
     from dstack._internal.server import settings as dstack_settings
     from dstack._internal.server.services.users import get_or_create_admin_user
@@ -98,14 +103,26 @@ async def init_dstack(database_url: str | None = None) -> None:
     db_url = database_url or os.environ.get("DSTACK_DATABASE_URL") or dstack_settings.DATABASE_URL
     logger.info("dstack DB: %s", db_url.split("@")[-1] if "@" in db_url else db_url)
 
+    def _make_db(url: str) -> Database:
+        """Create a Database with pool_pre_ping to avoid stale connections."""
+        engine = create_async_engine(
+            url,
+            echo=dstack_settings.SQL_ECHO_ENABLED,
+            poolclass=AsyncAdaptedQueuePool,
+            pool_size=dstack_settings.DB_POOL_SIZE,
+            max_overflow=dstack_settings.DB_MAX_OVERFLOW,
+            pool_pre_ping=True,
+        )
+        return Database(url=url, engine=engine)
+
     # dstack creates its DB/engine at import time (before the event loop).
     # Recreate it now with the correct URL and a fresh connection pool.
-    override_db(Database(url=db_url))
+    override_db(_make_db(db_url))
 
     # 1. DB migrations
     await migrate()
     # Replace the DB after migration so background tasks get a clean pool.
-    override_db(Database(url=db_url))
+    override_db(_make_db(db_url))
 
     # 2. Admin user + default project
     async with get_session_ctx() as session:

@@ -1,7 +1,7 @@
 // Copyright (c) 2026, Invergent SA, developed by Flavius Burca
 // SPDX-License-Identifier: AGPL-3.0-only
 //
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { PageHeader } from "@/components/page-header";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -15,10 +15,13 @@ import {
   DialogDescription,
   DialogFooter,
 } from "@/components/ui/dialog";
+import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { cn } from "@/utils/cn";
-import { AGENTS, toStatus } from "./agents-data";
+import { toStatus } from "./agents-data";
 import { AgentDetail, AgentEmptyState } from "./agent-detail";
 import type { Agent } from "./agents-data";
+import { DeployAgentDialog } from "./deploy-agent-dialog";
+import { useAppStore } from "@/stores/app-store";
 
 // ── Status filter buttons ──────────────────────────────────────
 
@@ -41,7 +44,7 @@ function AgentListItem({
   onSelect: () => void;
 }) {
   return (
-    <button
+    <button type="button"
       onClick={onSelect}
       className={cn(
         "w-full text-left px-3.5 py-3 border-l-2 border-b border-b-border/50 transition-colors cursor-pointer",
@@ -63,7 +66,7 @@ function AgentListItem({
         </div>
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-1.5 mb-0.5">
-            <span className="text-xs font-semibold text-foreground font-display">
+            <span className="text-sm font-semibold text-foreground font-display">
               {agent.name}
             </span>
             <Badge>v{agent.version}</Badge>
@@ -99,61 +102,6 @@ function AgentListItem({
   );
 }
 
-// ── Deploy modal ───────────────────────────────────────────────
-
-const DEPLOY_TEMPLATES = [
-  { icon: "\u2B21", label: "Blank Agent", desc: "Start from scratch" },
-  { icon: "\u2B21", label: "Chat Agent", desc: "Conversational template" },
-  { icon: "\u26A1", label: "Tool Agent", desc: "With tool-use skills" },
-  { icon: "\u25A4", label: "RAG Agent", desc: "Knowledge-grounded" },
-  { icon: "\u25C8", label: "Safety Agent", desc: "Content moderation" },
-  { icon: "\u29C9", label: "From Hub", desc: "Import from registry" },
-];
-
-function DeployDialog({
-  open,
-  onOpenChange,
-}: {
-  open: boolean;
-  onOpenChange: (open: boolean) => void;
-}) {
-  return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent>
-        <DialogHeader>
-          <DialogTitle>Deploy New Agent</DialogTitle>
-          <DialogDescription>
-            Choose a template or upload a configuration
-          </DialogDescription>
-        </DialogHeader>
-        <div className="grid grid-cols-2 gap-2.5">
-          {DEPLOY_TEMPLATES.map((t) => (
-            <button
-              key={t.label}
-              className="p-3.5 rounded-lg border border-border bg-muted/40 hover:border-amber-500/30 hover:bg-muted/60 transition-colors cursor-pointer text-left flex items-start gap-2.5"
-            >
-              <span className="text-lg text-amber-500 shrink-0">{t.icon}</span>
-              <div>
-                <div className="text-xs font-semibold text-foreground font-display">
-                  {t.label}
-                </div>
-                <div className="text-[10px] text-muted-foreground mt-0.5">
-                  {t.desc}
-                </div>
-              </div>
-            </button>
-          ))}
-        </div>
-        <DialogFooter>
-          <Button variant="outline" onClick={() => onOpenChange(false)}>
-            Cancel
-          </Button>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
-  );
-}
-
 // ── Scale modal ────────────────────────────────────────────────
 
 function ScaleDialog({
@@ -166,6 +114,14 @@ function ScaleDialog({
   agent: Agent;
 }) {
   const [value, setValue] = useState(agent.replicas.desired);
+  const updateAgent = useAppStore((s) => s.updateAgent);
+
+  const handleApply = async () => {
+    await updateAgent(agent.id, {
+      replicas: { current: agent.replicas.current, desired: value },
+    });
+    onOpenChange(false);
+  };
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -203,7 +159,7 @@ function ScaleDialog({
           <Button variant="outline" onClick={() => onOpenChange(false)}>
             Cancel
           </Button>
-          <Button onClick={() => onOpenChange(false)}>Apply</Button>
+          <Button onClick={handleApply}>Apply</Button>
         </DialogFooter>
       </DialogContent>
     </Dialog>
@@ -213,17 +169,24 @@ function ScaleDialog({
 // ── Main page ──────────────────────────────────────────────────
 
 export function AgentsPage() {
-  const [selectedId, setSelectedId] = useState<string | null>("cx-support-v3");
+  const agents = useAppStore((s) => s.agents);
+  const agentsLoading = useAppStore((s) => s.agentsLoading);
+  const fetchAgents = useAppStore((s) => s.fetchAgents);
+  const selectedAgent = useAppStore((s) => s.selectedAgent);
+  const setSelectedAgent = useAppStore((s) => s.setSelectedAgent);
+
   const [filterStatus, setFilterStatus] = useState("all");
   const [filterSearch, setFilterSearch] = useState("");
   const [showDeployModal, setShowDeployModal] = useState(false);
   const [showScaleModal, setShowScaleModal] = useState(false);
+  const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
+  const deleteAgent = useAppStore((s) => s.deleteAgent);
 
-  const agent = selectedId
-    ? AGENTS.find((a) => a.id === selectedId) ?? null
-    : null;
+  useEffect(() => {
+    fetchAgents();
+  }, [fetchAgents]);
 
-  const filtered = AGENTS.filter((a) => {
+  const filtered = agents.filter((a) => {
     if (filterStatus !== "all" && a.status !== filterStatus) return false;
     if (
       filterSearch &&
@@ -235,10 +198,10 @@ export function AgentsPage() {
   });
 
   const statusCounts = {
-    all: AGENTS.length,
-    running: AGENTS.filter((a) => a.status === "running").length,
-    deploying: AGENTS.filter((a) => a.status === "deploying").length,
-    error: AGENTS.filter((a) => a.status === "error").length,
+    all: agents.length,
+    running: agents.filter((a) => a.status === "running").length,
+    deploying: agents.filter((a) => a.status === "deploying").length,
+    error: agents.filter((a) => a.status === "error").length,
   };
 
   return (
@@ -267,18 +230,17 @@ export function AgentsPage() {
               value={filterSearch}
               onChange={(e) => setFilterSearch(e.target.value)}
               placeholder="Filter agents..."
-              className="h-8 text-xs"
             />
             <div className="flex gap-1">
               {STATUS_FILTERS.map((f) => {
                 const count = statusCounts[f.id as keyof typeof statusCounts];
                 const isActive = filterStatus === f.id;
                 return (
-                  <button
+                  <button type="button"
                     key={f.id}
                     onClick={() => setFilterStatus(f.id)}
                     className={cn(
-                      "px-2 py-1 rounded text-[10px] font-medium font-display border transition-colors cursor-pointer",
+                      "px-2 py-1 rounded text-xs font-medium font-display border transition-colors cursor-pointer",
                       isActive
                         ? f.id === "error"
                           ? "border-red-500/20 bg-red-500/10 text-red-500"
@@ -300,23 +262,24 @@ export function AgentsPage() {
               <AgentListItem
                 key={a.id}
                 agent={a}
-                selected={selectedId === a.id}
-                onSelect={() => setSelectedId(a.id)}
+                selected={selectedAgent?.id === a.id}
+                onSelect={() => setSelectedAgent(a)}
               />
             ))}
             {filtered.length === 0 && (
               <div className="py-8 text-center text-muted-foreground/30 text-xs">
-                No agents match filters
+                {agentsLoading ? "Loading agents..." : "No agents match filters"}
               </div>
             )}
           </div>
         </div>
 
         {/* Detail (right) */}
-        {agent ? (
+        {selectedAgent ? (
           <AgentDetail
-            agent={agent}
+            agent={selectedAgent}
             onScale={() => setShowScaleModal(true)}
+            onDelete={() => setShowDeleteConfirm(true)}
           />
         ) : (
           <AgentEmptyState />
@@ -324,15 +287,29 @@ export function AgentsPage() {
       </div>
 
       {/* Modals */}
-      <DeployDialog
+      <DeployAgentDialog
         open={showDeployModal}
         onOpenChange={setShowDeployModal}
       />
-      {agent && (
+      {selectedAgent && (
         <ScaleDialog
           open={showScaleModal}
           onOpenChange={setShowScaleModal}
-          agent={agent}
+          agent={selectedAgent}
+        />
+      )}
+      {selectedAgent && (
+        <ConfirmDialog
+          open={showDeleteConfirm}
+          title={`Delete ${selectedAgent.name}?`}
+          description="This will permanently remove the agent and all its versions. This action cannot be undone."
+          confirmLabel="Delete"
+          variant="destructive"
+          onConfirm={async () => {
+            await deleteAgent(selectedAgent.id);
+            setShowDeleteConfirm(false);
+          }}
+          onCancel={() => setShowDeleteConfirm(false)}
         />
       )}
     </div>

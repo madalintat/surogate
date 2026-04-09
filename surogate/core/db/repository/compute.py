@@ -15,6 +15,7 @@ from surogate.core.db.models.compute import (
     ManagedJob,
     ServingService,
 )
+from surogate.core.db.models.operate import Agent
 
 
 # ── ManagedJob ────────────────────────────────────────────────────────
@@ -318,6 +319,19 @@ async def get_deployed_model_by_name(
     return result.scalar_one_or_none()
 
 
+async def get_deployed_model_by_run_name(
+    session: AsyncSession, run_name: str
+) -> Optional[DeployedModel]:
+    """Resolve a DeployedModel from a dstack run_name via ServingService."""
+    stmt = (
+        sa.select(DeployedModel)
+        .join(ServingService, DeployedModel.serving_service_id == ServingService.id)
+        .where(ServingService.dstack_run_name == run_name)
+    )
+    result = await session.execute(stmt)
+    return result.scalar_one_or_none()
+
+
 async def list_deployed_models(
     session: AsyncSession,
     *,
@@ -357,6 +371,12 @@ async def update_deployed_model(
 async def delete_deployed_model(
     session: AsyncSession, model_id: str
 ) -> None:
+    # Nullify FK references from agents before deleting the model
+    await session.execute(
+        sa.update(Agent)
+        .where(Agent.model_id == model_id)
+        .values(model_id=None)
+    )
     await session.execute(
         sa.delete(DeployedModel).where(DeployedModel.id == model_id)
     )

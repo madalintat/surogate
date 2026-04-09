@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //
 import { authFetch } from "@/api/auth";
-import type { Conversation, ConversationDetail, ConversationTurn, ConversationMessage } from "@/features/conversations/conversations-data";
+import type { Conversation, ConversationDetail, ConversationTurn, ConversationMessage } from "@/types/conversation";
 
 // -- Raw backend types (snake_case) ----------------------------------------
 
@@ -42,9 +42,11 @@ interface RawTurn {
 }
 
 interface RawMessage {
-  role: "user" | "assistant";
+  role: "user" | "assistant" | "tool";
   content: string;
   reasoning_content?: string | null;
+  tool_calls?: { id: string; type: string; function: { name: string; arguments: string } }[] | null;
+  tool_call_id?: string | null;
   timestamp: string | null;
   tokens: number | null;
   latency: number | null;
@@ -139,8 +141,10 @@ function transformDetail(r: RawConversationDetail): ConversationDetail {
       role: m.role,
       content: m.content,
       reasoningContent: m.reasoning_content ?? undefined,
+      toolCalls: m.tool_calls ?? undefined,
+      toolCallId: m.tool_call_id ?? undefined,
       timestamp: m.timestamp,
-      tokens: m.tokens ?? 0,
+      tokens: m.tokens,
       latency: m.latency ?? undefined,
     })),
     turns: r.turns.map((t) => ({
@@ -165,13 +169,15 @@ function transformDetail(r: RawConversationDetail): ConversationDetail {
 export async function listConversations(params?: {
   project_name?: string;
   model?: string;
+  deployed_model_id?: string;
   search?: string;
   limit?: number;
   offset?: number;
 }): Promise<ConversationListResponse> {
   const qs = new URLSearchParams();
   if (params?.project_name) qs.set("project_name", params.project_name);
-  if (params?.model) qs.set("model", params.model);
+  if (params?.deployed_model_id) qs.set("deployed_model_id", params.deployed_model_id);
+  else if (params?.model) qs.set("model", params.model);
   if (params?.search) qs.set("search", params.search);
   if (params?.limit) qs.set("limit", String(params.limit));
   if (params?.offset) qs.set("offset", String(params.offset));

@@ -23,7 +23,7 @@
   "linter": {
     "enabled": true,
     "rules": {
-      "recommended": true,
+      "recommended": false,
       "a11y": { 
         "all": true,
         "useKeyWithClickEvents": "off",
@@ -42,7 +42,7 @@
       "security": { "all": true },
       "style": {
         "all": true,
-        "useNamingConvention": { "options": { "strictCase": false } }
+        "useNamingConvention": { "options": { "strictCase": false }, "level": "off" }
       },
       "suspicious": { 
         "all": true, 

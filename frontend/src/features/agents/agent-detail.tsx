@@ -18,9 +18,11 @@ import { ConfigTab } from "./config-tab";
 export function AgentDetail({
   agent,
   onScale,
+  onDelete,
 }: {
   agent: Agent;
   onScale: () => void;
+  onDelete: () => void;
 }) {
   return (
     <div className="flex-1 flex flex-col overflow-hidden">
@@ -103,8 +105,8 @@ export function AgentDetail({
             <Button variant="outline" size="xs">
               Logs
             </Button>
-            <Button variant="ghost" size="icon-xs">
-              &#x22EF;
+            <Button variant="destructive" size="xs" onClick={onDelete}>
+              Delete
             </Button>
           </div>
         </div>
@@ -118,10 +120,10 @@ export function AgentDetail({
         <div className="px-6 border-b border-border shrink-0">
           <TabsList variant="line">
             <TabsTrigger value="overview">Overview</TabsTrigger>
-            <TabsTrigger value="metrics">Metrics</TabsTrigger>
             <TabsTrigger value="skills">Skills & MCP</TabsTrigger>
-            <TabsTrigger value="versions">Versions</TabsTrigger>
             <TabsTrigger value="config">Config</TabsTrigger>
+            <TabsTrigger value="versions">Versions</TabsTrigger>
+            <TabsTrigger value="metrics">Metrics</TabsTrigger>
           </TabsList>
         </div>
 
@@ -129,18 +131,18 @@ export function AgentDetail({
           <TabsContent value="overview" className="mt-0">
             <OverviewTab agent={agent} />
           </TabsContent>
-          <TabsContent value="metrics" className="mt-0">
-            <MetricsTab agent={agent} />
-          </TabsContent>
           <TabsContent value="skills" className="mt-0 space-y-4">
             <AgentSkillsTable skills={agent.skills} />
             <AgentMcpServers servers={agent.mcpServers} />
           </TabsContent>
+          <TabsContent value="config" className="mt-0">
+            <ConfigTab agent={agent} />
+          </TabsContent>
           <TabsContent value="versions" className="mt-0">
             <VersionsTab agent={agent} />
           </TabsContent>
-          <TabsContent value="config" className="mt-0">
-            <ConfigTab agent={agent} />
+          <TabsContent value="metrics" className="mt-0">
+            <MetricsTab agent={agent} />
           </TabsContent>
         </div>
       </Tabs>

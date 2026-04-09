@@ -135,7 +135,7 @@ export function ConfigTab({ model }: { model: Model }) {
 
   const backends = allBackends.filter((b) => b.type !== "kubernetes");
 
-  const needsCompute = !model.source || model.source === "local_hub" || model.source === "huggingface";
+  const needsCompute = model.engine !== "openrouter" && model.engine !== "openai_compat";
 
   // Derive initial compute target from model's infra
   const isCloud = !!model.infra && model.infra !== "kubernetes";

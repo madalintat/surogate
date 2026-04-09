@@ -12,8 +12,8 @@ import {
   SelectItem,
 } from "@/components/ui/select";
 import { useAppStore } from "@/stores/app-store";
-import { ConversationListItem } from "./conversation-list-item";
-import { ConversationDetail, ConversationEmptyState } from "./conversation-detail";
+import { ConversationListItem } from "@/components/conversations/conversation-list-item";
+import { ConversationDetail, ConversationEmptyState } from "@/components/conversations/conversation-detail";
 
 export function ConversationsPage() {
   const conversations = useAppStore((s) => s.conversations);

@@ -11,8 +11,8 @@ class ServerConfig:
     port: int = 8888
     workers: int = 1
     log_level: str = 'info'
-    database_url: str = 'postgresql+asyncpg://surogate:surogate@127.0.0.1:5432/surogate'
-    dstack_database_url: str = 'postgresql+asyncpg://dstack:dstack@127.0.0.1:5432/dstack'
+    database_url: str = 'postgresql+asyncpg://surogate:surogate@127.0.0.1:32432/surogate'
+    dstack_database_url: str = 'postgresql+asyncpg://dstack:dstack@127.0.0.1:32432/dstack'
     lakefs_endpoint: Optional[str] = None
     lakefs_s3_endpoint: Optional[str] = None
     lakefs_k8s_s3_endpoint: Optional[str] = 'http://lakefs-s3.lakefs.svc'

@@ -71,6 +71,25 @@ def _uptime(svc: Optional[ServingService]) -> str:
     return f"{hours}h"
 
 
+_PROXY_ENGINES = {"openrouter", "openai_compat"}
+
+
+def _model_endpoint(
+    model: DeployedModel,
+    svc: Optional[ServingService],
+) -> str:
+    """Return the endpoint URL for a model.
+
+    Proxy models (OpenRouter / URL) get a backend proxy path;
+    dstack-served models use the service endpoint.
+    """
+    if model.engine in _PROXY_ENGINES:
+        return f"/proxy/services/_model/{model.id}"
+    if svc and svc.endpoint:
+        return svc.endpoint
+    return "\u2014"
+
+
 # ── Response builder ─────────────────────────────────────────────────
 
 
@@ -133,7 +152,7 @@ def build_model_response(
         deployed_by=model.deployed_by_id,
         namespace=model.namespace or "\u2014",
         project_color="#6B7280",
-        endpoint=svc.endpoint or "\u2014" if svc else "\u2014",
+        endpoint=_model_endpoint(model, svc),
         image=model.image or "\u2014",
         hub_ref=model.hub_ref or "",
         infra=svc.infra if svc else None,
@@ -193,21 +212,23 @@ async def create_model(
     """
 
     # Resolve model info from config.json / generation_config.json
+    # (skip for proxy models — no local files to inspect)
     resolved: dict = {}
-    try:
-        if hub_ref and server_config:
-            client = await lakefs.get_lakefs_client(
-                requested_by_id, session, server_config,
+    if engine not in _PROXY_ENGINES:
+        try:
+            if hub_ref and server_config:
+                client = await lakefs.get_lakefs_client(
+                    requested_by_id, session, server_config,
+                )
+                resolved = await resolve_from_lakefs(client, hub_ref)
+            elif base_model and not hub_ref:
+                resolved = await asyncio.to_thread(
+                    resolve_from_huggingface, base_model,
+                )
+        except Exception:
+            logger.warning(
+                f"Failed to resolve model info for {base_model}", exc_info=True,
             )
-            resolved = await resolve_from_lakefs(client, hub_ref)
-        elif base_model and not hub_ref:
-            resolved = await asyncio.to_thread(
-                resolve_from_huggingface, base_model,
-            )
-    except Exception:
-        logger.warning(
-            f"Failed to resolve model info for {base_model}", exc_info=True,
-        )
 
     # Merge resolved values — explicit request params take precedence
     if not family and resolved.get("family"):
@@ -221,21 +242,23 @@ async def create_model(
     if not generation_defaults and resolved.get("generation_defaults"):
         generation_defaults = resolved["generation_defaults"]
 
-    # Build service name: <model_slug>-<4-char random suffix>
     import secrets
     svc_base = f"{name}-{secrets.token_hex(2)}"
     svc_name = await _unique_service_name(session, svc_base)
 
-    # Create the ServingService (unconfigured — user must set infra,
-    # accelerators, and engine via the Config tab before starting).
-    svc = await repo.create_serving_service(
-        session,
-        name=svc_name,
-        project_id=project_id,
-        requested_by_id=requested_by_id,
-        task_yaml="",
-        status="stopped",
-    )
+    # Proxy models don't need a ServingService — they forward to an
+    # external API.  Only create one for locally-served engines.
+    svc_id: Optional[str] = None
+    if engine not in _PROXY_ENGINES:
+        svc = await repo.create_serving_service(
+            session,
+            name=svc_name,
+            project_id=project_id,
+            requested_by_id=requested_by_id,
+            task_yaml="",
+            status="stopped",
+        )
+        svc_id = svc.id
 
     model = await repo.create_deployed_model(
         session,
@@ -256,7 +279,7 @@ async def create_model(
         source=source,
         serving_config=serving_config,
         generation_defaults=generation_defaults,
-        serving_service_id=svc.id,
+        serving_service_id=svc_id,
     )
     return model
 
@@ -450,7 +473,7 @@ def _build_service_params(
         }
 
     return {
-        "image": "ghcr.io/invergent-ai/sky-llama-cpp:full-cuda12",
+        "image": "ghcr.io/invergent-ai/surogate-llama-cpp:full-cuda12",
         "commands": [run_cmd],
         "port": 8080,
         "env": env,
