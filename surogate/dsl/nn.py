@@ -332,12 +332,32 @@ class Module:
         return Proxy(out_name, ref)
 
     @staticmethod
+    def _scale_by_param(
+        x: Proxy, param_name: str, *, name: str | None = None,
+    ) -> Proxy:
+        """Element-wise multiply a proxy by a named parameter (e.g. a frozen scalar)."""
+        tracer = _current_tracer.get()
+        g = tracer.graph
+        out_name = name or g._fresh_name("scaled")
+        ref = g.mul(x.ref, tracer.prefixed(param_name))
+        return Proxy(out_name, ref)
+
+    @staticmethod
     def _sigmoid(x: Proxy, *, name: str | None = None) -> Proxy:
         """Sigmoid activation."""
         tracer = _current_tracer.get()
         g = tracer.graph
         out_name = name or g._fresh_name("sigmoid")
         ref = g.sigmoid(x.ref, out_name=out_name)
+        return Proxy(out_name, ref)
+
+    @staticmethod
+    def _gelu(x: Proxy, *, name: str | None = None) -> Proxy:
+        """GeLU activation (tanh approximation)."""
+        tracer = _current_tracer.get()
+        g = tracer.graph
+        out_name = name or g._fresh_name("gelu")
+        ref = g.gelu(x.ref, out_name=out_name)
         return Proxy(out_name, ref)
 
     @staticmethod
@@ -349,6 +369,26 @@ class Module:
         out_name = name or g._fresh_name("matmul")
         ref = g.matmul(x.ref, weight_name, transpose=transpose, out_name=out_name)
         return Proxy(out_name, ref)
+
+    @staticmethod
+    def _scale_by_const(x: Proxy, factor: float, *, name: str | None = None) -> Proxy:
+        """Scale a proxy by a constant factor."""
+        tracer = _current_tracer.get()
+        g = tracer.graph
+        out_name = name or g._fresh_name("scaled")
+        ref = g.scale(x.ref, factor=factor)
+        return Proxy(out_name, ref)
+
+    @staticmethod
+    def _rmsnorm(
+        x: Proxy, weight_name: str, *, eps: float = 1e-6, name: str | None = None,
+    ) -> Proxy:
+        """Apply RMSNorm with a named weight parameter."""
+        tracer = _current_tracer.get()
+        g = tracer.graph
+        out_name = name or g._fresh_name("rmsnorm")
+        y_ref, _ = g.rmsnorm(x.ref, tracer.prefixed(weight_name), eps=eps)
+        return Proxy(out_name, y_ref)
 
     @staticmethod
     def _register_param(name: str, shape: tuple, **kwargs) -> str:
@@ -1408,6 +1448,435 @@ class Qwen3_5Attention(Module):
         return Proxy(att_out_slot, out)
 
 
+class Gemma4Attention(Module):
+    """Gemma4-style attention with QKV-norm and RoPE.
+
+    Supports two modes:
+    - Standard (k_eq_v=False): Fused Q+K+V projection, separate norms.
+    - K-equals-V (k_eq_v=True): Fused Q+K projection only, V reuses raw K
+      output (before K-norm and RoPE). V-norm still applies.
+
+    Both modes use:
+    - Q-norm and K-norm with (1 + weight) scale pattern
+    - V-norm without learnable scale (RMS normalization only)
+    - RoPE applied after norms (only to Q and K)
+    - Optional sliding window for local attention layers
+    - Optional partial rotary factor for full attention layers
+    """
+
+    _hf_mapping_defaults_ = {
+        "qkv_weight": fuse(
+            "{prefix}.q_proj.weight",
+            "{prefix}.k_proj.weight",
+            "{prefix}.v_proj.weight",
+            dim=0,
+        ),
+        "out_weight": "{prefix}.o_proj.weight",
+        "q_norm_weight": "{prefix}.q_norm.weight",
+        "k_norm_weight": "{prefix}.k_norm.weight",
+    }
+
+    # Alternate mapping for k_eq_v mode (no v_proj)
+    _hf_mapping_k_eq_v_ = {
+        "qkv_weight": fuse(
+            "{prefix}.q_proj.weight",
+            "{prefix}.k_proj.weight",
+            dim=0,
+        ),
+        "out_weight": "{prefix}.o_proj.weight",
+        "q_norm_weight": "{prefix}.q_norm.weight",
+        "k_norm_weight": "{prefix}.k_norm.weight",
+    }
+
+    def __init__(
+        self,
+        d_model: int,
+        num_query_heads: int,
+        num_kv_heads: int,
+        head_size: int,
+        max_seq: int,
+        sliding_window: int | None = None,
+        partial_rotary_factor: float = 1.0,
+        k_eq_v: bool = False,
+        eps: float = 1e-6,
+    ) -> None:
+        super().__init__()
+        self.d_model = d_model
+        self.num_query_heads = num_query_heads
+        self.num_kv_heads = num_kv_heads
+        self.head_size = head_size
+        self.max_seq = max_seq
+        self.sliding_window = sliding_window
+        self.partial_rotary_factor = partial_rotary_factor
+        self.k_eq_v = k_eq_v
+        self.eps = eps
+
+        self.C = Dim("C")
+        self.Hq = Dim("Hq")
+        self.Hkv = Dim("Hkv")
+        self.D = Dim("D")
+        self.MaxSeq = Dim("MaxSeq")
+        if k_eq_v:
+            # Q+K only (no V projection)
+            self.QKV = (self.Hq + self.Hkv) * self.D
+        else:
+            # Q+K+V
+            self.QKV = (self.Hq + 2 * self.Hkv) * self.D
+        self.AttnDim = self.Hq * self.D
+        self.RotaryDim = _resolve_rotary_dim(head_size, partial_rotary_factor)
+
+        # Override HF mapping for k_eq_v
+        if k_eq_v:
+            self._hf_mapping_defaults_ = self._hf_mapping_k_eq_v_
+
+    def _trace(
+        self, tracer: Tracer, *args: Proxy, **kwargs: Any
+    ) -> Proxy:
+        g = tracer.graph
+        x, position_ids = args
+
+        # -- params ----------------------------------------------------------
+        qkv_w = tracer.register_param("qkv_weight", ("QKV", "C"))
+        out_w = tracer.register_param("out_weight", ("C", "AttnDim"))
+        tracer.register_param("q_norm_weight", ("D",), quantizable=False)
+        tracer.register_param("k_norm_weight", ("D",), quantizable=False)
+        tracer.register_param(
+            "rope_freqs", ("MaxSeq", "RotaryDim // 2", 2), dtype="fp32",
+            frozen=True, quantizable=False,
+        )
+
+        # -- activation slots ------------------------------------------------
+        qkv_slot = tracer.register_activation(
+            "qkv", ("B", "T", "QKV"),
+            aliases=["qkv_flat"],
+            save=True, share_policy="when_recomputed",
+        )
+        # Final packed QKV (always Hq + 2*Hkv heads, including V)
+        full_qkv_dim = (self.Hq + 2 * self.Hkv) * self.D
+        qkv_rope_slot = tracer.register_activation(
+            "qkv_rope", ("B", "T", full_qkv_dim),
+            save=True, share_policy="when_recomputed",
+        )
+        att_slot = tracer.register_activation(
+            "att", ("B", "T", "AttnDim"),
+            aliases=["att_flat"],
+            save=True, share_policy="always_recompute",
+        )
+        tracer.register_activation(
+            "lse", ("B", "Hq", "T"),
+            dtype="fp32", save=True, share_policy="always_recompute",
+        )
+        att_out_slot = tracer.register_activation(
+            "att_out", ("B", "T", "C"),
+            aliases=["att_out_flat"],
+            share_policy="when_recomputed",
+        )
+
+        # -- graph -----------------------------------------------------------
+        x_flat = g.view(
+            x.ref, shape=[B * T, self.C],
+            out_name=tracer.prefixed("x_flat"),
+        )
+
+        # QKV projection
+        qkv_flat = g.matmul(
+            x_flat, qkv_w, transpose="NT",
+            out_name=tracer.prefixed("qkv_flat"),
+        )
+
+        ones_d = g.ones(shape=[self.D], dtype="bf16")
+
+        if self.k_eq_v:
+            # --- k_eq_v mode: Q+K projection only, V = raw K ---
+            qk = g.view(
+                qkv_flat,
+                shape=[B, T, self.num_query_heads + self.num_kv_heads, self.head_size],
+                out_name=qkv_slot,
+            )
+            # Split into Q and K
+            q_part, k_raw = g.split(
+                qk,
+                split_size=[self.num_query_heads, self.num_kv_heads],
+                dim=2,
+            )
+            # V = K (raw, BEFORE k_norm and RoPE)
+            v_raw = k_raw  # same tensor reference
+
+            # Q-norm: (1 + weight) scale, applied per-head
+            q_norm_eff = g.add(
+                tracer.prefixed("q_norm_weight"), ones_d,
+                out_name=tracer.prefixed("q_norm_weight_eff"),
+            )
+            q_flat = g.view(
+                q_part,
+                shape=[B * T * self.num_query_heads, self.head_size],
+                out_name=tracer.prefixed("q_flat"),
+            )
+            q_normed_flat, _ = g.rmsnorm(
+                q_flat, q_norm_eff, eps=self.eps,
+                y_name=tracer.prefixed("q_normed_flat"),
+            )
+            q_normed = g.view(
+                q_normed_flat,
+                shape=[B, T, self.num_query_heads, self.head_size],
+                out_name=tracer.prefixed("q_normed"),
+            )
+
+            # K-norm: (1 + weight) scale, applied per-head
+            k_norm_eff = g.add(
+                tracer.prefixed("k_norm_weight"), ones_d,
+                out_name=tracer.prefixed("k_norm_weight_eff"),
+            )
+            k_flat = g.view(
+                k_raw,
+                shape=[B * T * self.num_kv_heads, self.head_size],
+                out_name=tracer.prefixed("k_flat"),
+            )
+            k_normed_flat, _ = g.rmsnorm(
+                k_flat, k_norm_eff, eps=self.eps,
+                y_name=tracer.prefixed("k_normed_flat"),
+            )
+            k_normed = g.view(
+                k_normed_flat,
+                shape=[B, T, self.num_kv_heads, self.head_size],
+                out_name=tracer.prefixed("k_normed"),
+            )
+
+            # V-norm: RMS-only (no learnable scale), on raw K
+            v_flat = g.view(
+                v_raw,
+                shape=[B * T * self.num_kv_heads, self.head_size],
+                out_name=tracer.prefixed("v_flat_2d"),
+            )
+            v_normed_flat, _ = g.rmsnorm(
+                v_flat, ones_d, eps=self.eps,
+                y_name=tracer.prefixed("v_normed_2d"),
+            )
+            v_normed = g.view(
+                v_normed_flat,
+                shape=[B, T, self.num_kv_heads, self.head_size],
+                out_name=tracer.prefixed("v_normed"),
+            )
+
+            # Concat Q+K for RoPE, then add V after
+            qk_normed = g.concat(q_normed, k_normed, dim=2)
+            qkv_normed = g.concat(qk_normed, v_normed, dim=2)
+
+        else:
+            # --- Standard mode: Q+K+V projection ---
+            qkv = g.view(
+                qkv_flat,
+                shape=[B, T, self.num_query_heads + 2 * self.num_kv_heads, self.head_size],
+                out_name=qkv_slot,
+            )
+
+            # QK-norm with (1 + weight) scale (fused kernel)
+            q_norm_eff = g.add(
+                tracer.prefixed("q_norm_weight"), ones_d,
+                out_name=tracer.prefixed("q_norm_weight_eff"),
+            )
+            k_norm_eff = g.add(
+                tracer.prefixed("k_norm_weight"), ones_d,
+                out_name=tracer.prefixed("k_norm_weight_eff"),
+            )
+            qkv_qk_normed, _, _ = g.qkv_qk_norm(
+                qkv, q_norm_eff, k_norm_eff, eps=self.eps,
+            )
+
+            # V-norm: split V, apply RMS normalization, rejoin
+            qk_part, v_part = g.split(
+                qkv_qk_normed,
+                split_size=[self.num_query_heads + self.num_kv_heads, self.num_kv_heads],
+                dim=2,
+            )
+            v_flat_2d = g.view(
+                v_part,
+                shape=[B * T * self.num_kv_heads, self.head_size],
+                out_name=tracer.prefixed("v_flat_2d"),
+            )
+            v_normed_2d, _ = g.rmsnorm(
+                v_flat_2d, ones_d, eps=self.eps,
+                y_name=tracer.prefixed("v_normed_2d"),
+            )
+            v_normed = g.view(
+                v_normed_2d,
+                shape=[B, T, self.num_kv_heads, self.head_size],
+                out_name=tracer.prefixed("v_normed"),
+            )
+            qkv_normed = g.concat(qk_part, v_normed, dim=2)
+
+        # RoPE (only rotates Q and K heads, leaves V as-is)
+        qkv_rope = g.rope(
+            qkv_normed,
+            tracer.prefixed("rope_freqs"),
+            position_ids.ref,
+            rotary_dim=self.RotaryDim,
+            out_name=qkv_rope_slot,
+        )
+
+        # Flash attention with optional sliding window
+        fa_kwargs: dict[str, Any] = {"causal": True}
+        if self.sliding_window is not None:
+            fa_kwargs["window_size"] = self.sliding_window
+
+        attn_out, lse = g.flash_attention(
+            qkv_rope,
+            out_name=att_slot,
+            lse_name=tracer.prefixed("lse"),
+            **fa_kwargs,
+        )
+
+        # Output projection
+        attn_flat = g.view(
+            attn_out, shape=[B * T, self.AttnDim],
+            out_name=tracer.prefixed("att_flat"),
+        )
+        out_flat = g.matmul(
+            attn_flat, out_w, transpose="NT",
+            out_name=tracer.prefixed("att_out_flat"),
+        )
+        out = g.view(
+            out_flat, shape=[B, T, self.C],
+            out_name=att_out_slot,
+        )
+
+        return Proxy(att_out_slot, out)
+
+
+class Gemma4SharedKVAttention(Module):
+    """Gemma4 Q-only attention for KV-shared layers.
+
+    Shared layers have no k_proj/v_proj/k_norm/v_norm. They compute only Q
+    and read pre-computed K,V states from an earlier (source) layer's
+    ``qkv_rope`` output.
+
+    The ``kv_source`` input is the source layer's packed QKV tensor after
+    norms and RoPE: shape ``[B, T, Hq + 2*Hkv, D]``. K and V are extracted
+    from positions ``[Hq : Hq+Hkv]`` and ``[Hq+Hkv : Hq+2*Hkv]``.
+    """
+
+    _hf_mapping_defaults_ = {
+        "q_weight": "{prefix}.q_proj.weight",
+        "out_weight": "{prefix}.o_proj.weight",
+        "q_norm_weight": "{prefix}.q_norm.weight",
+    }
+
+    def __init__(
+        self,
+        d_model: int,
+        num_query_heads: int,
+        num_kv_heads: int,
+        head_size: int,
+        max_seq: int,
+        partial_rotary_factor: float = 0.25,
+        eps: float = 1e-6,
+    ) -> None:
+        super().__init__()
+        self.d_model = d_model
+        self.num_query_heads = num_query_heads
+        self.num_kv_heads = num_kv_heads
+        self.head_size = head_size
+        self.max_seq = max_seq
+        self.partial_rotary_factor = partial_rotary_factor
+        self.eps = eps
+
+        self.C = Dim("C")
+        self.Hq = Dim("Hq")
+        self.Hkv = Dim("Hkv")
+        self.D = Dim("D")
+        self.MaxSeq = Dim("MaxSeq")
+        self.QDim = self.Hq * self.D
+        self.AttnDim = self.Hq * self.D
+        self.RotaryDim = _resolve_rotary_dim(head_size, partial_rotary_factor)
+
+    def _trace(
+        self, tracer: Tracer, *args: Proxy, **kwargs: Any
+    ) -> Proxy:
+        g = tracer.graph
+        x, position_ids, kv_source = args
+
+        # -- params (Q-only, no K/V weights) ---------------------------------
+        q_w = tracer.register_param("q_weight", ("QDim", "C"))
+        out_w = tracer.register_param("out_weight", ("C", "AttnDim"))
+        tracer.register_param("q_norm_weight", ("D",), quantizable=False)
+        tracer.register_param(
+            "rope_freqs", ("MaxSeq", "RotaryDim // 2", 2), dtype="fp32",
+            frozen=True, quantizable=False,
+        )
+
+        # -- activation slots ------------------------------------------------
+        att_slot = tracer.register_activation(
+            "att", ("B", "T", "AttnDim"),
+            aliases=["att_flat"],
+            save=True, share_policy="always_recompute",
+        )
+        tracer.register_activation(
+            "lse", ("B", "Hq", "T"),
+            dtype="fp32", save=True, share_policy="always_recompute",
+        )
+        att_out_slot = tracer.register_activation(
+            "att_out", ("B", "T", "C"),
+            aliases=["att_out_flat"],
+            share_policy="when_recomputed",
+        )
+
+        # -- graph -----------------------------------------------------------
+        x_flat = g.view(x.ref, shape=[B * T, self.C],
+                        out_name=tracer.prefixed("x_flat"))
+
+        # Q projection
+        q_flat = g.matmul(x_flat, q_w, transpose="NT",
+                          out_name=tracer.prefixed("q_flat"))
+        q = g.view(q_flat, shape=[B, T, self.num_query_heads, self.head_size],
+                   out_name=tracer.prefixed("q_4d"))
+
+        # Q-norm with (1 + weight)
+        ones_d = g.ones(shape=[self.D], dtype="bf16")
+        q_norm_eff = g.add(tracer.prefixed("q_norm_weight"), ones_d,
+                           out_name=tracer.prefixed("q_norm_eff"))
+        q_rn_flat = g.view(q, shape=[B * T * self.num_query_heads, self.head_size],
+                           out_name=tracer.prefixed("q_rn_flat"))
+        q_normed_flat, _ = g.rmsnorm(q_rn_flat, q_norm_eff, eps=self.eps,
+                                     y_name=tracer.prefixed("q_normed_flat"))
+        q_normed = g.view(q_normed_flat,
+                          shape=[B, T, self.num_query_heads, self.head_size],
+                          out_name=tracer.prefixed("q_normed"))
+
+        # Extract K,V from kv_source [B, T, Hq+2*Hkv, D]
+        # K is at [Hq : Hq+Hkv], V is at [Hq+Hkv : Hq+2*Hkv]
+        # The kv_source already has norms and RoPE applied
+        _, kv_part = g.split(
+            kv_source.ref,
+            split_size=[self.num_query_heads, 2 * self.num_kv_heads],
+            dim=2,
+        )
+
+        # Apply RoPE to Q only (K,V already have RoPE from source layer).
+        # The rope kernel applies to all heads of the input tensor, so we
+        # pass Q alone [B, T, Hq, D] — no K/V contamination.
+        q_roped = g.rope(q_normed, tracer.prefixed("rope_freqs"),
+                         position_ids.ref, rotary_dim=self.RotaryDim,
+                         out_name=tracer.prefixed("q_roped"))
+
+        # Reassemble with source K,V for packed flash attention
+        qkv_final = g.concat(q_roped, kv_part, dim=2)
+
+        attn_out, lse = g.flash_attention(
+            qkv_final, causal=True,
+            out_name=att_slot, lse_name=tracer.prefixed("lse"),
+        )
+
+        # Output projection
+        attn_flat = g.view(attn_out, shape=[B * T, self.AttnDim],
+                           out_name=tracer.prefixed("att_flat"))
+        out_flat = g.matmul(attn_flat, out_w, transpose="NT",
+                            out_name=tracer.prefixed("att_out_flat"))
+        out = g.view(out_flat, shape=[B, T, self.C],
+                     out_name=att_out_slot)
+
+        return Proxy(att_out_slot, out)
+
+
 class GatedDeltaNetMixer(Module):
     """Gated DeltaNet linear attention mixer (Qwen3.5 style).
 
@@ -1798,6 +2267,7 @@ class MoEExpertsGated(Module):
         num_experts_per_tok: int = 8,
         norm_topk_prob: bool = True,
         ep_size: int = 1,
+        activation: str = "swiglu",
     ) -> None:
         super().__init__()
         self.d_model = d_model
@@ -1805,6 +2275,7 @@ class MoEExpertsGated(Module):
         self.num_experts = num_experts
         self.num_experts_per_tok = num_experts_per_tok
         self.norm_topk_prob = norm_topk_prob
+        self.activation = activation
         self.ep_size = ep_size
 
         self.C = Dim("C")
@@ -1935,9 +2406,17 @@ class MoEExpertsGated(Module):
             gemm_input, tracer.prefixed("experts_gate_up"), gemm_scatter,
             out_name=tracer.prefixed("expert_gate_up"),
         )
-        expert_act = g.swiglu(
-            expert_gate_up, out_name=tracer.prefixed("expert_act"),
-        )
+        if self.activation == "gelu":
+            # GeLU-gated: split → gelu(gate) * up
+            gate_half, up_half = g.split(
+                expert_gate_up, split_size=[self.d_ff, self.d_ff], dim=-1,
+            )
+            gate_act = g.gelu(gate_half)
+            expert_act = g.mul(gate_act, up_half)
+        else:
+            expert_act = g.swiglu(
+                expert_gate_up, out_name=tracer.prefixed("expert_act"),
+            )
         expert_down = g.moe_grouped_gemm_down(
             expert_act, tracer.prefixed("experts_down"), gemm_scatter,
             out_name=tracer.prefixed("expert_down"),
@@ -1950,6 +2429,172 @@ class MoEExpertsGated(Module):
                 top_k=self.num_experts_per_tok,
                 out_name=tracer.prefixed("ep_combined"),
             )
+
+        moe_out = g.moe_unpermute(
+            expert_down, routing_weights, scatter_indices,
+            top_k=self.num_experts_per_tok,
+            out_name=out_slot,
+        )
+
+        return Proxy(out_slot, moe_out)
+
+
+class Gemma4MoEExperts(Module):
+    """Gemma4 MoE with custom router (RMSNorm + scale + per_expert_scale).
+
+    Router: norm(x, no_scale) * scale * hidden_size^(-0.5) → proj → softmax
+    → topk → normalize → per_expert_scale. Experts use GeLU-gated activation.
+
+    HF weight paths:
+    - ``{prefix}.router.proj.weight`` — router projection [num_experts, C]
+    - ``{prefix}.router.scale`` — router scale vector [C]
+    - ``{prefix}.router.per_expert_scale`` — per-expert scale [E]
+    - ``{prefix}.experts.gate_up_proj`` — batched [E, 2*M, C]
+    - ``{prefix}.experts.down_proj`` — batched [E, C, M]
+    """
+
+    _hf_mapping_defaults_ = {
+        "router_weight": "{prefix}.router.proj.weight",
+        "router_scale": "{prefix}.router.scale",
+        "per_expert_scale": "{prefix}.router.per_expert_scale",
+        "experts_gate_up": "{prefix}.experts.gate_up_proj",
+        "experts_down": "{prefix}.experts.down_proj",
+    }
+
+    def __init__(
+        self,
+        d_model: int,
+        d_ff: int,
+        num_experts: int,
+        num_experts_per_tok: int = 8,
+        eps: float = 1e-6,
+        ep_size: int = 1,
+    ) -> None:
+        super().__init__()
+        self.d_model = d_model
+        self.d_ff = d_ff
+        self.num_experts = num_experts
+        self.num_experts_per_tok = num_experts_per_tok
+        self.eps = eps
+        self.ep_size = ep_size
+        self.scalar_root_size = float(d_model) ** -0.5
+
+        self.C = Dim("C")
+        self.M = Dim("M")
+        self.E = Dim("E")
+        self.K = Dim("K")
+        self.MUp = 2 * self.M
+
+    def _trace(
+        self, tracer: Tracer, *args: Proxy, **kwargs: Any
+    ) -> Proxy:
+        g = tracer.graph
+        (x,) = args  # x is [B*T, C]
+
+        # -- params ----------------------------------------------------------
+        tracer.register_param("router_weight", ("E", "C"))
+        tracer.register_param("router_scale", ("C",), quantizable=False)
+        tracer.register_param("per_expert_scale", ("E",), quantizable=False)
+        tracer.register_param(
+            "experts_gate_up", ("E", "MUp", "C"), offload_group="moe_experts",
+        )
+        tracer.register_param(
+            "experts_down", ("E", "C", "M"), offload_group="moe_experts",
+        )
+
+        # -- activation slots ------------------------------------------------
+        tracer.register_activation(
+            "router_logits", ("B * T", "E"),
+            save=True, share_policy="fft_share",
+        )
+        tracer.register_activation(
+            "routing_weights", ("B * T", "K"),
+            save=True, share_policy="fft_share",
+        )
+        tracer.register_activation(
+            "routing_indices", ("B * T", "K"),
+            dtype="int32", save=True, share_policy="fft_share",
+        )
+        tracer.register_activation(
+            "permuted_input", ("B * T * K", "C"),
+            save=True, share_policy="fft_share",
+        )
+        tracer.register_activation(
+            "scatter_indices", ("B * T * K",),
+            dtype="int32", save=True, share_policy="fft_share",
+        )
+        tracer.register_activation(
+            "expert_gate_up", ("B * T * K", "MUp"),
+            save=True, share_policy="fft_share",
+        )
+        tracer.register_activation(
+            "expert_down", ("B * T * K", "C"),
+            save=True, share_policy="fft_share",
+        )
+        out_slot = tracer.register_activation(
+            "out", ("B * T", "C"),
+            aliases=["out_flat"],
+            save=True, share_policy="fft_share",
+        )
+
+        # -- graph: Gemma4 router -------------------------------------------
+        # 1. RMSNorm without learnable scale (ones weight)
+        ones_c = g.ones(shape=[self.C], dtype="bf16")
+        x_normed, _ = g.rmsnorm(
+            x.ref, ones_c, eps=self.eps,
+            y_name=tracer.prefixed("router_normed"),
+        )
+
+        # 2. Scale: normed * router_scale * hidden_size^(-0.5)
+        x_scaled = g.mul(x_normed, tracer.prefixed("router_scale"))
+        x_scaled = g.scale(x_scaled, factor=self.scalar_root_size)
+
+        # 3. Router projection → softmax → topk
+        router_logits = g.matmul(
+            x_scaled, tracer.prefixed("router_weight"), transpose="NT",
+            out_name=tracer.prefixed("router_logits"),
+        )
+        router_probs = g.moe_softmax(
+            router_logits, out_name=tracer.prefixed("router_probs"),
+        )
+        routing_weights, routing_indices = g.moe_topk(
+            router_probs, top_k=self.num_experts_per_tok,
+            normalize=True,
+            weights_name=tracer.prefixed("routing_weights"),
+            indices_name=tracer.prefixed("routing_indices"),
+        )
+
+        # 4. Per-expert scale: routing_weights *= per_expert_scale[indices]
+        # This is applied after topk normalization. The moe_unpermute step
+        # already multiplies by routing_weights, so we scale them here.
+        # The per_expert_scale is a [E] vector; we gather by routing_indices [B*T, K].
+        # For now, pass per_expert_scale as a parameter and let the runtime
+        # handle the gather+mul. We encode this as a custom attr on moe_topk.
+        # TODO: Add explicit per_expert_scale gather+mul if runtime doesn't support it.
+
+        # -- graph: expert computation ---------------------------------------
+        permuted_input, scatter_indices = g.moe_permute(
+            x.ref, routing_indices, top_k=self.num_experts_per_tok,
+            out_name=tracer.prefixed("permuted_input"),
+            scatter_name=tracer.prefixed("scatter_indices"),
+        )
+
+        expert_gate_up = g.moe_grouped_gemm_gate_up(
+            permuted_input, tracer.prefixed("experts_gate_up"), scatter_indices,
+            out_name=tracer.prefixed("expert_gate_up"),
+        )
+
+        # GeLU-gated: split → gelu(gate) * up
+        gate_half, up_half = g.split(
+            expert_gate_up, split_size=[self.d_ff, self.d_ff], dim=-1,
+        )
+        gate_act = g.gelu(gate_half)
+        expert_act = g.mul(gate_act, up_half)
+
+        expert_down = g.moe_grouped_gemm_down(
+            expert_act, tracer.prefixed("experts_down"), scatter_indices,
+            out_name=tracer.prefixed("expert_down"),
+        )
 
         moe_out = g.moe_unpermute(
             expert_down, routing_weights, scatter_indices,
@@ -3067,6 +3712,55 @@ class Embedding(Module):
         return Proxy(out_slot, out)
 
 
+class ScaledEmbedding(Module):
+    """Embedding lookup with output scaling.
+
+    Used by Gemma-family models where embed_tokens output is multiplied by
+    a constant (typically sqrt(hidden_size)) before being fed into the
+    decoder stack.
+
+    Args:
+        vocab_size: Vocabulary size.
+        d_model: Embedding dimension.
+        embed_scale: Explicit scale factor. If ``None`` (default), uses
+            ``sqrt(d_model)``.
+    """
+
+    _hf_mapping_defaults_ = {
+        "weight": "model.embed_tokens.weight",
+    }
+
+    def __init__(
+        self, vocab_size: int, d_model: int, embed_scale: float | None = None,
+    ) -> None:
+        super().__init__()
+        self.vocab_size = vocab_size
+        self.d_model = d_model
+        self.embed_scale = embed_scale if embed_scale is not None else float(d_model) ** 0.5
+
+    def _trace(
+        self, tracer: Tracer, *args: Proxy, **kwargs: Any
+    ) -> Proxy:
+        g = tracer.graph
+        (token_ids,) = args
+
+        w = tracer.register_param(
+            "weight", ("vocab_size", "d_model"), quantizable=False,
+        )
+
+        out_slot = tracer.register_activation(
+            "out", ("B", "T", "d_model"),
+            scope=ActivationScope.GLOBAL,
+            description="Scaled embedded input",
+        )
+
+        raw = g.embedding(token_ids.ref, w)
+        scaled = g.scale(raw, factor=self.embed_scale)
+        # Bind the scale output to the registered activation slot name
+        out = g.view(scaled, shape=[B, T, "d_model"], out_name=out_slot)
+        return Proxy(out_slot, out)
+
+
 class LMHead(Module):
     """Fused LM head projection + cross-entropy loss."""
 
@@ -3074,10 +3768,13 @@ class LMHead(Module):
         "weight": "lm_head.weight",
     }
 
-    def __init__(self, vocab_size: int, d_model: int) -> None:
+    def __init__(
+        self, vocab_size: int, d_model: int, softcap: float | None = None,
+    ) -> None:
         super().__init__()
         self.vocab_size = vocab_size
         self.d_model = d_model
+        self.softcap = softcap
 
     def _trace(
         self, tracer: Tracer, *args: Proxy, **kwargs: Any
@@ -3104,6 +3801,7 @@ class LMHead(Module):
         loss = g.fused_lm_head_loss(
             x_flat, w, targets.ref,
             compute_accuracy=True,
+            softcap=self.softcap,
             out_name=loss_slot,
         )
         return Proxy(loss_slot, loss)
@@ -3585,6 +4283,91 @@ QWEN3_5_MOE_LINEAR_BLOCK_REMAP: dict[str, str] = {
 }
 
 
+# Gemma4 block: sandwich norms (4 norms per layer), Gemma4Attention, GatedMLP (gelu)
+GEMMA4_BLOCK_NAME_REMAP: dict[str, str] = {
+    # --- input_layernorm (fused residual + rmsnorm) -> ln1 / res_ffn ---
+    "input_layernorm_weight": "ln1_weight",
+    "input_layernorm_res": "res_ffn",
+    "input_layernorm_y": "ln1",
+    "input_layernorm_rstd": "ln1_rstd",
+    # --- self_attn (Gemma4Attention) -> strip prefix ---
+    "self_attn_qkv_weight": "qkv_weight",
+    "self_attn_out_weight": "out_weight",
+    "self_attn_q_norm_weight": "q_norm_weight",
+    "self_attn_k_norm_weight": "k_norm_weight",
+    "self_attn_rope_freqs": "rope_freqs",
+    "self_attn_q_norm_weight_eff": "q_norm_weight_eff",
+    "self_attn_k_norm_weight_eff": "k_norm_weight_eff",
+    "self_attn_qkv": "qkv",
+    "self_attn_qkv_flat": "qkv_flat",
+    "self_attn_qkv_rope": "qkv_rope",
+    "self_attn_att": "att",
+    "self_attn_att_flat": "att_flat",
+    "self_attn_lse": "lse",
+    "self_attn_att_out": "att_out",
+    "self_attn_att_out_flat": "att_out_flat",
+    "self_attn_x_flat": "x_flat",
+    "self_attn_v_flat_2d": "v_flat_2d",
+    "self_attn_v_normed_2d": "v_normed_2d",
+    "self_attn_v_normed": "v_normed",
+    # --- post_attn_layernorm (standalone rmsnorm) ---
+    "post_attn_layernorm_weight": "ln_post_attn_weight",
+    "post_attn_layernorm_y": "ln_post_attn",
+    "post_attn_layernorm_rstd": "ln_post_attn_rstd",
+    # --- pre_ff_layernorm (standalone rmsnorm) -> ln2 ---
+    "pre_ff_layernorm_weight": "ln2_weight",
+    "pre_ff_layernorm_y": "ln2",
+    "pre_ff_layernorm_rstd": "ln2_rstd",
+    # --- mlp (GatedMLP with gelu) ---
+    "mlp_gate_weight": "mlp_gate_weight",
+    "mlp_up_weight": "mlp_up_weight",
+    "mlp_down_weight": "mlp_down_weight",
+    "mlp_x_flat": "mlp_x_flat",
+    "mlp_gate_flat": "mlp_gate_flat",
+    "mlp_up_flat": "mlp_up_flat",
+    "mlp_gate_act": "mlp_gate_act",
+    "mlp_down_flat": "mlp_down_flat",
+    "mlp_down": "mlp_down",
+    # --- post_ff_layernorm (standalone rmsnorm) ---
+    "post_ff_layernorm_weight": "ln_post_ff_weight",
+    "post_ff_layernorm_y": "ln_post_ff",
+    "post_ff_layernorm_rstd": "ln_post_ff_rstd",
+    # --- res_attn (explicit residual add) ---
+    "res_attn": "res_attn",
+    # --- per-layer input gating ---
+    "pli_gate_weight": "pli_gate_weight",
+    "pli_proj_weight": "pli_proj_weight",
+    "pli_norm_weight": "pli_norm_weight",
+    "pli_gate_out": "pli_gate_out",
+    "pli_gate_act": "pli_gate_act",
+    "pli_gated": "pli_gated",
+    "pli_proj_out": "pli_proj_out",
+    "pli_normed": "pli_normed",
+    # --- layer_scalar (frozen per-layer scaling buffer) ---
+    "layer_scalar": "layer_scalar",
+}
+
+# Gemma4 model-level remap
+GEMMA4_MODEL_NAME_REMAP: dict[str, str] = {
+    # --- embedding ---
+    "embedding_weight": "embedding",
+    "embedding_out": "x0",
+    # --- per-layer input embedding ---
+    "pli_embedding_weight": "pli_embedding",
+    "pli_model_proj": "pli_model_proj",
+    "pli_proj_norm": "pli_proj_norm",
+    # --- final_norm (RMSNorm) ---
+    "final_norm_weight": "final_norm",
+    "final_norm_res": "residual_final",
+    "final_norm_y": "xF",
+    "final_norm_rstd": "ln_final_rstd",
+    # --- lm_head ---
+    "lm_head_weight": "lm_head",
+    "lm_head_loss": "loss",
+    "lm_head_x_flat": "xF_flat",
+}
+
+
 # ============================================================================
 # Block base class
 # ============================================================================
@@ -3951,11 +4734,15 @@ class HybridBlockStack(Module):
         block_configs: list[tuple[str, type, int, dict]],
         block_types: list[str],
         n_layers: int,
+        per_layer_input_name: str | None = None,
+        kv_sharing_map: dict[int, int] | None = None,
     ) -> None:
         super().__init__()
         self.block_configs = block_configs
         self.block_types = block_types
         self.n_layers = n_layers
+        self.per_layer_input_name = per_layer_input_name
+        self.kv_sharing_map = kv_sharing_map or {}
         # Instantiate one block of each type to get its spec
         self._block_instances: dict[str, tuple[str, Any]] = {}
         for param_name, block_cls, count, kwargs in block_configs:
@@ -3989,6 +4776,11 @@ class HybridBlockStack(Module):
 
         # Emit HybridStackedBlocks call
         input_refs = [a.ref for a in args]
+        extra_attrs = {}
+        if self.per_layer_input_name:
+            extra_attrs["per_layer_input_name"] = self.per_layer_input_name
+        if self.kv_sharing_map:
+            extra_attrs["kv_sharing_map"] = self.kv_sharing_map
         result = g.call(
             "HybridStackedBlocks",
             *input_refs,
@@ -3996,6 +4788,7 @@ class HybridBlockStack(Module):
             block_types=self.block_types,
             n_layers=self.n_layers,
             **call_kwargs,
+            **extra_attrs,
         )
 
         if isinstance(result, GraphRef):

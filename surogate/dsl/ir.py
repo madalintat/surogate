@@ -62,6 +62,7 @@ class KernelType(str, Enum):
     # Tensor manipulation
     SPLIT = "split"
     CONCAT = "concat"
+    NARROW = "narrow"
     VIEW = "view"
     TRANSPOSE = "transpose"
     PERMUTE = "permute"

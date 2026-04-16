@@ -225,6 +225,7 @@ CompiledOpType op_type_from_string(const std::string& op_type) {
         {"transpose_backward", CompiledOpType::Transpose},
         {"split", CompiledOpType::Split},
         {"split_backward", CompiledOpType::Split},
+        {"narrow", CompiledOpType::Narrow},
         {"concat", CompiledOpType::Concat},
         {"concat_backward", CompiledOpType::Concat},
         {"add", CompiledOpType::Add},
@@ -684,9 +685,29 @@ CompiledAttrs GraphCompiler::resolve_attrs(const Operation& op, CompiledOpType t
         }
     }
 
+    // Narrow attributes (start, length along dim).
+    if (type == CompiledOpType::Narrow) {
+        if (auto* start_attr = find_attr(op.attrs, "start")) {
+            if (auto v = attr_int(*start_attr)) {
+                attrs.narrow_start = static_cast<int>(*v);
+            }
+        }
+        if (auto* len_attr = find_attr(op.attrs, "length")) {
+            if (auto v = attr_int(*len_attr)) {
+                attrs.narrow_length = static_cast<int>(*v);
+            }
+        }
+    }
+
     if (auto* acc_attr = find_attr(op.attrs, "compute_accuracy")) {
         if (auto v = attr_bool(*acc_attr)) {
             attrs.compute_accuracy = *v;
+        }
+    }
+
+    if (auto* softcap_attr = find_attr(op.attrs, "softcap")) {
+        if (auto v = attr_float(*softcap_attr)) {
+            attrs.softcap = static_cast<float>(*v);
         }
     }
 

@@ -224,6 +224,7 @@ private:
     void dispatch_view(const CompiledOp& op);
     void dispatch_transpose(const CompiledOp& op);
     void dispatch_split(const CompiledOp& op);
+    void dispatch_narrow(const CompiledOp& op);
     void dispatch_concat(const CompiledOp& op);
     void dispatch_add(const CompiledOp& op);
     void dispatch_matmul(const CompiledOp& op, const modules::ForwardHook* hook);

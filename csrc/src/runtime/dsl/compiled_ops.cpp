@@ -235,6 +235,7 @@ const char* op_type_to_string(CompiledOpType type) {
         case CompiledOpType::View: return "view";
         case CompiledOpType::Transpose: return "transpose";
         case CompiledOpType::Split: return "split";
+        case CompiledOpType::Narrow: return "narrow";
         case CompiledOpType::Concat: return "concat";
         case CompiledOpType::Add: return "add";
         case CompiledOpType::Matmul: return "matmul";
@@ -2305,6 +2306,7 @@ void CompiledExecutor::replay_layer_forward(int layer_idx, long B, long T,
                 case CompiledOpType::View:                dispatch_view(op); break;
                 case CompiledOpType::Transpose:           dispatch_transpose(op); break;
                 case CompiledOpType::Split:               dispatch_split(op); break;
+                case CompiledOpType::Narrow:              dispatch_narrow(op); break;
                 case CompiledOpType::Concat:              dispatch_concat(op); break;
                 case CompiledOpType::Add:                 dispatch_add(op); break;
                 case CompiledOpType::Matmul:
@@ -3780,6 +3782,9 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
                 case CompiledOpType::Split:
                     dispatch_split(op);
                     break;
+                case CompiledOpType::Narrow:
+                    dispatch_narrow(op);
+                    break;
                 case CompiledOpType::Concat:
                     dispatch_concat(op);
                     break;
@@ -4788,9 +4793,12 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
                 case CompiledOpType::Transpose:
                     dispatch_transpose(op);
                     break;
-                // Split/concat may appear in backward graphs via autodiff rules.
+                // Split/concat/narrow may appear in backward graphs via autodiff rules.
                 case CompiledOpType::Split:
                     dispatch_split(op);
+                    break;
+                case CompiledOpType::Narrow:
+                    dispatch_narrow(op);
                     break;
                 case CompiledOpType::Concat:
                     dispatch_concat(op);
@@ -5123,6 +5131,7 @@ void CompiledExecutor::dispatch_forward_op(const CompiledOp& op,
         case CompiledOpType::View:               dispatch_view(op); break;
         case CompiledOpType::Transpose:          dispatch_transpose(op); break;
         case CompiledOpType::Split:              dispatch_split(op); break;
+        case CompiledOpType::Narrow:             dispatch_narrow(op); break;
         case CompiledOpType::Concat:             dispatch_concat(op); break;
         case CompiledOpType::Add:                dispatch_add(op); break;
         case CompiledOpType::Matmul:
@@ -5201,6 +5210,7 @@ void CompiledExecutor::dispatch_backward_op(const CompiledOp& op,
         case CompiledOpType::View:                 dispatch_view_backward(op); break;
         case CompiledOpType::Transpose:            dispatch_transpose(op); break;
         case CompiledOpType::Split:                dispatch_split(op); break;
+        case CompiledOpType::Narrow:               dispatch_narrow(op); break;
         case CompiledOpType::Concat:               dispatch_concat(op); break;
         case CompiledOpType::Add:                  dispatch_add(op); break;
         case CompiledOpType::Zeros:                dispatch_zeros_backward(op); break;

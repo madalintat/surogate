@@ -81,6 +81,11 @@ void CompiledExecutor::dispatch_fused_lm_head_loss(const CompiledOp& op) {
                    V, static_cast<int>(nano_batch_size), C,
                    swap_transpose(EMMTranspose::NT), false, mRunState.MainStream);
 
+            if (op.attrs.softcap > 0.0f) {
+                softcap_logits(logits, op.attrs.softcap,
+                               static_cast<int>(nano_batch_size), V, mRunState.MainStream);
+            }
+
             if (mInvTemperatureGpu) {
                 const float* inv_t = mInvTemperatureGpu + token_offset;
                 scale_logits_rows(logits, inv_t, static_cast<int>(nano_batch_size), V, P, mRunState.MainStream);
@@ -134,6 +139,12 @@ void CompiledExecutor::dispatch_fused_lm_head_loss(const CompiledOp& op) {
                std::nullopt, nullptr, nullptr, mRunState.CublasLtHandle, mRunState.CuBlasWorkspace,
                static_cast<int>(V), static_cast<int>(nano_batch_size), static_cast<int>(C),
                swap_transpose(EMMTranspose::NT), false, mRunState.MainStream);
+
+        // Logit softcapping: softcap * tanh(logits / softcap)
+        if (op.attrs.softcap > 0.0f) {
+            softcap_logits(logits, op.attrs.softcap,
+                           static_cast<int>(nano_batch_size), V, mRunState.MainStream);
+        }
 
         if (mInvTemperatureGpu) {
             const float* inv_t = mInvTemperatureGpu + token_offset;

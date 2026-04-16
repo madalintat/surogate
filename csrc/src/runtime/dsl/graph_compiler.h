@@ -52,6 +52,7 @@ enum class CompiledOpType : std::uint8_t {
     View,
     Transpose,
     Split,
+    Narrow,
     Concat,
     Add,
     Matmul,
@@ -240,9 +241,16 @@ struct CompiledAttrs {
     int split_concat_dim = 0;
     std::vector<long> split_sizes;
 
+    // Tensor narrow attributes
+    int narrow_start = 0;
+    int narrow_length = 0;
+
     // Tensor transpose attributes
     int dim0 = 0;
     int dim1 = 1;
+
+    // Logit softcapping (fused_lm_head_loss)
+    float softcap = 0.0f;  // 0 = disabled
 };
 
 // ============================================================================

@@ -939,3 +939,30 @@ void scale_logits_rows(nv_bfloat16* logits, const float* inv_temperature,
     scale_logits_rows_kernel<<<grid, block_size, 0, stream>>>(logits, inv_temperature, BT, V, P);
     CUDA_CHECK(cudaGetLastError());
 }
+
+// ---------------------------------------------------------------------------
+// Logit softcapping: y = softcap * tanh(x / softcap)
+// ---------------------------------------------------------------------------
+template <typename T>
+__global__ void softcap_logits_kernel(T* data, float inv_softcap, float softcap, long n) {
+    long idx = static_cast<long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        float x = static_cast<float>(data[idx]);
+        float y = softcap * tanhf(x * inv_softcap);
+        data[idx] = static_cast<T>(y);
+    }
+}
+
+void launch_softcap_logits_bf16(nv_bfloat16* data, float softcap, long n, cudaStream_t stream) {
+    const int block_size = 256;
+    int grid = static_cast<int>((n + block_size - 1) / block_size);
+    softcap_logits_kernel<<<grid, block_size, 0, stream>>>(data, 1.0f / softcap, softcap, n);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void launch_softcap_logits_fp32(float* data, float softcap, long n, cudaStream_t stream) {
+    const int block_size = 256;
+    int grid = static_cast<int>((n + block_size - 1) / block_size);
+    softcap_logits_kernel<<<grid, block_size, 0, stream>>>(data, 1.0f / softcap, softcap, n);
+    CUDA_CHECK(cudaGetLastError());
+}

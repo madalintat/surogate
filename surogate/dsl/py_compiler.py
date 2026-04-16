@@ -889,21 +889,23 @@ def _inline_stacked_blocks(
                     f"HybridStackedBlocks block_types length ({len(block_types)}) != n_layers ({n_layers})",
                 )
 
-            # Map block type names to their param arrays
-            block_type_to_param = {
-                "mamba": node.attrs.get("mamba_blocks", "mamba_blocks"),
-                "attention": node.attrs.get("attn_blocks", "attn_blocks"),
-                "mlp": node.attrs.get("mlp_blocks", "mlp_blocks"),
-                "moe": node.attrs.get("moe_blocks", "moe_blocks"),
+            # Map block type names to their param arrays.
+            # Derive dynamically from the unique block types used in this model,
+            # falling back to well-known defaults for backwards compatibility.
+            unique_block_types = sorted(set(block_types))
+            _well_known_defaults = {
+                "mamba": "mamba_blocks",
+                "attention": "attn_blocks",
+                "mlp": "mlp_blocks",
+                "moe": "moe_blocks",
             }
+            block_type_to_param = {}
+            for bt in unique_block_types:
+                default_param = _well_known_defaults.get(bt, f"{bt}_blocks")
+                block_type_to_param[bt] = node.attrs.get(default_param, default_param)
 
             # Track indices per block type
-            block_type_indices: Dict[str, int] = {
-                "mamba": 0,
-                "attention": 0,
-                "mlp": 0,
-                "moe": 0,
-            }
+            block_type_indices: Dict[str, int] = {bt: 0 for bt in unique_block_types}
 
             # Resolve all block specs upfront
             block_specs: Dict[str, BlockSpec] = {}
@@ -919,6 +921,16 @@ def _inline_stacked_blocks(
                             block_irs[block_type] = _get_block_ir(spec)
 
             cur_inputs = list(node.inputs)
+
+            # Per-layer input support: if a 4D tensor [B, T, n_layers, D] is
+            # provided as a 4th input and "per_layer_input_name" is set, we
+            # emit narrow+view ops for each layer to extract that layer's slice.
+            pli_block_name = node.attrs.get("per_layer_input_name")  # block input name
+            pli_tensor_ref = node.inputs[3] if len(node.inputs) > 3 and pli_block_name else None
+
+            # KV sharing: map shared layers' kv_source input to the source
+            # layer's qkv_rope activation tensor.
+            kv_sharing_map = node.attrs.get("kv_sharing_map", {})
 
             for layer_idx in range(int(n_layers)):
                 block_type = block_types[layer_idx]
@@ -984,6 +996,36 @@ def _inline_stacked_blocks(
                     mapping[p] = f"{prefix}{p}"
                     if mapping[p] not in new_params:
                         new_params[mapping[p]] = block_graph.params[p]
+
+                # Per-layer input: narrow dim=2 to get [B, T, 1, D], then
+                # view to [B, T, D] for this layer.
+                if pli_tensor_ref and pli_block_name in block_inputs:
+                    narrow_out = f"pli_narrow_layer{layer_idx}"
+                    pli_slice_name = f"pli_slice_layer{layer_idx}"
+                    op_id += 1
+                    new_nodes.append(OpIR(
+                        id=op_id,
+                        name=f"narrow_pli_{layer_idx}",
+                        kernel_type="narrow",
+                        inputs=[pli_tensor_ref],
+                        outputs=[narrow_out],
+                        attrs={"dim": 2, "start": layer_idx, "length": 1},
+                    ))
+                    op_id += 1
+                    new_nodes.append(OpIR(
+                        id=op_id,
+                        name=f"view_pli_{layer_idx}",
+                        kernel_type="view",
+                        inputs=[narrow_out],
+                        outputs=[pli_slice_name],
+                        attrs={},  # shape resolved at runtime from element count
+                    ))
+                    mapping[pli_block_name] = pli_slice_name
+
+                # KV sharing: wire kv_source to the source layer's qkv_rope
+                if layer_idx in kv_sharing_map and "kv_source" in block_inputs:
+                    source_layer_idx = kv_sharing_map[layer_idx]
+                    mapping["kv_source"] = f"blocks[{source_layer_idx}].qkv_rope"
 
                 # Inline block nodes
                 for bnode in block_graph.nodes:

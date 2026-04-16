@@ -407,10 +407,14 @@ class GraphBuilder:
         targets: str | GraphRef,
         *,
         compute_accuracy: bool = False,
+        softcap: float | None = None,
         out_name: str | None = None,
     ) -> GraphRef:
         """Fused LM head matmul + cross-entropy loss."""
         out = out_name if out_name else self._fresh_name("loss")
+        attrs: dict[str, Any] = {"compute_accuracy": compute_accuracy}
+        if softcap is not None:
+            attrs["softcap"] = softcap
         self._add_node(GraphNode(
             op="fused_lm_head_loss",
             inputs=[
@@ -419,7 +423,7 @@ class GraphBuilder:
                 self._resolve_input(targets),
             ],
             outputs=[out],
-            attrs={"compute_accuracy": compute_accuracy},
+            attrs=attrs,
         ))
         return self._make_output(out)
 
@@ -680,6 +684,30 @@ class GraphBuilder:
             attrs={"split_size": split_size, "dim": dim},
         ))
         return self._make_outputs(outputs)
+
+    def narrow(
+        self,
+        x: str | GraphRef,
+        *,
+        dim: int,
+        start: int,
+        length: int,
+        out_name: str | None = None,
+    ) -> GraphRef:
+        """Select a contiguous slice along a dimension.
+
+        Extracts ``x.narrow(dim, start, length)`` — equivalent to
+        ``x[..., start:start+length, ...]`` along the given dimension.
+        The output rank equals the input rank (the dimension is kept).
+        """
+        out = out_name if out_name else self._fresh_name("narrow")
+        self._add_node(GraphNode(
+            op="narrow",
+            inputs=[self._resolve_input(x)],
+            outputs=[out],
+            attrs={"dim": dim, "start": start, "length": length},
+        ))
+        return self._make_output(out)
 
     def repeat_interleave_heads(
         self,

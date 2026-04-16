@@ -90,6 +90,7 @@ def _kernel_type_from_op(op_name: str) -> KernelType:
         "permute": KernelType.PERMUTE,
         "contiguous": KernelType.CONTIGUOUS,
         "split": KernelType.SPLIT,
+        "narrow": KernelType.NARROW,
         "repeat_interleave_heads": KernelType.CUSTOM,
         "concat": KernelType.CONCAT,
         "copy": KernelType.COPY,

@@ -629,6 +629,9 @@ void scale_logits_rows(nv_bfloat16* logits, const float* inv_temperature,
 void scale_logits_rows(Tensor& logits, const float* inv_temperature,
                        int BT, int V, int P, cudaStream_t stream);
 
+/// Apply logit softcapping in-place: logits[i] = softcap * tanh(logits[i] / softcap).
+void softcap_logits(Tensor& logits, float softcap, int BT, int V, cudaStream_t stream);
+
 int get_max_num_block_sums(const cudaDeviceProp& dp);
 void global_norm_squared(float* out, const float* values, size_t count, const cudaDeviceProp& dp, cudaStream_t stream);
 void global_norm_squared(float* out, const nv_bfloat16* values, size_t count, const cudaDeviceProp& dp, cudaStream_t stream);

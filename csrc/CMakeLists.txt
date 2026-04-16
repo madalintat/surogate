@@ -303,6 +303,7 @@ target_sources(surogate-common PRIVATE
     src/runtime/ops/view.cpp
     src/runtime/ops/transpose.cpp
     src/runtime/ops/concat_split.cpp
+    src/runtime/ops/narrow.cpp
     src/runtime/ops/add.cpp
     src/runtime/ops/bias_add.cpp
     src/runtime/ops/matmul.cpp

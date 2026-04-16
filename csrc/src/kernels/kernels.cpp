@@ -643,6 +643,20 @@ void scale_logits_rows(Tensor& logits, const float* inv_temperature,
     }
 }
 
+void softcap_logits(Tensor& logits, float softcap, int BT, int V, cudaStream_t stream) {
+    if (softcap <= 0.0f) return;
+    extern void launch_softcap_logits_bf16(nv_bfloat16* data, float softcap, long n, cudaStream_t stream);
+    extern void launch_softcap_logits_fp32(float* data, float softcap, long n, cudaStream_t stream);
+    long total = static_cast<long>(BT) * static_cast<long>(V);
+    if (logits.DType == ETensorDType::BF16) {
+        launch_softcap_logits_bf16(logits.get<nv_bfloat16>(), softcap, total, stream);
+    } else if (logits.DType == ETensorDType::FP32) {
+        launch_softcap_logits_fp32(logits.get<float>(), softcap, total, stream);
+    } else {
+        throw std::runtime_error("softcap_logits: unsupported logits dtype");
+    }
+}
+
 /**
  * @brief Performs the forward pass of the encoder layer (embedding lookup + positional encoding).
  *
