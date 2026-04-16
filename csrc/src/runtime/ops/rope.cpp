@@ -36,10 +36,13 @@ void CompiledExecutor::dispatch_rope(const CompiledOp& op) {
     int Hkv = static_cast<int>(mConfig.NumKeyValHeads);
     const int Hs = derive_head_size(qkv, Hq, Hkv, static_cast<int>(mConfig.head_size()));
 
-    // For Q-only RoPE (shared-KV attention), the input has only Hq heads.
-    // The kernel expects Hq + 2*Hkv heads — set Hkv=0 to prevent OOB access.
-    if (qkv.Rank == 4 && qkv.Sizes[2] == Hq) {
-        Hkv = 0;
+    // Derive actual Hkv from tensor shape to handle Q-only inputs (shared-KV)
+    // and other cases where the tensor has fewer heads than global config.
+    if (qkv.Rank == 4) {
+        const int actual_heads = static_cast<int>(qkv.Sizes[2]);
+        if (actual_heads < Hq + 2 * Hkv) {
+            Hkv = std::max(0, (actual_heads - Hq) / 2);
+        }
     }
 
     if (mForwardPlan) {
@@ -77,8 +80,20 @@ void CompiledExecutor::dispatch_rope_backward(const CompiledOp& op) {
         d_out.DType, d_qkv_shape, "rope_backward");
 
     const int Hq = static_cast<int>(mConfig.NumQueryHeads);
-    const int Hkv = static_cast<int>(mConfig.NumKeyValHeads);
+    int Hkv = static_cast<int>(mConfig.NumKeyValHeads);
     const int Hs = derive_head_size(d_out, Hq, Hkv, static_cast<int>(mConfig.head_size()));
+
+    // Derive actual Hkv from tensor shape to handle shared-KV Q-only gradients
+    // and other cases where the gradient has fewer heads than the global config.
+    if (d_out.Rank == 4) {
+        const int actual_heads = static_cast<int>(d_out.Sizes[2]);
+        if (actual_heads < Hq + 2 * Hkv) {
+            // Fewer heads than expected — adjust Hkv to match.
+            // If actual == Hq: Q-only (Hkv=0)
+            // Otherwise: compute Hkv from remaining heads
+            Hkv = std::max(0, (actual_heads - Hq) / 2);
+        }
+    }
 
     // For FP8 hybrid backward, record abs_max of d_qkv for subsequent quantization
     float* abs_max_ptr = mRunState.has_fp8_hybrid_backward()

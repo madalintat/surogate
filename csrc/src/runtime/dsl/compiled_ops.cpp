@@ -4829,9 +4829,10 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
                 case CompiledOpType::Add:
                     dispatch_add(op);
                     break;
-                // Zeros in backward is a no-op
+                // Zeros in backward: may be a true no-op (gradient of zeros init)
+                // or a split backward zero-fill (needs actual allocation).
                 case CompiledOpType::Zeros:
-                    dispatch_zeros_backward(op);
+                    dispatch_zeros(op);
                     break;
                 // Ones in backward is a no-op
                 case CompiledOpType::Ones:
