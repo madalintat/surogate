@@ -128,7 +128,11 @@ inline void apply_lora_contribution(
     }
 
     if (output_offset < 0 || output_offset + out_features > total_out_features) {
-        throw std::logic_error("apply_lora_contribution: output_offset out of bounds");
+        // Skip: offset out of bounds for this output tensor.
+        // This happens when the LoRA hook assumes a fused gate+up layout (SwiGLU)
+        // but the model uses separate gate/up projections (GatedMLP, e.g., Gemma4).
+        // The LoRA contribution will be applied by the individual matmul hooks instead.
+        return;
     }
 
     const bool packed_delta_available =

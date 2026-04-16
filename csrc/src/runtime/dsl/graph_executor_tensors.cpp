@@ -32,7 +32,23 @@ Tensor* resolve_block_activation_tensor(ExecState& st, const std::string& name, 
         if (dtype != base.DType) {
             throw std::runtime_error("DSL graph executor: dtype mismatch for tensor " + name);
         }
-        Tensor view = view_for_shape(base, shape, name);
+        // For hybrid models, the compiled shape may not match the actual per-layer
+        // buffer size. When the buffer has more elements than the shape expects,
+        // create a view with matching element count but the shape's rank.
+        Tensor view = base;
+        if (!shape.empty()) {
+            const std::size_t shape_n = shape_nelem(shape);
+            const std::size_t base_n = static_cast<std::size_t>(base.nelem());
+            if (shape_n == base_n) {
+                view = view_for_shape(base, shape, name);
+            } else if (shape_n < base_n && shape.size() == 2) {
+                // Flat view (B*T, dim): use actual buffer size for the last dim
+                view = view_tensor(base, {shape[0], static_cast<long>(base_n / static_cast<std::size_t>(shape[0]))});
+            } else if (shape_n < base_n && shape.size() == 3) {
+                // 3D view (B, T, dim): use actual buffer size for the last dim
+                view = view_tensor(base, {shape[0], shape[1], static_cast<long>(base_n / static_cast<std::size_t>(shape[0] * shape[1]))});
+            }
+        }
         auto [it, inserted] = st.tensors.emplace(name, view);
         if (!inserted) {
             it->second = view;
@@ -194,7 +210,23 @@ Tensor* resolve_block_gradient_tensor(ExecState& st, const std::string& name, ET
         if (dtype != base.DType) {
             throw std::runtime_error("DSL graph executor: dtype mismatch for tensor " + name);
         }
-        Tensor view = view_for_shape(base, shape, name);
+        // For hybrid models, the compiled shape may not match the actual per-layer
+        // buffer size. When the buffer has more elements than the shape expects,
+        // create a view with matching element count but the shape's rank.
+        Tensor view = base;
+        if (!shape.empty()) {
+            const std::size_t shape_n = shape_nelem(shape);
+            const std::size_t base_n = static_cast<std::size_t>(base.nelem());
+            if (shape_n == base_n) {
+                view = view_for_shape(base, shape, name);
+            } else if (shape_n < base_n && shape.size() == 2) {
+                // Flat view (B*T, dim): use actual buffer size for the last dim
+                view = view_tensor(base, {shape[0], static_cast<long>(base_n / static_cast<std::size_t>(shape[0]))});
+            } else if (shape_n < base_n && shape.size() == 3) {
+                // 3D view (B, T, dim): use actual buffer size for the last dim
+                view = view_tensor(base, {shape[0], shape[1], static_cast<long>(base_n / static_cast<std::size_t>(shape[0] * shape[1]))});
+            }
+        }
         auto [it, inserted] = st.tensors.emplace(name, view);
         if (!inserted) {
             it->second = view;

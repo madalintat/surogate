@@ -220,6 +220,7 @@ private:
     void dispatch_zeros(const CompiledOp& op);
     void dispatch_ones(const CompiledOp& op);
     void dispatch_fused_residual_rmsnorm(const CompiledOp& op);
+    void dispatch_rmsnorm(const CompiledOp& op);
     void dispatch_layernorm(const CompiledOp& op);
     void dispatch_view(const CompiledOp& op);
     void dispatch_transpose(const CompiledOp& op);
@@ -235,6 +236,7 @@ private:
     void dispatch_gelu(const CompiledOp& op);
     void dispatch_relu2(const CompiledOp& op);
     void dispatch_mul(const CompiledOp& op);
+    void dispatch_scale(const CompiledOp& op);
     void dispatch_mask_scatter(const CompiledOp& op);
     void dispatch_deepstack_inject(const CompiledOp& op);
     void dispatch_matmul_swiglu(const CompiledOp& op, const modules::ForwardHook* hook);
@@ -270,6 +272,8 @@ private:
     void dispatch_gelu_backward(const CompiledOp& op);
     void dispatch_relu2_backward(const CompiledOp& op);
     void dispatch_mul_backward(const CompiledOp& op);
+    void dispatch_scale_backward(const CompiledOp& op);
+    void dispatch_narrow_backward(const CompiledOp& op);
     void dispatch_mask_scatter_backward(const CompiledOp& op);
     void dispatch_deepstack_inject_backward(const CompiledOp& op);
     void dispatch_matmul_swiglu_backward(const CompiledOp& op, const modules::BackwardHook* hook);
@@ -280,6 +284,7 @@ private:
     void dispatch_flash_attention_backward(const CompiledOp& op);
     void dispatch_zeros_backward(const CompiledOp& op);
     void dispatch_fused_residual_rmsnorm_backward(const CompiledOp& op);
+    void dispatch_rmsnorm_backward(const CompiledOp& op);
     void dispatch_layernorm_backward(const CompiledOp& op);
     void dispatch_embedding_backward(const CompiledOp& op);
     void dispatch_cross_entropy_loss_backward(const CompiledOp& op);

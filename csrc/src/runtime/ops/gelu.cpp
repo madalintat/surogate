@@ -15,7 +15,14 @@ namespace dsl {
 
 void CompiledExecutor::dispatch_gelu(const CompiledOp& op) {
     Tensor& inp = resolve_tensor(op.inputs[0]);
-    Tensor& out = ensure_output_tensor(op.outputs[0]);
+    Tensor& out_ref = ensure_output_tensor(op.outputs[0]);
+    // If output buffer is wrong size (empty shape at compile time), match input
+    Tensor out = out_ref;
+    if (out.nelem() != inp.nelem() || !out.Data) {
+        std::vector<long> shape(inp.Sizes.begin(), inp.Sizes.begin() + inp.Rank);
+        out = mRunState.temp_alloc(inp.DType, shape, "gelu_out");
+        mTemps.push_back(out);
+    }
 
     const long N = static_cast<long>(inp.nelem());
     gelu_forward(out, inp, N, mRunState.MainStream);

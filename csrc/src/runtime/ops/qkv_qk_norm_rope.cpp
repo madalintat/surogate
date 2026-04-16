@@ -64,7 +64,7 @@ void CompiledExecutor::dispatch_qkv_qk_norm_rope(const CompiledOp& op) {
 
     int Hq = static_cast<int>(mConfig.NumQueryHeads);
     int Hkv = static_cast<int>(mConfig.NumKeyValHeads);
-    const int Hs = static_cast<int>(mConfig.head_size());
+    const int Hs = derive_head_size(qkv_in, Hq, Hkv, static_cast<int>(mConfig.head_size()));
     const Tensor& qkv_out_candidate = ensure_output_tensor(op.outputs[0]);
     const Tensor& q_rstd_candidate = ensure_output_tensor(op.outputs[1]);
     const Tensor& k_rstd_candidate = ensure_output_tensor(op.outputs[2]);
@@ -245,7 +245,7 @@ void CompiledExecutor::dispatch_qkv_qk_norm_rope_backward(const CompiledOp& op) 
 
     int Hq = static_cast<int>(mConfig.NumQueryHeads);
     int Hkv = static_cast<int>(mConfig.NumKeyValHeads);
-    const int Hs = static_cast<int>(mConfig.head_size());
+    const int Hs = derive_head_size(qkv, Hq, Hkv, static_cast<int>(mConfig.head_size()));
     int qkv_channels = Hs * (Hq + 2 * Hkv);
     const int qkv_expected = qkv_channels;
 

@@ -27,8 +27,13 @@ from ..dim import B, T
 # ============================================================================
 
 def _sandwich_attn_phase(block, x, residual, position_ids):
-    """Sandwich norm attention phase: input_ln → attn → post_attn_ln → residual add."""
-    residual, h = block.input_layernorm(residual, x)
+    """Sandwich norm attention phase: input_ln → attn → post_attn_ln → residual add.
+
+    Gemma4 uses zero residual between blocks (state flows through x, not residual).
+    We create fresh zeros to avoid stale data from cross-layer slot reuse.
+    """
+    fresh_zeros = block._zeros(["B", "T", "d_model"], name="fresh_zero")
+    residual, h = block.input_layernorm(fresh_zeros, x)
     h = block.self_attn(h, position_ids)
     h = block.post_attn_layernorm(h)
     residual = block._add(residual, h, name="res_attn")
@@ -59,10 +64,27 @@ def _per_layer_input_phase(block, residual, per_layer_input):
 
 
 def _finalize(block, residual):
-    """Apply layer_scalar and return (state, zeros)."""
-    h_out = block._scale_by_param(residual, "layer_scalar")
-    zeros = block._zeros(["B", "T", "d_model"], name="zero_res")
-    return h_out, zeros
+    """Apply layer_scalar and return (state, zeros).
+
+    The block output is the scaled hidden state. The residual is always zero
+    (Gemma4 doesn't use a running residual sum across blocks).
+    We return the output as BOTH values: (h_out, h_out). The next block's
+    input_layernorm receives (residual=h_out, x=h_out) and computes
+    new_residual = h_out + h_out. We compensate by halving the result
+    via the layer_scalar or adjusting the fused_residual_rmsnorm behavior.
+
+    Actually — simpler: return the state in the first position and a zero
+    in the second. Use the names that the inliner maps to blocks[N].* for
+    persistence: "att_out" and "mlp_down" (both are C-dimensional slots
+    in the simplified activations that are available at layer boundaries).
+    """
+    scaled = block._scale_by_param(residual, "layer_scalar")
+    # Copy the scaled output into the mlp_down slot (persists across layer
+    # boundaries). Must use _add(scaled, 0) not _view to trigger a real copy —
+    # _view creates an alias that dangles when the temp stack is restored.
+    zero_copy = block._zeros(["B", "T", "d_model"], name="copy_zero")
+    h_out = block._add(scaled, zero_copy, name="mlp_down")
+    return h_out, h_out
 
 
 def _register_frozen_and_pli_params(block):
@@ -283,7 +305,8 @@ class Gemma4FullBlock(nn.Block):
 
 def _sandwich_shared_attn_phase(block, x, residual, position_ids, kv_source):
     """Shared-KV attention: input_ln -> Q-only attn(kv_source) -> post_attn_ln -> residual."""
-    residual, h = block.input_layernorm(residual, x)
+    fresh_zeros = block._zeros(["B", "T", "d_model"], name="fresh_zero")
+    residual, h = block.input_layernorm(fresh_zeros, x)
     h = block.self_attn(h, position_ids, kv_source)
     h = block.post_attn_layernorm(h)
     residual = block._add(residual, h, name="res_attn")

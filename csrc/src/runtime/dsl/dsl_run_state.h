@@ -94,6 +94,7 @@ public:
     bool ffn_temps_on_stack() const { return mFfnTempsOnStack; }
     bool large_bwd_temps_on_stack() const { return mRecomputeLevel >= RecomputeLevel::Enabled; }
     bool is_lora_only_mode() const { return mLoraOnlyMode; }
+    bool has_hybrid_blocks() const { return mRuntimeConfig.has_per_layer_dims(); }
     bool is_prequantized() const { return mPrequantized; }
 
     /// @brief Get the recompute level

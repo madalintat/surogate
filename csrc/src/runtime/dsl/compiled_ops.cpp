@@ -231,6 +231,7 @@ const char* op_type_to_string(CompiledOpType type) {
         case CompiledOpType::Zeros: return "zeros";
         case CompiledOpType::Ones: return "ones";
         case CompiledOpType::FusedResidualRMSNorm: return "fused_residual_rmsnorm";
+        case CompiledOpType::RMSNorm: return "rmsnorm";
         case CompiledOpType::LayerNorm: return "layernorm";
         case CompiledOpType::View: return "view";
         case CompiledOpType::Transpose: return "transpose";
@@ -247,6 +248,7 @@ const char* op_type_to_string(CompiledOpType type) {
         case CompiledOpType::Gelu: return "gelu";
         case CompiledOpType::Relu2: return "relu2";
         case CompiledOpType::Mul: return "mul";
+        case CompiledOpType::Scale: return "scale";
         case CompiledOpType::MaskScatter: return "mask_scatter";
         case CompiledOpType::DeepstackInject: return "deepstack_inject";
         case CompiledOpType::MatmulSwiGLU: return "matmul_swiglu";
@@ -281,6 +283,8 @@ const char* op_type_to_string(CompiledOpType type) {
         case CompiledOpType::GeluBackward: return "gelu_backward";
         case CompiledOpType::Relu2Backward: return "relu2_backward";
         case CompiledOpType::MulBackward: return "mul_backward";
+        case CompiledOpType::ScaleBackward: return "scale_backward";
+        case CompiledOpType::NarrowBackward: return "narrow_backward";
         case CompiledOpType::MaskScatterBackward: return "mask_scatter_backward";
         case CompiledOpType::DeepstackInjectBackward: return "deepstack_inject_backward";
         case CompiledOpType::MatmulSwiGLUBackward: return "matmul_swiglu_backward";
@@ -291,6 +295,7 @@ const char* op_type_to_string(CompiledOpType type) {
         case CompiledOpType::FlashAttentionBackward: return "flash_attention_backward";
         case CompiledOpType::ZerosBackward: return "zeros_backward";
         case CompiledOpType::FusedResidualRMSNormBackward: return "fused_residual_rmsnorm_backward";
+        case CompiledOpType::RMSNormBackward: return "rmsnorm_backward";
         case CompiledOpType::LayerNormBackward: return "layernorm_backward";
         case CompiledOpType::EmbeddingBackward: return "embedding_backward";
         case CompiledOpType::CrossEntropyLossBackward: return "cross_entropy_backward";
@@ -1645,14 +1650,13 @@ Tensor& CompiledExecutor::resolve_tensor(const TensorRef& ref) {
     // If shape is specified and this is a pre-allocated slot, we may need to create a view
     if (!ref.shape.empty() && ref.slot != TensorSlot::Mapped && ref.slot != TensorSlot::Saved &&
         ref.slot != TensorSlot::Parameter && ref.slot != TensorSlot::Temporary) {
-        // Check if we already have a tensor cached (e.g., from MoE temp allocation)
-        if (tid >= 0) {
-            auto& cached = mTensors[static_cast<std::size_t>(tid)];
-            if (cached.Data) {
-                return cached;
-            }
+        // Need to create a view from the base tensor
+        if (ref.name.find("att_flat") != std::string::npos && ref.layer_idx == 4) {
+            fprintf(stderr, "[RESOLVE] %s slot=%d layer=%d shape=[%ld,%ld] tid=%d\n",
+                    ref.name.c_str(), (int)ref.slot, ref.layer_idx,
+                    ref.shape.size() > 0 ? ref.shape[0] : -1,
+                    ref.shape.size() > 1 ? ref.shape[1] : -1, tid);
         }
-        // Need to create a view - get the base tensor and create view
         Tensor* base = nullptr;
         switch (ref.slot) {
             case TensorSlot::TokenIDs: base = &rs.Inputs; break;
@@ -1686,7 +1690,7 @@ Tensor& CompiledExecutor::resolve_tensor(const TensorRef& ref) {
                 mTensors[static_cast<std::size_t>(tid)] = view;
                 return mTensors[static_cast<std::size_t>(tid)];
             }
-            return *base;  // tid < 0 should not happen, return base as fallback
+            return *base;
         }
     }
 
@@ -2302,6 +2306,7 @@ void CompiledExecutor::replay_layer_forward(int layer_idx, long B, long T,
                 case CompiledOpType::Zeros:               dispatch_zeros(op); break;
                 case CompiledOpType::Ones:                dispatch_ones(op); break;
                 case CompiledOpType::FusedResidualRMSNorm: dispatch_fused_residual_rmsnorm(op); break;
+                case CompiledOpType::RMSNorm:            dispatch_rmsnorm(op); break;
                 case CompiledOpType::LayerNorm:           dispatch_layernorm(op); break;
                 case CompiledOpType::View:                dispatch_view(op); break;
                 case CompiledOpType::Transpose:           dispatch_transpose(op); break;
@@ -2318,6 +2323,7 @@ void CompiledExecutor::replay_layer_forward(int layer_idx, long B, long T,
                 case CompiledOpType::Gelu:                dispatch_gelu(op); break;
                 case CompiledOpType::Relu2:               dispatch_relu2(op); break;
                 case CompiledOpType::Mul:                 dispatch_mul(op); break;
+                case CompiledOpType::Scale:               dispatch_scale(op); break;
                 case CompiledOpType::MaskScatter:         dispatch_mask_scatter(op); break;
                 case CompiledOpType::DeepstackInject:     dispatch_deepstack_inject(op); break;
                 case CompiledOpType::MatmulSwiGLU:        dispatch_matmul_swiglu(op, hook); break;
@@ -3770,6 +3776,9 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
                 case CompiledOpType::FusedResidualRMSNorm:
                     dispatch_fused_residual_rmsnorm(op);
                     break;
+                case CompiledOpType::RMSNorm:
+                    dispatch_rmsnorm(op);
+                    break;
                 case CompiledOpType::LayerNorm:
                     dispatch_layernorm(op);
                     break;
@@ -3815,6 +3824,9 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
                     break;
                 case CompiledOpType::Mul:
                     dispatch_mul(op);
+                    break;
+                case CompiledOpType::Scale:
+                    dispatch_scale(op);
                     break;
                 case CompiledOpType::MaskScatter:
                     dispatch_mask_scatter(op);
@@ -4748,6 +4760,12 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
                 case CompiledOpType::MulBackward:
                     dispatch_mul_backward(op);
                     break;
+                case CompiledOpType::ScaleBackward:
+                    dispatch_scale_backward(op);
+                    break;
+                case CompiledOpType::NarrowBackward:
+                    dispatch_narrow_backward(op);
+                    break;
                 case CompiledOpType::MaskScatterBackward:
                     dispatch_mask_scatter_backward(op);
                     break;
@@ -4777,6 +4795,9 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
                     break;
                 case CompiledOpType::FusedResidualRMSNormBackward:
                     dispatch_fused_residual_rmsnorm_backward(op);
+                    break;
+                case CompiledOpType::RMSNormBackward:
+                    dispatch_rmsnorm_backward(op);
                     break;
                 case CompiledOpType::LayerNormBackward:
                     dispatch_layernorm_backward(op);
@@ -5127,6 +5148,7 @@ void CompiledExecutor::dispatch_forward_op(const CompiledOp& op,
         case CompiledOpType::Zeros:              dispatch_zeros(op); break;
         case CompiledOpType::Ones:               dispatch_ones(op); break;
         case CompiledOpType::FusedResidualRMSNorm: dispatch_fused_residual_rmsnorm(op); break;
+        case CompiledOpType::RMSNorm:            dispatch_rmsnorm(op); break;
         case CompiledOpType::LayerNorm:          dispatch_layernorm(op); break;
         case CompiledOpType::View:               dispatch_view(op); break;
         case CompiledOpType::Transpose:          dispatch_transpose(op); break;
@@ -5143,6 +5165,7 @@ void CompiledExecutor::dispatch_forward_op(const CompiledOp& op,
         case CompiledOpType::Gelu:               dispatch_gelu(op); break;
         case CompiledOpType::Relu2:              dispatch_relu2(op); break;
         case CompiledOpType::Mul:                dispatch_mul(op); break;
+        case CompiledOpType::Scale:              dispatch_scale(op); break;
         case CompiledOpType::MaskScatter:        dispatch_mask_scatter(op); break;
         case CompiledOpType::DeepstackInject:    dispatch_deepstack_inject(op); break;
         case CompiledOpType::MatmulSwiGLU:       dispatch_matmul_swiglu(op, hook); break;
@@ -5192,6 +5215,8 @@ void CompiledExecutor::dispatch_backward_op(const CompiledOp& op,
         case CompiledOpType::GeluBackward:         dispatch_gelu_backward(op); break;
         case CompiledOpType::Relu2Backward:        dispatch_relu2_backward(op); break;
         case CompiledOpType::MulBackward:          dispatch_mul_backward(op); break;
+        case CompiledOpType::ScaleBackward:        dispatch_scale_backward(op); break;
+        case CompiledOpType::NarrowBackward:       dispatch_narrow_backward(op); break;
         case CompiledOpType::MaskScatterBackward:  dispatch_mask_scatter_backward(op); break;
         case CompiledOpType::DeepstackInjectBackward: dispatch_deepstack_inject_backward(op); break;
         case CompiledOpType::MatmulSwiGLUBackward: dispatch_matmul_swiglu_backward(op, hook); break;
@@ -5202,6 +5227,7 @@ void CompiledExecutor::dispatch_backward_op(const CompiledOp& op,
         case CompiledOpType::FlashAttentionBackward: dispatch_flash_attention_backward(op); break;
         case CompiledOpType::ZerosBackward:        dispatch_zeros_backward(op); break;
         case CompiledOpType::FusedResidualRMSNormBackward: dispatch_fused_residual_rmsnorm_backward(op); break;
+        case CompiledOpType::RMSNormBackward:      dispatch_rmsnorm_backward(op); break;
         case CompiledOpType::LayerNormBackward:    dispatch_layernorm_backward(op); break;
         case CompiledOpType::EmbeddingBackward:    dispatch_embedding_backward(op); break;
         case CompiledOpType::CrossEntropyLossBackward: dispatch_cross_entropy_loss_backward(op); break;

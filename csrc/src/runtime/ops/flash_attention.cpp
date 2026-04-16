@@ -34,12 +34,13 @@ void CompiledExecutor::dispatch_flash_attention(const CompiledOp& op) {
 
     const int Hq = static_cast<int>(mConfig.NumQueryHeads);
     const int Hkv = static_cast<int>(mConfig.NumKeyValHeads);
-    const int Hs = static_cast<int>(mConfig.head_size());
+    const int Hs = derive_head_size(qkv, Hq, Hkv, static_cast<int>(mConfig.head_size()));
     const int H  = Hq + 2 * Hkv;
     const Tensor& out_candidate = ensure_output_tensor(op.outputs[0]);
     const Tensor& lse_candidate = ensure_output_tensor(op.outputs[1]);
-    const std::vector<long> out_shape =
-        !op.outputs[0].shape.empty() ? op.outputs[0].shape : std::vector<long>{mB, mT, Hq, Hs};
+    // Always derive output shape from actual QKV dims (activation layout may
+    // have wrong shape for hybrid models with per-block-type head dimensions).
+    const std::vector<long> out_shape = {mB, mT, Hq, Hs};
     const std::vector<long> lse_shape =
         !op.outputs[1].shape.empty()
             ? op.outputs[1].shape
@@ -99,21 +100,25 @@ void CompiledExecutor::dispatch_flash_attention(const CompiledOp& op) {
         cu_seqlens_ptr = generated_cu_seqlens.get<int32_t>();
     }
 
-    if (use_varlen) {
+    if (use_varlen && Hs <= 256) {
         if (out.DType != ETensorDType::BF16 || qkv.DType != ETensorDType::BF16) {
             throw std::logic_error("flash_attention: varlen path currently requires BF16 tensors");
         }
-        // Document-level masking: Flash Attention varlen path.
-        // Write LSE directly into the pre-allocated output tensor (persists to backward).
-        // For B>1, LSE is still consumed only by matching backward kernels and sinks path.
+        // Document-level masking: Flash Attention varlen path (max head_dim=256).
         attention_forward_flash_varlen(
             out.get<nv_bfloat16>(), lse.get<float>(), qkv.get<nv_bfloat16>(),
             cu_seqlens_ptr, num_docs, max_doc_seqlen, total_doc_tokens,
             Hq, Hkv, Hs, mRunState.MainStream);
     } else if (window_size > 0) {
+        // Sliding window attention: custom kernel (supports head_dim <= 128)
         attention_forward_custom(out, lse, qkv,
                                  static_cast<int>(mB), static_cast<int>(mT),
                                  Hq, Hkv, Hs, window_size, mRunState.MainStream);
+    } else if (!cudnn_supported) {
+        // head_dim > 128: Use cuBLAS matmul-based attention (SDPA math equivalent).
+        attention_forward_matmul(out, lse, qkv,
+                                 static_cast<int>(mB), static_cast<int>(mT),
+                                 Hq, Hkv, Hs, mRunState.cublas_handle(), mRunState.MainStream);
     } else {
         if (!mRunState.scratch().cudnn_workspace.Data) {
             mRunState.temp_acquire(mRunState.scratch().cudnn_workspace);
@@ -180,7 +185,7 @@ void CompiledExecutor::dispatch_flash_attention_backward(const CompiledOp& op) {
         d_out.DType, d_qkv_shape, "flash_attention_backward");
     const int Hq = static_cast<int>(mConfig.NumQueryHeads);
     const int Hkv = static_cast<int>(mConfig.NumKeyValHeads);
-    const int Hs = static_cast<int>(mConfig.head_size());
+    const int Hs = derive_head_size(qkv, Hq, Hkv, static_cast<int>(mConfig.head_size()));
     int layer_idx = op.attrs.layer_idx;
     if (layer_idx < 0 && !op.inputs.empty() && op.inputs[0].layer_idx >= 0) {
         layer_idx = op.inputs[0].layer_idx;
@@ -219,7 +224,12 @@ void CompiledExecutor::dispatch_flash_attention_backward(const CompiledOp& op) {
         cu_seqlens_ptr = generated_cu_seqlens.get<int32_t>();
     }
 
-    if (use_varlen) {
+    // head_dim > 256 without sliding window: use matmul backward (matches forward_matmul)
+    if (use_varlen && Hs > 256) {
+        attention_backward_matmul(d_qkv, lse, out, d_out, qkv,
+                                  static_cast<int>(mB), static_cast<int>(mT),
+                                  Hq, Hkv, Hs, mRunState.cublas_handle(), mRunState.MainStream);
+    } else if (use_varlen) {
         if (out.DType != ETensorDType::BF16 ||
             d_out.DType != ETensorDType::BF16 ||
             qkv.DType != ETensorDType::BF16 ||

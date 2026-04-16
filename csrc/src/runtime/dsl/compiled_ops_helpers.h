@@ -134,6 +134,22 @@ bool refresh_moe_experts_if_needed(int layer_idx,
                                    DslParamStore& weights,
                                    cudaStream_t stream);
 
+/// Derive head_size from a QKV tensor's actual shape for hybrid models
+/// where different block types have different head dimensions.
+/// Falls back to config_hs if the tensor shape is ambiguous.
+inline int derive_head_size(const Tensor& qkv, int Hq, int Hkv, int config_hs) {
+    if (qkv.Rank == 4) {
+        return static_cast<int>(qkv.Sizes[3]);
+    }
+    if (qkv.Rank == 3) {
+        const int total_heads = Hq + 2 * Hkv;
+        if (total_heads > 0) {
+            return static_cast<int>(qkv.Sizes[2]) / total_heads;
+        }
+    }
+    return config_hs;
+}
+
 }  // namespace dsl
 
 #endif  // SUROGATE_SRC_DSL_COMPILED_OPS_HELPERS_H

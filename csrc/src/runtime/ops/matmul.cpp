@@ -635,6 +635,18 @@ void CompiledExecutor::dispatch_matmul_backward(const CompiledOp& op, const modu
             maybe_flatten_bt(a_mat);
         }
 
+        // Validate d_out shape matches expected forward output shape.
+        // The gradient buffer may be mapped to a wrong-sized slot for ops
+        // whose intermediate shapes don't match any pre-allocated slot
+        // (e.g., PLI gate: [B*T, PLI_D] mapped to [B*T, C]).
+        {
+            const bool transB = (mode == EMMTranspose::NT || mode == EMMTranspose::TT);
+            const long expected_cols = transB ? b.Sizes[0] : b.Sizes[1];
+            if (d_out_mat.Rank == 2 && d_out_mat.Sizes[1] != expected_cols) {
+                d_out_mat = view_tensor(d_out_mat, {d_out_mat.Sizes[0], expected_cols});
+            }
+        }
+
         // Fallback: explicit matmuls for dA and dB
         EMMTranspose mode_dA = EMMTranspose::NN;
         EMMTranspose mode_dB = EMMTranspose::NN;

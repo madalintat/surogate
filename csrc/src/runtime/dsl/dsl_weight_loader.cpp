@@ -445,11 +445,33 @@ bool DslWeightLoader::load_fused(const MappingSpec& spec, const std::string& nam
 
     // Infer slice sizes for the fused tensor.
     std::vector<long> slice_sizes = infer_fuse_slices(name, static_cast<int>(spec.sources.size()));
+    const Tensor& shape_ref = global_template ? *global_template : target;
+    const long target_rows = shape_ref.Sizes[0];
+
+    // Validate static slices against target (hybrid models may have per-block-type dims)
+    if (!slice_sizes.empty()) {
+        long sum = 0;
+        for (long s : slice_sizes) sum += s;
+        if (sum != target_rows) slice_sizes.clear();
+    }
+
     if (slice_sizes.empty()) {
-        // Fall back to equal-sized chunks.
-        const Tensor& shape_ref = global_template ? *global_template : target;
-        if (shape_ref.Sizes[0] % static_cast<long>(spec.sources.size()) == 0) {
-            const long chunk = shape_ref.Sizes[0] / static_cast<long>(spec.sources.size());
+        // Try file-based inference from source tensor shapes
+        std::vector<long> file_sizes;
+        file_sizes.reserve(spec.sources.size());
+        for (const auto& src : spec.sources) {
+            const std::string hf_name = format_hf_name(src, layer_idx);
+            if (has_entry(hf_name)) {
+                const auto& entry = mReader.find_entry(hf_name);
+                if (!entry.shape().empty()) {
+                    file_sizes.push_back(entry.shape()[0]);
+                }
+            } else { break; }
+        }
+        if (file_sizes.size() == spec.sources.size()) {
+            slice_sizes = std::move(file_sizes);
+        } else if (target_rows % static_cast<long>(spec.sources.size()) == 0) {
+            const long chunk = target_rows / static_cast<long>(spec.sources.size());
             slice_sizes.assign(spec.sources.size(), chunk);
         } else {
             if (spec.optional) return false;

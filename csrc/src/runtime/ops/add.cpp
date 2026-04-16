@@ -38,6 +38,7 @@ void CompiledExecutor::dispatch_add(const CompiledOp& op) {
     }
 
     vector_add_sr(out, a, b, 1.0f, static_cast<long>(a.nelem()), 0, mRunState.MainStream);
+    store_tensor(op.outputs[0], out);
 }
 
 void CompiledExecutor::dispatch_add_backward(const CompiledOp& op) {

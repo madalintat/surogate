@@ -15,6 +15,7 @@ namespace dsl {
 void CompiledExecutor::dispatch_zeros(const CompiledOp& op) {
     Tensor& out = ensure_output_tensor(op.outputs[0]);
     fill_zero(out, mRunState.MainStream);
+    store_tensor(op.outputs[0], out);
 }
 
 void CompiledExecutor::dispatch_zeros_backward(const CompiledOp& op) {

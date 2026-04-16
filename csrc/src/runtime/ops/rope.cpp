@@ -33,8 +33,14 @@ void CompiledExecutor::dispatch_rope(const CompiledOp& op) {
         qkv.DType, out_shape, "rope");
 
     const int Hq = static_cast<int>(mConfig.NumQueryHeads);
-    const int Hkv = static_cast<int>(mConfig.NumKeyValHeads);
-    const int Hs = static_cast<int>(mConfig.head_size());
+    int Hkv = static_cast<int>(mConfig.NumKeyValHeads);
+    const int Hs = derive_head_size(qkv, Hq, Hkv, static_cast<int>(mConfig.head_size()));
+
+    // For Q-only RoPE (shared-KV attention), the input has only Hq heads.
+    // The kernel expects Hq + 2*Hkv heads — set Hkv=0 to prevent OOB access.
+    if (qkv.Rank == 4 && qkv.Sizes[2] == Hq) {
+        Hkv = 0;
+    }
 
     if (mForwardPlan) {
         int layer_idx = -1;
@@ -72,7 +78,7 @@ void CompiledExecutor::dispatch_rope_backward(const CompiledOp& op) {
 
     const int Hq = static_cast<int>(mConfig.NumQueryHeads);
     const int Hkv = static_cast<int>(mConfig.NumKeyValHeads);
-    const int Hs = static_cast<int>(mConfig.head_size());
+    const int Hs = derive_head_size(d_out, Hq, Hkv, static_cast<int>(mConfig.head_size()));
 
     // For FP8 hybrid backward, record abs_max of d_qkv for subsequent quantization
     float* abs_max_ptr = mRunState.has_fp8_hybrid_backward()

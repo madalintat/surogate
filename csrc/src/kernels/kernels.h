@@ -461,6 +461,20 @@ void attention_backward_custom(Tensor& dqkv, const Tensor& stats,
                                const Tensor& out, const Tensor& dout, const Tensor& qkv,
                                int B, int T, int Hq, int Hkv, int HS, int window_size, cudaStream_t stream);
 
+// cuBLAS matmul-based attention (SDPA math equivalent). No head_dim limit.
+// Computes: scores = Q @ K^T * scale, causal mask, softmax, out = attn @ V.
+// Uses temporary memory for the (B, Hq, T, T) attention matrix.
+void attention_forward_matmul(Tensor& out, Tensor& stats, const Tensor& qkv,
+                              int B, int T, int Hq, int Hkv, int HS,
+                              cublasHandle_t cublas, cudaStream_t stream);
+
+// cuBLAS matmul-based attention backward. Matches forward_matmul precision.
+void attention_backward_matmul(Tensor& d_qkv, const Tensor& lse,
+                               const Tensor& out, const Tensor& d_out,
+                               const Tensor& qkv,
+                               int B, int T, int Hq, int Hkv, int HS,
+                               cublasHandle_t cublas, cudaStream_t stream);
+
 struct AttnBwdDebugConfig {
     int enabled = 0;
     int layer = -1;

@@ -40,7 +40,8 @@ std::string_view trim_optional(std::string_view name) {
 
 bool is_embedding_name(std::string_view name) {
     const std::string_view clean = trim_optional(name);
-    return clean == "embedding" || clean == "embeddings" || clean == "embed_tokens";
+    return clean == "embedding" || clean == "embeddings" || clean == "embed_tokens"
+        || clean == "pli_embedding";
 }
 
 bool is_lm_head_name(std::string_view name) {

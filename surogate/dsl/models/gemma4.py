@@ -91,6 +91,13 @@ def _gemma4_layer_mappings(layer_prefix: str, *, k_eq_v: bool = False) -> dict[s
         "mlp_down_weight": f"{layer_prefix}.mlp.down_proj.weight",
         # Per-layer scaling buffer
         "layer_scalar": f"{layer_prefix}.layer_scalar",
+        # Per-layer input gating (PLI)
+        "pli_gate_weight": f"{layer_prefix}.per_layer_input_gate.weight",
+        "pli_proj_weight": f"{layer_prefix}.per_layer_projection.weight",
+        "pli_norm_weight": f"{layer_prefix}.post_per_layer_input_norm.weight",
+        # Shared-KV attention (Q-only projection, no K/V)
+        "self_attn_q_weight": f"{layer_prefix}.self_attn.q_proj.weight",
+        "self_attn_q_norm_weight": f"{layer_prefix}.self_attn.q_norm.weight",
     }
 
 
@@ -165,17 +172,21 @@ def _build_gemma4_model(
                     kv_sharing_map[i] = j
                     break
 
-    # Build final block_types: shared layers become "shared_kv"
+    # Build final block_types: shared layers split by base attention type
     cls.block_types = []
     for i, t in enumerate(base_types):
         if i >= first_shared_idx and num_kv_shared_layers > 0:
-            cls.block_types.append("shared_kv")
+            if t == "full":
+                cls.block_types.append("shared_kv_full")
+            else:
+                cls.block_types.append("shared_kv_sliding")
         else:
             cls.block_types.append(t)
 
     cls.n_sliding_blocks = sum(1 for t in cls.block_types if t == "sliding")
     cls.n_full_blocks = sum(1 for t in cls.block_types if t == "full")
-    cls.n_shared_kv_blocks = sum(1 for t in cls.block_types if t == "shared_kv")
+    cls.n_shared_kv_sliding_blocks = sum(1 for t in cls.block_types if t == "shared_kv_sliding")
+    cls.n_shared_kv_full_blocks = sum(1 for t in cls.block_types if t == "shared_kv_full")
 
     block_configs = []
     if cls.n_sliding_blocks > 0:
@@ -247,14 +258,31 @@ def _build_gemma4_model(
                 ),
             ))
 
-    # Shared-KV blocks (Q-only attention + optional double-wide MLP)
-    if cls.n_shared_kv_blocks > 0:
+    # Shared-KV sliding blocks (Q-only attention, standard head_dim, double-wide MLP)
+    if cls.n_shared_kv_sliding_blocks > 0:
         block_configs.append((
-            "shared_kv_blocks", Gemma4SharedKVBlock, cls.n_shared_kv_blocks,
+            "shared_kv_sliding_blocks", Gemma4SharedKVBlock, cls.n_shared_kv_sliding_blocks,
             dict(
                 d_model=d_model,
                 num_query_heads=num_query_heads,
                 num_kv_heads=num_kv_heads,
+                head_size=head_size,
+                d_ff=d_ff,
+                max_seq=max_seq,
+                partial_rotary_factor=1.0,
+                d_per_layer_input=d_per_layer_input,
+                use_double_wide_mlp=use_double_wide_mlp,
+                eps=eps,
+            ),
+        ))
+    # Shared-KV full blocks (Q-only attention, global_head_dim, double-wide MLP)
+    if cls.n_shared_kv_full_blocks > 0:
+        block_configs.append((
+            "shared_kv_full_blocks", Gemma4SharedKVBlock, cls.n_shared_kv_full_blocks,
+            dict(
+                d_model=d_model,
+                num_query_heads=num_query_heads,
+                num_kv_heads=global_num_kv_heads,
                 head_size=global_head_dim,
                 d_ff=d_ff,
                 max_seq=max_seq,
@@ -272,6 +300,7 @@ def _build_gemma4_model(
         cls.pli_embedding = nn.ScaledEmbedding(
             vocab_size_per_layer_input, n_layers * d_per_layer_input,
             embed_scale=float(d_per_layer_input) ** 0.5,
+            dim_name="PLI_total",
         )
 
     cls.hybrid_blocks = nn.HybridBlockStack(
@@ -325,8 +354,11 @@ def _gemma4_forward(model, token_ids, position_ids, targets):
 
         model._register_param("pli_model_proj", ("PLI_total", "d_model"),
                               quantizable=False)
-        pli_proj_flat = model._matmul(x, "pli_model_proj", name="pli_proj_flat")
-        pli_proj_scaled = model._scale_by_const(pli_proj_flat, float(d_model) ** -0.5,
+        x_flat_pli = model._view(x, ["B * T", "d_model"], name="x_flat_pli")
+        pli_proj_flat = model._matmul(x_flat_pli, "pli_model_proj", name="pli_proj_flat")
+        pli_proj_3d = model._view(pli_proj_flat, ["B", "T", pli_total],
+                                  name="pli_proj_3d")
+        pli_proj_scaled = model._scale_by_const(pli_proj_3d, float(d_model) ** -0.5,
                                                 name="pli_proj_scaled")
 
         pli_embeds_4d = model._view(pli_embeds, ["B", "T", n_layers, d_pli],
@@ -470,6 +502,12 @@ class Gemma4CausalModel(nn.Model):
     vocab_size_per_layer_input="text_config.vocab_size_per_layer_input",
     k_eq_v="text_config.attention_k_eq_v",
     final_logit_softcapping="text_config.final_logit_softcapping",
+    enable_moe_block="text_config.enable_moe_block",
+    num_experts="text_config.num_experts",
+    top_k_experts="text_config.top_k_experts",
+    moe_intermediate_size="text_config.moe_intermediate_size",
+    num_kv_shared_layers="text_config.num_kv_shared_layers",
+    use_double_wide_mlp="text_config.use_double_wide_mlp",
 )
 class Gemma4ConditionalModel(nn.Model):
     """Gemma4 text backbone for ``Gemma4ForConditionalGeneration`` (multimodal)."""

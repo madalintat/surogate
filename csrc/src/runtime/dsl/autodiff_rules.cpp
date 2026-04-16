@@ -286,6 +286,53 @@ std::vector<Operation> multiply_backward(const BackwardRuleContext& ctx) {
 }
 
 // -----------------------------------------------------------------------------
+// Scale backward rule
+// Forward: y = factor * x
+// Backward: d_x = factor * d_y
+// -----------------------------------------------------------------------------
+std::vector<Operation> scale_backward_rule(const BackwardRuleContext& ctx) {
+    std::vector<Operation> ops;
+
+    if (ctx.needs_grad(0)) {
+        // Copy the "factor" attribute from the forward op
+        AttrMap attrs = copy_attrs(ctx.fwd_op.attrs, {"factor"});
+        ops.push_back(make_operation(
+            "scale_backward_" + std::to_string(ctx.op_counter++),
+            "scale_backward",
+            "scale_backward",
+            {ctx.d_output},
+            {ctx.d_inputs[0]},
+            attrs));
+    }
+
+    return ops;
+}
+
+// -----------------------------------------------------------------------------
+// Narrow backward rule
+// Forward: y = narrow(x, dim, start, length)
+// Backward: d_x = zeros_like(x); d_x[..., start:start+length, ...] = d_y
+// -----------------------------------------------------------------------------
+std::vector<Operation> narrow_backward_rule(const BackwardRuleContext& ctx) {
+    std::vector<Operation> ops;
+
+    if (ctx.needs_grad(0)) {
+        // Copy dim, start, length attributes from forward
+        AttrMap attrs = copy_attrs(ctx.fwd_op.attrs, {"dim", "start", "length"});
+        // Pass the forward input name so backward can determine the full shape
+        ops.push_back(make_operation(
+            "narrow_backward_" + std::to_string(ctx.op_counter++),
+            "narrow_backward",
+            "narrow_backward",
+            {ctx.d_output, saved_ref(ctx.fwd_op.inputs[0])},
+            {ctx.d_inputs[0]},
+            attrs));
+    }
+
+    return ops;
+}
+
+// -----------------------------------------------------------------------------
 // Masked scatter backward rule
 // Forward: out = mask_scatter(x, mask, src)
 // Backward: d_x, d_src (mask is non-differentiable)
@@ -1717,6 +1764,8 @@ void register_builtin_backward_rules() {
     reg.register_rule("add", add_backward);
     reg.register_rule("multiply", multiply_backward);
     reg.register_rule("mul", multiply_backward);
+    reg.register_rule("scale", scale_backward_rule);
+    reg.register_rule("narrow", narrow_backward_rule);
     reg.register_rule("mask_scatter", mask_scatter_backward);
     reg.register_rule("deepstack_inject", deepstack_inject_backward);
 

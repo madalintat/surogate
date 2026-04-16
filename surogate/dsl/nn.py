@@ -1535,35 +1535,42 @@ class Gemma4Attention(Module):
         g = tracer.graph
         x, position_ids = args
 
+        # Use numeric dimensions (not DimExpr) to avoid global shape env
+        # collisions in hybrid models with different head_size/QKV per block type.
+        if self.k_eq_v:
+            _qkv_dim = (self.num_query_heads + self.num_kv_heads) * self.head_size
+        else:
+            _qkv_dim = (self.num_query_heads + 2 * self.num_kv_heads) * self.head_size
+        _attn_dim = self.num_query_heads * self.head_size
+        _full_qkv_dim = (self.num_query_heads + 2 * self.num_kv_heads) * self.head_size
+
         # -- params ----------------------------------------------------------
-        qkv_w = tracer.register_param("qkv_weight", ("QKV", "C"))
-        out_w = tracer.register_param("out_weight", ("C", "AttnDim"))
-        tracer.register_param("q_norm_weight", ("D",), quantizable=False)
-        tracer.register_param("k_norm_weight", ("D",), quantizable=False)
+        qkv_w = tracer.register_param("qkv_weight", (_qkv_dim, "C"))
+        out_w = tracer.register_param("out_weight", ("C", _attn_dim))
+        tracer.register_param("q_norm_weight", (self.head_size,), quantizable=False)
+        tracer.register_param("k_norm_weight", (self.head_size,), quantizable=False)
         tracer.register_param(
-            "rope_freqs", ("MaxSeq", "RotaryDim // 2", 2), dtype="fp32",
+            "rope_freqs", (self.max_seq, self.RotaryDim // 2, 2), dtype="fp32",
             frozen=True, quantizable=False,
         )
 
         # -- activation slots ------------------------------------------------
         qkv_slot = tracer.register_activation(
-            "qkv", ("B", "T", "QKV"),
+            "qkv", ("B", "T", _qkv_dim),
             aliases=["qkv_flat"],
             save=True, share_policy="when_recomputed",
         )
-        # Final packed QKV (always Hq + 2*Hkv heads, including V)
-        full_qkv_dim = (self.Hq + 2 * self.Hkv) * self.D
         qkv_rope_slot = tracer.register_activation(
-            "qkv_rope", ("B", "T", full_qkv_dim),
+            "qkv_rope", ("B", "T", _full_qkv_dim),
             save=True, share_policy="when_recomputed",
         )
         att_slot = tracer.register_activation(
-            "att", ("B", "T", "AttnDim"),
+            "att", ("B", "T", _attn_dim),
             aliases=["att_flat"],
             save=True, share_policy="always_recompute",
         )
         tracer.register_activation(
-            "lse", ("B", "Hq", "T"),
+            "lse", ("B", self.num_query_heads, "T"),
             dtype="fp32", save=True, share_policy="always_recompute",
         )
         att_out_slot = tracer.register_activation(
@@ -1578,13 +1585,13 @@ class Gemma4Attention(Module):
             out_name=tracer.prefixed("x_flat"),
         )
 
-        # QKV projection
+        # Fused QKV projection
         qkv_flat = g.matmul(
             x_flat, qkv_w, transpose="NT",
             out_name=tracer.prefixed("qkv_flat"),
         )
 
-        ones_d = g.ones(shape=[self.D], dtype="bf16")
+        ones_d = g.ones(shape=[self.head_size], dtype="bf16")
 
         if self.k_eq_v:
             # --- k_eq_v mode: Q+K projection only, V = raw K ---
@@ -1593,72 +1600,35 @@ class Gemma4Attention(Module):
                 shape=[B, T, self.num_query_heads + self.num_kv_heads, self.head_size],
                 out_name=qkv_slot,
             )
-            # Split into Q and K
             q_part, k_raw = g.split(
-                qk,
-                split_size=[self.num_query_heads, self.num_kv_heads],
-                dim=2,
+                qk, split_size=[self.num_query_heads, self.num_kv_heads], dim=2,
             )
-            # V = K (raw, BEFORE k_norm and RoPE)
-            v_raw = k_raw  # same tensor reference
+            v_raw = k_raw
 
-            # Q-norm: (1 + weight) scale, applied per-head
-            q_norm_eff = g.add(
-                tracer.prefixed("q_norm_weight"), ones_d,
-                out_name=tracer.prefixed("q_norm_weight_eff"),
-            )
-            q_flat = g.view(
-                q_part,
-                shape=[B * T * self.num_query_heads, self.head_size],
-                out_name=tracer.prefixed("q_flat"),
-            )
-            q_normed_flat, _ = g.rmsnorm(
-                q_flat, q_norm_eff, eps=self.eps,
-                y_name=tracer.prefixed("q_normed_flat"),
-            )
-            q_normed = g.view(
-                q_normed_flat,
-                shape=[B, T, self.num_query_heads, self.head_size],
-                out_name=tracer.prefixed("q_normed"),
-            )
+            # Q-norm: direct weight (Gemma4 stores the full scale, no +1 offset)
+            q_flat_2d = g.view(q_part, shape=[B * T * self.num_query_heads, self.head_size],
+                               out_name=tracer.prefixed("q_flat"))
+            q_normed_flat, _ = g.rmsnorm(q_flat_2d, tracer.prefixed("q_norm_weight"),
+                                         eps=self.eps, y_name=tracer.prefixed("q_normed_flat"))
+            q_normed = g.view(q_normed_flat, shape=[B, T, self.num_query_heads, self.head_size],
+                              out_name=tracer.prefixed("q_normed"))
 
-            # K-norm: (1 + weight) scale, applied per-head
-            k_norm_eff = g.add(
-                tracer.prefixed("k_norm_weight"), ones_d,
-                out_name=tracer.prefixed("k_norm_weight_eff"),
-            )
-            k_flat = g.view(
-                k_raw,
-                shape=[B * T * self.num_kv_heads, self.head_size],
-                out_name=tracer.prefixed("k_flat"),
-            )
-            k_normed_flat, _ = g.rmsnorm(
-                k_flat, k_norm_eff, eps=self.eps,
-                y_name=tracer.prefixed("k_normed_flat"),
-            )
-            k_normed = g.view(
-                k_normed_flat,
-                shape=[B, T, self.num_kv_heads, self.head_size],
-                out_name=tracer.prefixed("k_normed"),
-            )
+            # K-norm: direct weight
+            k_flat_2d = g.view(k_raw, shape=[B * T * self.num_kv_heads, self.head_size],
+                               out_name=tracer.prefixed("k_flat"))
+            k_normed_flat, _ = g.rmsnorm(k_flat_2d, tracer.prefixed("k_norm_weight"),
+                                         eps=self.eps, y_name=tracer.prefixed("k_normed_flat"))
+            k_normed = g.view(k_normed_flat, shape=[B, T, self.num_kv_heads, self.head_size],
+                              out_name=tracer.prefixed("k_normed"))
 
             # V-norm: RMS-only (no learnable scale), on raw K
-            v_flat = g.view(
-                v_raw,
-                shape=[B * T * self.num_kv_heads, self.head_size],
-                out_name=tracer.prefixed("v_flat_2d"),
-            )
-            v_normed_flat, _ = g.rmsnorm(
-                v_flat, ones_d, eps=self.eps,
-                y_name=tracer.prefixed("v_normed_2d"),
-            )
-            v_normed = g.view(
-                v_normed_flat,
-                shape=[B, T, self.num_kv_heads, self.head_size],
-                out_name=tracer.prefixed("v_normed"),
-            )
+            v_flat_2d = g.view(v_raw, shape=[B * T * self.num_kv_heads, self.head_size],
+                               out_name=tracer.prefixed("v_flat_2d"))
+            v_normed_flat, _ = g.rmsnorm(v_flat_2d, ones_d, eps=self.eps,
+                                         y_name=tracer.prefixed("v_normed_2d"))
+            v_normed = g.view(v_normed_flat, shape=[B, T, self.num_kv_heads, self.head_size],
+                              out_name=tracer.prefixed("v_normed"))
 
-            # Concat Q+K for RoPE, then add V after
             qk_normed = g.concat(q_normed, k_normed, dim=2)
             qkv_normed = g.concat(qk_normed, v_normed, dim=2)
 
@@ -1670,28 +1640,24 @@ class Gemma4Attention(Module):
                 out_name=qkv_slot,
             )
 
-            # QK-norm with (1 + weight) scale (fused kernel)
-            q_norm_eff = g.add(
-                tracer.prefixed("q_norm_weight"), ones_d,
-                out_name=tracer.prefixed("q_norm_weight_eff"),
-            )
-            k_norm_eff = g.add(
-                tracer.prefixed("k_norm_weight"), ones_d,
-                out_name=tracer.prefixed("k_norm_weight_eff"),
-            )
+            # QK-norm: direct weight (Gemma4 stores the full scale, no +1 offset)
             qkv_qk_normed, _, _ = g.qkv_qk_norm(
-                qkv, q_norm_eff, k_norm_eff, eps=self.eps,
+                qkv, tracer.prefixed("q_norm_weight"),
+                tracer.prefixed("k_norm_weight"), eps=self.eps,
             )
 
-            # V-norm: split V, apply RMS normalization, rejoin
-            qk_part, v_part = g.split(
-                qkv_qk_normed,
-                split_size=[self.num_query_heads + self.num_kv_heads, self.num_kv_heads],
-                dim=2,
+            # V-norm: split V from QKV in flattened space, normalize, rejoin
+            qk_dim = (self.num_query_heads + self.num_kv_heads) * self.head_size
+            v_dim = self.num_kv_heads * self.head_size
+            qkv_normed_flat = g.view(
+                qkv_qk_normed, shape=[B, T, qk_dim + v_dim],
+                out_name=tracer.prefixed("qkv_normed_flat"),
+            )
+            qk_flat_3d, v_flat_3d = g.split(
+                qkv_normed_flat, split_size=[qk_dim, v_dim], dim=2,
             )
             v_flat_2d = g.view(
-                v_part,
-                shape=[B * T * self.num_kv_heads, self.head_size],
+                v_flat_3d, shape=[B * T * self.num_kv_heads, self.head_size],
                 out_name=tracer.prefixed("v_flat_2d"),
             )
             v_normed_2d, _ = g.rmsnorm(
@@ -1699,11 +1665,15 @@ class Gemma4Attention(Module):
                 y_name=tracer.prefixed("v_normed_2d"),
             )
             v_normed = g.view(
-                v_normed_2d,
-                shape=[B, T, self.num_kv_heads, self.head_size],
+                v_normed_2d, shape=[B, T, self.num_kv_heads * self.head_size],
                 out_name=tracer.prefixed("v_normed"),
             )
-            qkv_normed = g.concat(qk_part, v_normed, dim=2)
+            qkv_normed_3d = g.concat(qk_flat_3d, v_normed, dim=2)
+            qkv_normed = g.view(
+                qkv_normed_3d,
+                shape=[B, T, self.num_query_heads + 2 * self.num_kv_heads, self.head_size],
+                out_name=tracer.prefixed("qkv_normed_4d"),
+            )
 
         # RoPE (only rotates Q and K heads, leaves V as-is)
         qkv_rope = g.rope(
@@ -1795,23 +1765,27 @@ class Gemma4SharedKVAttention(Module):
         g = tracer.graph
         x, position_ids, kv_source = args
 
+        # Use numeric dims to avoid global shape env collisions in hybrid models
+        _qdim = self.num_query_heads * self.head_size
+        _attn_dim = _qdim
+
         # -- params (Q-only, no K/V weights) ---------------------------------
-        q_w = tracer.register_param("q_weight", ("QDim", "C"))
-        out_w = tracer.register_param("out_weight", ("C", "AttnDim"))
-        tracer.register_param("q_norm_weight", ("D",), quantizable=False)
+        q_w = tracer.register_param("q_weight", (_qdim, "C"))
+        out_w = tracer.register_param("out_weight", ("C", _attn_dim))
+        tracer.register_param("q_norm_weight", (self.head_size,), quantizable=False)
         tracer.register_param(
-            "rope_freqs", ("MaxSeq", "RotaryDim // 2", 2), dtype="fp32",
+            "rope_freqs", (self.max_seq, self.RotaryDim // 2, 2), dtype="fp32",
             frozen=True, quantizable=False,
         )
 
         # -- activation slots ------------------------------------------------
         att_slot = tracer.register_activation(
-            "att", ("B", "T", "AttnDim"),
+            "att", ("B", "T", _attn_dim),
             aliases=["att_flat"],
             save=True, share_policy="always_recompute",
         )
         tracer.register_activation(
-            "lse", ("B", "Hq", "T"),
+            "lse", ("B", self.num_query_heads, "T"),
             dtype="fp32", save=True, share_policy="always_recompute",
         )
         att_out_slot = tracer.register_activation(
@@ -1830,25 +1804,34 @@ class Gemma4SharedKVAttention(Module):
         q = g.view(q_flat, shape=[B, T, self.num_query_heads, self.head_size],
                    out_name=tracer.prefixed("q_4d"))
 
-        # Q-norm with (1 + weight)
-        ones_d = g.ones(shape=[self.D], dtype="bf16")
-        q_norm_eff = g.add(tracer.prefixed("q_norm_weight"), ones_d,
-                           out_name=tracer.prefixed("q_norm_eff"))
+        # Q-norm: direct weight scale (Gemma4 stores the full scale, no +1 offset)
         q_rn_flat = g.view(q, shape=[B * T * self.num_query_heads, self.head_size],
                            out_name=tracer.prefixed("q_rn_flat"))
-        q_normed_flat, _ = g.rmsnorm(q_rn_flat, q_norm_eff, eps=self.eps,
+        q_normed_flat, _ = g.rmsnorm(q_rn_flat, tracer.prefixed("q_norm_weight"),
+                                     eps=self.eps,
                                      y_name=tracer.prefixed("q_normed_flat"))
         q_normed = g.view(q_normed_flat,
                           shape=[B, T, self.num_query_heads, self.head_size],
                           out_name=tracer.prefixed("q_normed"))
 
-        # Extract K,V from kv_source [B, T, Hq+2*Hkv, D]
-        # K is at [Hq : Hq+Hkv], V is at [Hq+Hkv : Hq+2*Hkv]
-        # The kv_source already has norms and RoPE applied
-        _, kv_part = g.split(
+        # Extract K,V from kv_source. Use dimension sizes (not head counts)
+        # because the source tensor may be 3D (B,T,QKV) during backward replay.
+        q_dim = self.num_query_heads * self.head_size
+        kv_dim = 2 * self.num_kv_heads * self.head_size
+        kv_source_flat = g.view(
             kv_source.ref,
-            split_size=[self.num_query_heads, 2 * self.num_kv_heads],
+            shape=[B, T, q_dim + kv_dim],
+            out_name=tracer.prefixed("kv_source_flat"),
+        )
+        _, kv_flat = g.split(
+            kv_source_flat,
+            split_size=[q_dim, kv_dim],
             dim=2,
+        )
+        kv_part = g.view(
+            kv_flat,
+            shape=[B, T, 2 * self.num_kv_heads, self.head_size],
+            out_name=tracer.prefixed("kv_4d"),
         )
 
         # Apply RoPE to Q only (K,V already have RoPE from source layer).
@@ -2211,23 +2194,17 @@ class GatedMLP(Module):
         g = tracer.graph
         (x,) = args
 
-        gate_w = tracer.register_param("gate_weight", ("M", "C"))
-        up_w = tracer.register_param("up_weight", ("M", "C"))
-        down_w = tracer.register_param("down_weight", ("C", "M"))
+        gate_w = tracer.register_param("gate_weight", (self.d_ff, "C"))
+        up_w = tracer.register_param("up_weight", (self.d_ff, "C"))
+        down_w = tracer.register_param("down_weight", ("C", self.d_ff))
 
-        tracer.register_activation(
-            "gate", ("B", "T", "M"), share_policy="when_recomputed",
-        )
-        tracer.register_activation(
-            "up", ("B", "T", "M"), share_policy="when_recomputed",
-        )
         down_slot = tracer.register_activation(
             "down", ("B", "T", "C"), share_policy="when_recomputed",
         )
 
         x_flat = g.view(x.ref, shape=[B * T, self.C], out_name=tracer.prefixed("x_flat"))
-        gate_flat = g.matmul(x_flat, gate_w, transpose="NT", out_name=tracer.prefixed("gate_flat"))
-        up_flat = g.matmul(x_flat, up_w, transpose="NT", out_name=tracer.prefixed("up_flat"))
+        gate_flat = g.matmul(x_flat, gate_w, transpose="NT")
+        up_flat = g.matmul(x_flat, up_w, transpose="NT")
 
         act_map = {"silu": g.silu, "relu": g.relu, "relu2": g.relu2, "gelu": g.gelu}
         act_fn = act_map.get(self.activation, g.silu)
@@ -3732,24 +3709,27 @@ class ScaledEmbedding(Module):
 
     def __init__(
         self, vocab_size: int, d_model: int, embed_scale: float | None = None,
+        dim_name: str = "d_model",
     ) -> None:
         super().__init__()
         self.vocab_size = vocab_size
         self.d_model = d_model
         self.embed_scale = embed_scale if embed_scale is not None else float(d_model) ** 0.5
+        self._dim_name = dim_name
 
     def _trace(
         self, tracer: Tracer, *args: Proxy, **kwargs: Any
     ) -> Proxy:
         g = tracer.graph
         (token_ids,) = args
+        dim = self._dim_name
 
         w = tracer.register_param(
-            "weight", ("vocab_size", "d_model"), quantizable=False,
+            "weight", ("vocab_size", dim), quantizable=False,
         )
 
         out_slot = tracer.register_activation(
-            "out", ("B", "T", "d_model"),
+            "out", ("B", "T", dim),
             scope=ActivationScope.GLOBAL,
             description="Scaled embedded input",
         )
@@ -3757,7 +3737,7 @@ class ScaledEmbedding(Module):
         raw = g.embedding(token_ids.ref, w)
         scaled = g.scale(raw, factor=self.embed_scale)
         # Bind the scale output to the registered activation slot name
-        out = g.view(scaled, shape=[B, T, "d_model"], out_name=out_slot)
+        out = g.view(scaled, shape=[B, T, dim], out_name=out_slot)
         return Proxy(out_slot, out)
 
 
@@ -4296,8 +4276,6 @@ GEMMA4_BLOCK_NAME_REMAP: dict[str, str] = {
     "self_attn_q_norm_weight": "q_norm_weight",
     "self_attn_k_norm_weight": "k_norm_weight",
     "self_attn_rope_freqs": "rope_freqs",
-    "self_attn_q_norm_weight_eff": "q_norm_weight_eff",
-    "self_attn_k_norm_weight_eff": "k_norm_weight_eff",
     "self_attn_qkv": "qkv",
     "self_attn_qkv_flat": "qkv_flat",
     "self_attn_qkv_rope": "qkv_rope",
@@ -4414,7 +4392,7 @@ class Block(Module):
     def forward(self, *args: Proxy, **kwargs: Any) -> Any:
         raise NotImplementedError("Subclasses must implement forward()")
 
-    def compile(self) -> BlockSpec:
+    def compile(self, name_override: str | None = None) -> BlockSpec:
         """Trace forward and produce a BlockSpec."""
         tracer = Tracer()
         tracer._name_remap = getattr(type(self), '_name_remap_', {})
@@ -4475,7 +4453,7 @@ class Block(Module):
 
         # Build BlockSpec
         spec = BlockSpec(
-            name=type(self).__name__,
+            name=name_override or type(self).__name__,
             python_class=type(self),
             docstring=type(self).__doc__,
             constructor_params=_extract_constructor_params(type(self)),
@@ -4484,8 +4462,10 @@ class Block(Module):
             activations=activation_layout,
         )
 
-        # Register in block registry
+        # Register in block registry (both class name and override name)
         _block_registry[type(self).__name__] = spec
+        if name_override and name_override != type(self).__name__:
+            _block_registry[name_override] = spec
 
         return spec
 
@@ -4761,7 +4741,10 @@ class HybridBlockStack(Module):
         # Register each block array as a param and compile block specs
         call_kwargs = {}
         for btype, (param_name, instance, count) in self._block_instances.items():
-            block_name = type(instance).__name__
+            base_name = type(instance).__name__
+            # Use param_name as a unique key when the same Block class is used
+            # with different configs (e.g., Gemma4SharedKVBlock with different head sizes)
+            block_name = param_name.replace("_blocks", "").replace("_", "__") + "__" + base_name
             size_attr = f"n_{btype}_blocks"
             if param_name not in tracer.params:
                 tracer.params[param_name] = ParamSpec(
@@ -4770,8 +4753,8 @@ class HybridBlockStack(Module):
                     array_size=size_attr,
                     element_type=block_name,
                 )
-            # Compile the inner block to register it
-            instance.compile()
+            # Compile the inner block to register it with a unique name
+            instance.compile(name_override=block_name)
             call_kwargs[param_name] = param_name
 
         # Emit HybridStackedBlocks call

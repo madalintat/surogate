@@ -827,8 +827,15 @@ void DslModel::allocate_run_state(const RuntimeOptions& options, NCCLCommunicato
     const long dtype_bytes = static_cast<long>(get_dtype_size(act_dtype));
     const long BT = static_cast<long>(B) * static_cast<long>(T);
     const long C = mModelConfig.HiddenSize;
-    const long QKV = mModelConfig.head_size() * (mModelConfig.NumQueryHeads + 2 * mModelConfig.NumKeyValHeads);
-    const long MUp = static_cast<long>(mModelConfig.mlp_up_rows());
+    long QKV = mModelConfig.head_size() * (mModelConfig.NumQueryHeads + 2 * mModelConfig.NumKeyValHeads);
+    long MUp = static_cast<long>(mModelConfig.mlp_up_rows());
+    // For hybrid models, use max dims across all block types
+    if (mRuntimeConfig.has_per_layer_dims()) {
+        for (const auto& pld : mRuntimeConfig.per_layer_dims) {
+            QKV = std::max(QKV, pld.qkv_channels);
+            MUp = std::max(MUp, pld.mlp_up);
+        }
+    }
     const long extra_tmp = std::max({BT * C, BT * QKV, BT * MUp}) * dtype_bytes;
     long attn_fallback_bytes = 0;
     const bool lora_stack_tight = lora_enabled();

@@ -34,7 +34,7 @@ void CompiledExecutor::dispatch_mrope(const CompiledOp& op) {
 
     const int Hq = static_cast<int>(mConfig.NumQueryHeads);
     const int Hkv = static_cast<int>(mConfig.NumKeyValHeads);
-    const int Hs = static_cast<int>(mConfig.head_size());
+    const int Hs = derive_head_size(qkv_in, Hq, Hkv, static_cast<int>(mConfig.head_size()));
     const int qkv_channels = Hs * (Hq + 2 * Hkv);
 
     if (qkv_in.Data != qkv_out.Data) {
@@ -86,7 +86,7 @@ void CompiledExecutor::dispatch_mrope_backward(const CompiledOp& op) {
 
     const int Hq = static_cast<int>(mConfig.NumQueryHeads);
     const int Hkv = static_cast<int>(mConfig.NumKeyValHeads);
-    const int Hs = static_cast<int>(mConfig.head_size());
+    const int Hs = derive_head_size(d_out, Hq, Hkv, static_cast<int>(mConfig.head_size()));
     const int qkv_channels = Hs * (Hq + 2 * Hkv);
     const int rotary_dim = op.attrs.rotary_dim;
 

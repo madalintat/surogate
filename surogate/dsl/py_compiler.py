@@ -838,15 +838,18 @@ def _inline_stacked_blocks(
             raise DSLUndefinedError(param_spec.element_type)
         return block_spec
 
-    # Cache compiled block graphs by block name
+    # Cache compiled block graphs by block name + param_name to support hybrid models
+    # where different block types use the same Block class with different configs
+    # (e.g., Gemma4SharedKVBlock with head_size=256 vs head_size=512).
     block_cache: Dict[str, ModuleIR] = {}
 
-    def _get_block_ir(block_spec: BlockSpec) -> ModuleIR:
-        cached = block_cache.get(block_spec.name)
+    def _get_block_ir(block_spec: BlockSpec, cache_key: str | None = None) -> ModuleIR:
+        key = cache_key or block_spec.name
+        cached = block_cache.get(key)
         if cached is not None:
             return cached
         ir = compile_block_spec(block_spec, config)
-        block_cache[block_spec.name] = ir
+        block_cache[key] = ir
         return ir
 
     new_nodes: List[OpIR] = []
@@ -918,7 +921,7 @@ def _inline_stacked_blocks(
                         spec = get_block_spec(param_spec.element_type)
                         if spec:
                             block_specs[block_type] = spec
-                            block_irs[block_type] = _get_block_ir(spec)
+                            block_irs[block_type] = _get_block_ir(spec, cache_key=param_name)
 
             cur_inputs = list(node.inputs)
 
@@ -970,7 +973,7 @@ def _inline_stacked_blocks(
                     # use a neutral name to avoid the block-activation resolver.
                     layer_outputs = [
                         f"blocks[{layer_idx}].{name}"
-                        if name in ("res_in", "res_ffn", "res_att")
+                        if name in ("res_in", "res_ffn", "res_att", "mlp_down")
                         else f"layer{layer_idx}.{name}"
                         for name in block_outputs
                     ]

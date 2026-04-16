@@ -296,9 +296,37 @@ void DslModel::import_weights(const std::string& file_name, bool allow_cast, NCC
             }
             std::vector<long> slice_sizes = internal::infer_fuse_slices(name, *mConfig,
                                                                         static_cast<int>(spec->sources.size()));
+
+            // Validate static slices against target. For hybrid models with
+            // per-block-type dimensions, the static inference may produce wrong
+            // sizes (uses global head_size which varies across block types).
+            const Tensor& global = mParams->template_tensor(name);
+            const long global_rows = global.Sizes[0];
+            if (!slice_sizes.empty()) {
+                long sum = 0;
+                for (long s : slice_sizes) sum += s;
+                if (sum != global_rows) {
+                    slice_sizes.clear();  // Invalidate — try file-based fallback
+                }
+            }
+
             if (slice_sizes.empty()) {
-                if (param.Sizes[0] % static_cast<long>(spec->sources.size()) == 0) {
-                    const long chunk = param.Sizes[0] / static_cast<long>(spec->sources.size());
+                // Infer slice sizes from the actual source file tensor shapes
+                std::vector<long> file_sizes;
+                file_sizes.reserve(spec->sources.size());
+                for (const auto& src : spec->sources) {
+                    const std::string hf_name = internal::format_hf_name(src, layer_idx);
+                    try {
+                        const auto& entry = reader.find_entry(hf_name);
+                        if (!entry.shape().empty()) {
+                            file_sizes.push_back(entry.shape()[0]);
+                        }
+                    } catch (...) { break; }
+                }
+                if (file_sizes.size() == spec->sources.size()) {
+                    slice_sizes = std::move(file_sizes);
+                } else if (global_rows % static_cast<long>(spec->sources.size()) == 0) {
+                    const long chunk = global_rows / static_cast<long>(spec->sources.size());
                     slice_sizes.assign(spec->sources.size(), chunk);
                 } else {
                     throw std::runtime_error("DSL model: cannot infer fuse slices for " + name);
@@ -307,8 +335,6 @@ void DslModel::import_weights(const std::string& file_name, bool allow_cast, NCC
                 throw std::runtime_error("DSL model: fuse slice count mismatch for " + name);
             }
 
-            const Tensor& global = mParams->template_tensor(name);
-            const long global_rows = global.Sizes[0];
             auto [shard_start, shard_end] = shard_range(global_rows, param_sharded);
 
             long offset = 0;

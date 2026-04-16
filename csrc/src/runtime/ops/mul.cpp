@@ -32,8 +32,11 @@ void CompiledExecutor::dispatch_mul(const CompiledOp& op) {
         } else {
             big = &b; small = &a;
         }
-        // Validate: small must broadcast to big (e.g., (N,1) -> (N,M))
-        if (big->Rank == 2 && small->Rank == 2 &&
+        // Validate: small must broadcast to big
+        if (small->nelem() == 1) {
+            // Scalar broadcast: out = big * scalar
+            broadcast = true;
+        } else if (big->Rank == 2 && small->Rank == 2 &&
             big->Sizes[0] == small->Sizes[0] && small->Sizes[1] == 1) {
             broadcast = true;
         } else {
@@ -68,9 +71,33 @@ void CompiledExecutor::dispatch_mul(const CompiledOp& op) {
         } else {
             throw std::runtime_error("dispatch_mul: unsupported dtype");
         }
+    } else if (small->nelem() == 1) {
+        // Scalar broadcast: out = big * scalar_value
+        // Read the scalar from device memory
+        float scale_val = 0.0f;
+        if (small->DType == ETensorDType::BF16) {
+            nv_bfloat16 h_val;
+            CUDA_CHECK(cudaMemcpyAsync(&h_val, small->Data, sizeof(nv_bfloat16),
+                                        cudaMemcpyDeviceToHost, mRunState.MainStream));
+            CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
+            scale_val = static_cast<float>(h_val);
+        } else if (small->DType == ETensorDType::FP32) {
+            CUDA_CHECK(cudaMemcpyAsync(&scale_val, small->Data, sizeof(float),
+                                        cudaMemcpyDeviceToHost, mRunState.MainStream));
+            CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
+        }
+        const long n = static_cast<long>(big->nelem());
+        if (big->DType == ETensorDType::BF16) {
+            moe_scale_forward(out.get<nv_bfloat16>(), big->get<nv_bfloat16>(), scale_val,
+                              static_cast<int>(n), mRunState.MainStream);
+        } else if (big->DType == ETensorDType::FP32) {
+            moe_scale_forward(out.get<float>(), big->get<float>(), scale_val,
+                              static_cast<int>(n), mRunState.MainStream);
+        } else {
+            throw std::runtime_error("dispatch_mul scalar: unsupported dtype");
+        }
     } else {
-        // Broadcast: (N, M) * (N, 1) → (N, M)
-        // Scale each row of big by the corresponding scalar from small.
+        // Row broadcast: (N, M) * (N, 1) → (N, M)
         const long N = bigger.Sizes[0];
         const long M = bigger.Sizes[1];
         if (bigger.DType == ETensorDType::BF16) {
@@ -108,14 +135,18 @@ void CompiledExecutor::dispatch_mul_backward(const CompiledOp& op) {
         throw std::runtime_error("dispatch_mul_backward: dtype mismatch between d_out/a/b");
     }
 
-    // Detect broadcast: one of a,b has trailing dim 1 (the "scale" tensor)
+    // Detect broadcast: one of a,b has nelem=1 (scalar) or trailing dim 1
     bool broadcast = false;
-    Tensor* big = &a;   // the (N,M) tensor
-    Tensor* small = &b; // the (N,1) tensor
-    int big_input_idx = 0;   // index in {a=0, b=1} for the big tensor
+    bool scalar_broadcast = false;
+    Tensor* big = &a;
+    Tensor* small = &b;
+    int big_input_idx = 0;
     if (a.nelem() != b.nelem()) {
         if (a.nelem() < b.nelem()) { big = &b; small = &a; big_input_idx = 1; }
-        if (big->Rank == 2 && small->Rank == 2 &&
+        if (small->nelem() == 1) {
+            broadcast = true;
+            scalar_broadcast = true;
+        } else if (big->Rank == 2 && small->Rank == 2 &&
             big->Sizes[0] == small->Sizes[0] && small->Sizes[1] == 1) {
             broadcast = true;
         } else {
@@ -155,8 +186,44 @@ void CompiledExecutor::dispatch_mul_backward(const CompiledOp& op) {
         }
         if (op.outputs.size() > 0 && !op.outputs[0].name.empty()) store_tensor(op.outputs[0], d_a);
         if (op.outputs.size() > 1 && !op.outputs[1].name.empty()) store_tensor(op.outputs[1], d_b);
+    } else if (scalar_broadcast) {
+        // Scalar broadcast backward: forward was big * scalar -> out
+        // d_big = d_out * scalar_value, d_scalar = sum(d_out * big)
+        float scale_val = 0.0f;
+        if (small->DType == ETensorDType::BF16) {
+            nv_bfloat16 h_val;
+            CUDA_CHECK(cudaMemcpyAsync(&h_val, small->Data, sizeof(nv_bfloat16),
+                                        cudaMemcpyDeviceToHost, mRunState.MainStream));
+            CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
+            scale_val = static_cast<float>(h_val);
+        } else if (small->DType == ETensorDType::FP32) {
+            CUDA_CHECK(cudaMemcpyAsync(&scale_val, small->Data, sizeof(float),
+                                        cudaMemcpyDeviceToHost, mRunState.MainStream));
+            CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
+        }
+        int d_big_idx = big_input_idx;
+        int d_small_idx = 1 - big_input_idx;
+        // d_big = d_out * scalar
+        Tensor d_big = allocate_like(static_cast<std::size_t>(d_big_idx), *big);
+        const long n = static_cast<long>(big->nelem());
+        if (d_out.DType == ETensorDType::BF16) {
+            moe_scale_forward(d_big.get<nv_bfloat16>(), d_out.get<nv_bfloat16>(), scale_val,
+                              static_cast<int>(n), mRunState.MainStream);
+        } else if (d_out.DType == ETensorDType::FP32) {
+            moe_scale_forward(d_big.get<float>(), d_out.get<float>(), scale_val,
+                              static_cast<int>(n), mRunState.MainStream);
+        }
+        if (op.outputs.size() > static_cast<std::size_t>(d_big_idx) && !op.outputs[d_big_idx].name.empty())
+            store_tensor(op.outputs[d_big_idx], d_big);
+        // d_scalar: skip for frozen layer_scalar (gradient output is usually empty)
+        if (op.outputs.size() > static_cast<std::size_t>(d_small_idx) && !op.outputs[d_small_idx].name.empty()) {
+            Tensor d_small = allocate_like(static_cast<std::size_t>(d_small_idx), *small);
+            // d_scalar = sum(d_out * big) — for frozen scalars this is unused
+            cudaMemsetAsync(d_small.Data, 0, d_small.bytes(), mRunState.MainStream);
+            store_tensor(op.outputs[d_small_idx], d_small);
+        }
     } else {
-        // Broadcast backward: forward was big(N,M) * small(N,1) -> out(N,M)
+        // Row broadcast backward: forward was big(N,M) * small(N,1) -> out(N,M)
         // d_big  = d_out * small  (row-scale: same as forward broadcast)
         // d_small = sum(d_out * big, dim=-1)  (reduce to (N,1))
         const long N = big->Sizes[0];

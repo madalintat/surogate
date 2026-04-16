@@ -13,6 +13,8 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+
+#include "runtime/dsl/dsl_runtime_config.h"
 #include <optional>
 #include <limits>
 
@@ -48,6 +50,7 @@ enum class CompiledOpType : std::uint8_t {
     Zeros,
     Ones,
     FusedResidualRMSNorm,
+    RMSNorm,
     LayerNorm,
     View,
     Transpose,
@@ -64,6 +67,7 @@ enum class CompiledOpType : std::uint8_t {
     Gelu,
     Relu2,
     Mul,
+    Scale,
     MaskScatter,
     DeepstackInject,
     MatmulSwiGLU,
@@ -98,6 +102,8 @@ enum class CompiledOpType : std::uint8_t {
     GeluBackward,
     Relu2Backward,
     MulBackward,
+    ScaleBackward,
+    NarrowBackward,
     MaskScatterBackward,
     DeepstackInjectBackward,
     MatmulSwiGLUBackward,
@@ -108,6 +114,7 @@ enum class CompiledOpType : std::uint8_t {
     FlashAttentionBackward,
     ZerosBackward,
     FusedResidualRMSNormBackward,
+    RMSNormBackward,
     LayerNormBackward,
     EmbeddingBackward,
     CrossEntropyLossBackward,
@@ -248,6 +255,9 @@ struct CompiledAttrs {
     // Tensor transpose attributes
     int dim0 = 0;
     int dim1 = 1;
+
+    // Constant scale factor (scale op)
+    float scale_factor = 1.0f;
 
     // Logit softcapping (fused_lm_head_loss)
     float softcap = 0.0f;  // 0 = disabled
@@ -436,6 +446,11 @@ private:
     std::unordered_map<std::string, TensorShape> mTensorShapes;
     std::unordered_map<std::string, ETensorDType> mTensorDtypes;
     bool mDebugShapes = false;  // Set via SUROGATE_DEBUG_SHAPES env var
+    bool mHasHybridBlocks = false; // True if model uses HybridStackedBlocks
+
+    // Per-layer dimensions for hybrid models (populated from IR param shapes)
+    std::vector<BlockTypeDims> mPerLayerDims;
+    ShapeEnv make_layer_env(int layer_idx) const;
 
     // Tensor ID assignment state (per-compile, reset at start of compile())
     std::unordered_map<std::string, int> mTensorIdMap;  // name -> tensor_id

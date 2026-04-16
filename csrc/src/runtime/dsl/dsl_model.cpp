@@ -313,6 +313,123 @@ DslRuntimeConfig build_runtime_config(const Module& module, const PretrainedConf
         runtime.moe_intermediate_size = static_cast<int>(view.d_ff.value());
     }
 
+    // Populate per-layer dims from IR param shapes for hybrid models
+    if (module.forward.has_value()) {
+        const auto& graph = module.forward.value();
+        bool has_varying_dims = false;
+        long first_qkv = 0;
+
+        // Probe: check if any block has a different QKV size from block 0
+        for (const auto& [name, info] : graph.params) {
+            int layer_idx = -1;
+            std::string field;
+            if (!parse_block_param(name, layer_idx, field)) continue;
+            if (field != "qkv_weight" || info.shape.size() < 2) continue;
+            long qkv = (info.shape[0].kind == DimKind::Concrete) ? info.shape[0].value : 0;
+            if (qkv == 0) continue;
+            if (first_qkv == 0) { first_qkv = qkv; continue; }
+            if (qkv != first_qkv) { has_varying_dims = true; break; }
+        }
+
+        // Also check mlp weights for variation
+        if (!has_varying_dims) {
+            long first_mlp = 0;
+            for (const auto& [name, info] : graph.params) {
+                int layer_idx = -1;
+                std::string field;
+                if (!parse_block_param(name, layer_idx, field)) continue;
+                if (field != "mlp_down_weight" || info.shape.size() < 2) continue;
+                long m = (info.shape[1].kind == DimKind::Concrete) ? info.shape[1].value : 0;
+                if (m == 0) continue;
+                if (first_mlp == 0) { first_mlp = m; continue; }
+                if (m != first_mlp) { has_varying_dims = true; break; }
+            }
+        }
+
+        if (has_varying_dims) {
+            const auto cfg_view = parse_dsl_config(module);
+            const int num_layers = static_cast<int>(cfg_view.n_layers.value_or(0));
+            const long hq = cfg_view.num_query_heads.value_or(0);
+
+            runtime.per_layer_dims.resize(num_layers);
+            // Set defaults from global config
+            const long default_hs = cfg_view.head_size.value_or(0);
+            const long default_hkv = cfg_view.num_kv_heads.value_or(0);
+            const long default_dff = cfg_view.d_ff.value_or(0);
+            for (int i = 0; i < num_layers; ++i) {
+                auto& d = runtime.per_layer_dims[i];
+                d.head_size = default_hs;
+                d.qkv_channels = default_hs * (hq + 2 * default_hkv);
+                d.attn_dim = hq * default_hs;
+                d.intermediate = default_dff;
+                d.mlp_up = 2 * default_dff;  // gated activation default
+            }
+            // Override from actual IR param shapes
+            for (const auto& [name, info] : graph.params) {
+                int layer_idx = -1;
+                std::string field;
+                if (!parse_block_param(name, layer_idx, field)) continue;
+                if (layer_idx < 0 || layer_idx >= num_layers) continue;
+                auto& d = runtime.per_layer_dims[layer_idx];
+                if (info.shape.size() < 2) continue;
+                long s0 = (info.shape[0].kind == DimKind::Concrete) ? info.shape[0].value : 0;
+                long s1 = (info.shape[1].kind == DimKind::Concrete) ? info.shape[1].value : 0;
+                if (s0 == 0 || s1 == 0) continue;
+
+                if (field == "qkv_weight") {
+                    d.qkv_channels = s0;
+                    long total_heads = hq + 2 * default_hkv;
+                    if (total_heads > 0) d.head_size = s0 / total_heads;
+                    d.attn_dim = hq * d.head_size;
+                } else if (field == "self_attn_q_weight") {
+                    // Shared-KV block: Q-only projection
+                    d.qkv_channels = s0;  // Q dim
+                    if (hq > 0) d.head_size = s0 / hq;
+                    d.attn_dim = s0;
+                } else if (field == "out_weight") {
+                    d.attn_dim = s1;
+                    if (hq > 0) d.head_size = s1 / hq;
+                } else if (field == "mlp_down_weight") {
+                    d.intermediate = s1;
+                    d.mlp_up = s1;  // for GatedMLP: down_weight is (C, M)
+                } else if (field == "mlp_gate_weight") {
+                    d.intermediate = s0;
+                    d.mlp_up = s0;  // gate and up each have M rows
+                } else if (field == "mlp_up_weight") {
+                    // SwiGLU: up_weight is (MUp, C) where MUp = 2*M
+                    // GatedMLP: up_weight is (M, C)
+                    // Use mlp_down_weight to disambiguate (set above)
+                }
+            }
+        }
+    }
+
+    // Detect KV source layers: scan forward graph ops for cross-layer
+    // qkv_rope references (shared-KV attention reading from a source layer).
+    if (module.forward.has_value()) {
+        const auto& graph = module.forward.value();
+        for (const auto& op : graph.operations) {
+            for (const auto& inp : op.inputs) {
+                int inp_layer = -1;
+                std::string inp_field;
+                if (!internal::parse_block_param(inp, inp_layer, inp_field)) continue;
+                // Match qkv_rope or qkv_rope_N (SSA suffix)
+                if (inp_field.rfind("qkv_rope", 0) != 0 && inp_field != "qkv") continue;
+
+                // Check if this op belongs to a different layer
+                for (const auto& out : op.outputs) {
+                    int out_layer = -1;
+                    std::string out_field;
+                    if (internal::parse_block_param(out, out_layer, out_field) &&
+                        out_layer != inp_layer) {
+                        runtime.kv_source_layers.insert(inp_layer);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
     return runtime;
 }
 
@@ -394,6 +511,11 @@ std::optional<std::vector<modules::LayerOverride>> parse_layer_types_to_override
             continue;
         }
         if (lower == "full_attention") {
+            overrides.push_back(modules::LayerOverride::dense(i));
+            continue;
+        }
+        // Gemma4: sliding_attention is a dense block with sliding window
+        if (lower == "sliding_attention") {
             overrides.push_back(modules::LayerOverride::dense(i));
             continue;
         }

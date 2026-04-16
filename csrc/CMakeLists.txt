@@ -323,6 +323,8 @@ target_sources(surogate-common PRIVATE
     src/runtime/ops/silu.cpp
     src/runtime/ops/relu2.cpp
     src/runtime/ops/mul.cpp
+    src/runtime/ops/scale.cpp
+    src/runtime/ops/rmsnorm.cpp
     src/runtime/ops/moe_softmax.cpp
     src/runtime/ops/moe_sigmoid.cpp
     src/runtime/ops/moe_topk.cpp
