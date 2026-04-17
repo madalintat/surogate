@@ -1114,7 +1114,11 @@ void DslRunState::allocate_scratch_buffers(const PretrainedConfig& cfg) {
             max_D = std::max(max_D, pld.head_size);
         }
     }
-    const bool cudnn_ok = (max_D > 0 && Hq > 0 && Hkv > 0 && (max_D % 8 == 0) && max_D <= 256);
+    // Must match the dispatch gate in flash_attention.cpp: cuDNN SDPA
+    // backward rejects head_dim > 128, so avoid eagerly building the
+    // backward graph for sizing. For head_dim > 128 the dispatch falls
+    // through to flash-varlen / matmul and never touches cuDNN.
+    const bool cudnn_ok = (max_D > 0 && Hq > 0 && Hkv > 0 && (max_D % 8 == 0) && max_D <= 128);
     if (cudnn_ok) {
         const long cudnn_ws_size = static_cast<long>(cudnn_get_workspace_size(static_cast<int>(attn_ws_batch_size),
                                                                               static_cast<int>(T),
