@@ -15,6 +15,7 @@
 #include <cstring>
 #include <stdexcept>
 
+#include "runtime/attention/attention_kernels.h"
 #include "utilities/utils.h"
 
 namespace {

@@ -7,6 +7,8 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
+#include "runtime/attention/attention_kernels.h"
+
 namespace {
 
 // Scatter dQ (contiguous) into the Q portion of interleaved dQKV.

@@ -8,8 +8,8 @@
 
 #include <memory>
 
-#include "kernels/kernels.h"
 #include "runtime/attention/attention_backend.h"
+#include "runtime/attention/attention_kernels.h"
 #include "utilities/tensor.h"
 
 namespace dsl {

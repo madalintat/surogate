@@ -9,8 +9,8 @@
 #include <stdexcept>
 #include <vector>
 
-#include "kernels/kernels.h"
 #include "runtime/attention/attention_backend.h"
+#include "runtime/attention/attention_kernels.h"
 #include "runtime/dsl/dsl_run_state.h"
 #include "utilities/tensor.h"
 #include "utilities/utils.h"

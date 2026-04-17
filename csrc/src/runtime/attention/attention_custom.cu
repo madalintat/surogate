@@ -17,10 +17,11 @@
 #include <cstdio>
 #include <cooperative_groups.h>
 #include <cublas_v2.h>
-#include "kernels/kernels.h"
+#include "kernels/kernel_utils.cuh"
+#include "runtime/attention/attention_kernels.h"
 #include "utilities/tensor.h"
+#include "utilities/utils.h"
 #include "utilities/vec.cuh"
-#include "kernel_utils.cuh"
 
 namespace cg = cooperative_groups;
 

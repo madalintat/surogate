@@ -6,6 +6,7 @@
 
 #include <cudnn_frontend.h>
 
+#include "runtime/attention/attention_kernels.h"
 #include "utilities/utils.h"
 
 namespace fe = cudnn_frontend;

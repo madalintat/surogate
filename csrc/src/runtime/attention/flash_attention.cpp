@@ -22,6 +22,7 @@
 
 #include "kernels/kernels.h"
 #include "runtime/attention/attention_backend.h"
+#include "runtime/attention/attention_kernels.h"
 #include "runtime/dsl/autodiff.h"
 #include "runtime/dsl/op_shape_signatures.h"
 #include "runtime/executor/compiled_ops_helpers.h"

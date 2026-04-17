@@ -321,12 +321,16 @@ target_sources(surogate-common PRIVATE
     src/runtime/ops/gelu.cpp
     src/runtime/ops/layernorm.cpp
     src/runtime/ops/rope.cpp
-    src/runtime/ops/flash_attention.cpp
+    src/runtime/attention/flash_attention.cpp
     src/runtime/attention/backend_registry.cpp
     src/runtime/attention/backend_cudnn.cpp
     src/runtime/attention/backend_flash_varlen.cpp
     src/runtime/attention/backend_custom.cpp
     src/runtime/attention/backend_sdpa.cpp
+    src/runtime/attention/attention_cudnn.cpp
+    src/runtime/attention/flash_attn_varlen.cpp
+    src/runtime/attention/flash_attn_scatter.cu
+    src/runtime/attention/attention_custom.cu
     src/runtime/ops/cross_entropy_loss.cpp
     src/runtime/ops/fused_lm_head_loss.cpp
     src/runtime/ops/silu.cpp
@@ -415,9 +419,6 @@ target_sources(surogate-common PRIVATE
     src/kernels/mask_scatter.cu
     src/kernels/rmsnorm.cu
     src/kernels/qk_norm.cu
-    src/kernels/cudnn_att.cpp
-    src/kernels/flash_attn_varlen.cpp
-    src/kernels/flash_attn_scatter.cu
     src/kernels/moe_cudnn.cpp
     src/kernels/block_quant.cu
     src/kernels/mxfp4_dequant.cu
@@ -430,7 +431,6 @@ target_sources(surogate-common PRIVATE
     src/runtime/optimizers/cpu_adamw.cpp
     src/runtime/optimizers/polar_express.cu
     src/runtime/optimizers/normuon.cu
-    src/kernels/attention.cu
     src/kernels/fused_classifier.cu
     src/kernels/transpose.cu
     src/kernels/vector_add.cu
