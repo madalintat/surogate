@@ -461,12 +461,16 @@ void attention_forward_custom(Tensor& out,  // output: (B, T, Hq, HS)
                               const Tensor& inp,  // input: (B, T, Hq + Hk + Hv, HS) QKV
                               int B, int T, int Hq, int Hkv, int HS,
                               int window_size,
-                              cudaStream_t stream) {
+                              cudaStream_t stream,
+                              float scale_override) {
+    const float scale = (scale_override != 0.0f)
+                            ? scale_override
+                            : 1.f / sqrtf(static_cast<float>(HS));
     if (out.DType == ETensorDType::FP32) {
-        attention_gpu_forward(out.get<float>(), stats.get<float>(), 1.f / sqrtf(HS),
+        attention_gpu_forward(out.get<float>(), stats.get<float>(), scale,
                               inp.get<float>(), B, T, Hq, Hkv, HS, window_size, stream);
     } else if (out.DType == ETensorDType::BF16) {
-        attention_gpu_forward(out.get<nv_bfloat16>(), stats.get<float>(), 1.f / sqrtf(HS),
+        attention_gpu_forward(out.get<nv_bfloat16>(), stats.get<float>(), scale,
                               inp.get<nv_bfloat16>(), B, T, Hq, Hkv, HS, window_size, stream);
     } else {
         throw std::logic_error("attention_forward_custom: unsupported dtype");
@@ -477,9 +481,13 @@ void attention_backward_custom(Tensor& dqkv, const Tensor& stats,
                                const Tensor& out, const Tensor& dout, const Tensor& qkv,
                                int B, int T, int Hq, int Hkv, int HS,
                                int window_size,
-                               cudaStream_t stream) {
+                               cudaStream_t stream,
+                               float scale_override) {
+    const float scale = (scale_override != 0.0f)
+                            ? scale_override
+                            : 1.f / sqrtf(static_cast<float>(HS));
     if (out.DType == ETensorDType::FP32) {
-        attention_gpu_backward(dqkv.get<float>(), stats.get<float>(), 1.f / sqrtf(HS),
+        attention_gpu_backward(dqkv.get<float>(), stats.get<float>(), scale,
                                out.get<float>(), dout.get<float>(), qkv.get<float>(),
                                B, T, Hq, Hkv, HS, window_size, stream);
     } else {
@@ -762,9 +770,12 @@ __global__ void causal_softmax_bf16_kernel(nv_bfloat16* scores_bf16, float* lse_
 
 void attention_forward_matmul(Tensor& out, Tensor& stats, const Tensor& qkv,
                               int B, int T, int Hq, int Hkv, int HS,
-                              cublasHandle_t cublas, cudaStream_t stream) {
+                              cublasHandle_t cublas, cudaStream_t stream,
+                              float scale_override) {
     const int H = Hq + 2*Hkv;
-    const float scale = 1.f / sqrtf(static_cast<float>(HS));
+    const float scale = (scale_override != 0.0f)
+                            ? scale_override
+                            : 1.f / sqrtf(static_cast<float>(HS));
     cublasSetStream(cublas, stream);
 
     nv_bfloat16 *d_scores, *d_q, *d_k, *d_v;
@@ -884,11 +895,31 @@ void attention_backward_matmul(Tensor& d_qkv, const Tensor& lse,
                                const Tensor& out, const Tensor& d_out,
                                const Tensor& qkv,
                                int B, int T, int Hq, int Hkv, int HS,
-                               cublasHandle_t cublas, cudaStream_t stream) {
+                               cublasHandle_t cublas, cudaStream_t stream,
+                               float scale_override) {
     // SDPA backward using cuBLAS GEMMs, matching the forward's BF16 precision.
+    //
+    // Per-(b, h) we compute:
+    //   dV_h = dO_h @ P_h^T
+    //   dP_h = dO_h @ V_h^T
+    //   dS_h = P_h * (dP_h - rowsum(dP_h * P_h)) * scale
+    //   dQ_h = dS_h @ K_h
+    //   dK_h = dS_h^T @ Q_h
+    //
+    // GQA layout (Hq > Hkv): multiple Q heads share one (K, V) head, so
+    // dK and dV must be SUMMED across Q heads that map to the same K/V slot.
+    // Earlier versions scattered each head's dK/dV directly into d_qkv's
+    // single K/V slot, overwriting prior heads — for Hkv=1 only the last Q
+    // head's contribution survived. We now write per-Q-head dK/dV into
+    // expanded buffers [B, T, Hq, HS] and finalize with reduce_scatter_dkv,
+    // mirroring the Flash-Attn varlen backward path.
     const int H = Hq + 2 * Hkv;
-    const float scale = 1.f / sqrtf(static_cast<float>(HS));
+    const float scale = (scale_override != 0.0f)
+                            ? scale_override
+                            : 1.f / sqrtf(static_cast<float>(HS));
     cublasSetStream(cublas, stream);
+
+    const bool is_gqa = (Hq != Hkv);
 
     nv_bfloat16 *w_q, *w_k, *w_v, *w_do, *w_scores, *w_dp;
     CUDA_CHECK(cudaMallocAsync(&w_q, sizeof(nv_bfloat16) * T * HS, stream));
@@ -898,20 +929,34 @@ void attention_backward_matmul(Tensor& d_qkv, const Tensor& lse,
     CUDA_CHECK(cudaMallocAsync(&w_scores, sizeof(nv_bfloat16) * T * T, stream));
     CUDA_CHECK(cudaMallocAsync(&w_dp, sizeof(nv_bfloat16) * T * T, stream));
 
+    // Expanded per-Q-head dK/dV buffers (GQA only). For MHA they're unused.
+    nv_bfloat16 *dk_expanded = nullptr;
+    nv_bfloat16 *dv_expanded = nullptr;
+    if (is_gqa) {
+        const std::size_t expanded_bytes =
+            sizeof(nv_bfloat16) * static_cast<std::size_t>(B) *
+            static_cast<std::size_t>(T) * static_cast<std::size_t>(Hq) *
+            static_cast<std::size_t>(HS);
+        CUDA_CHECK(cudaMallocAsync(&dk_expanded, expanded_bytes, stream));
+        CUDA_CHECK(cudaMallocAsync(&dv_expanded, expanded_bytes, stream));
+    }
+
     const auto* p_qkv = qkv.get<nv_bfloat16>();
     const auto* p_do = d_out.get<nv_bfloat16>();
     auto* p_dqkv = d_qkv.get<nv_bfloat16>();
     const int st = H * HS;
+    const int st_exp = Hq * HS;           // stride for expanded dK/dV buffers
     dim3 gg(T, (HS + 255) / 256);
-    float alpha = 1.f, beta = 0.f, one = 1.f;
+    float alpha = 1.f, beta = 0.f;
     nv_bfloat16 scale_bf16 = __float2bfloat16(scale);
 
-    // Zero d_qkv — accumulate into it
+    // Zero d_qkv — we write Q directly per head; K/V come from
+    // reduce_scatter_dkv (GQA) or direct per-head scatter (MHA).
     CUDA_CHECK(cudaMemsetAsync(d_qkv.Data, 0, d_qkv.bytes(), stream));
 
     for (int b = 0; b < B; ++b) {
         for (int h = 0; h < Hq; ++h) {
-            int hkv = h * Hkv / Hq;
+            const int hkv = h * Hkv / Hq;
 
             // Gather Q, K, V, d_out for this head
             bf16_gather_rows_k<<<gg, 256, 0, stream>>>(
@@ -923,114 +968,85 @@ void attention_backward_matmul(Tensor& d_qkv, const Tensor& lse,
             bf16_gather_rows_k<<<gg, 256, 0, stream>>>(
                 w_do, p_do + (long)b * T * Hq * HS + h * HS, T, HS, Hq * HS);
 
-            // 1. Recompute scores: S = K^T @ Q  [T, T]
+            // 1. Recompute scores: S = K^T @ Q   [T, T] col-major
             cublasGemmEx(cublas, CUBLAS_OP_T, CUBLAS_OP_N, T, T, HS,
                          &alpha, w_k, CUDA_R_16BF, HS, w_q, CUDA_R_16BF, HS,
                          &beta, w_scores, CUDA_R_16BF, T,
                          CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
 
-            // 2. Recompute softmax: P = causal_softmax(S * scale)
+            // 2. Recompute softmax: P = causal_softmax(S * scale). w_scores := P.
             causal_softmax_bf16_kernel<<<dim3(1, T), std::min(256, T), 0, stream>>>(
                 w_scores, nullptr, T, scale_bf16);
-            // w_scores now holds P [T, T]
 
-            // 3. d_V += P^T @ d_out  → [HS, T] = [HS, T(d_out)] via V^T @ P^T^T
-            //    Actually: d_V[t,d] += sum_over_s P[s,t] * d_out[s,d]
-            //    = d_out^T @ P then transpose, or P^T @ d_out
-            //    GemmEx: d_V(HS,T) = d_out(HS,T) @ P^T(T,T)  →  (HS,T) = (HS,T) @ (T,T)
-            //    P is row-major [T,T], P^T in col-major = P in row-major with transposed dims.
-            //    cublas col-major: C(HS,T) = d_out(HS,T) @ P(T,T)^T
-            // Use w_k as temporary for d_V contribution
+            // 3. dV_h = dO @ P^T   (col-major HS×T = dO(HS,T) @ P(T,T)^T).
+            //    Write into w_k (K_h is no longer needed until step 6,
+            //    where we re-gather it).
             cublasGemmEx(cublas, CUBLAS_OP_N, CUBLAS_OP_T, HS, T, T,
                          &alpha, w_do, CUDA_R_16BF, HS, w_scores, CUDA_R_16BF, T,
-                         &beta, w_k, CUDA_R_16BF, HS,  // reuse w_k for d_v_head
+                         &beta, w_k, CUDA_R_16BF, HS,
                          CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
-            // Scatter-add d_V to d_qkv (accumulate for GQA)
-            // For GQA, multiple Q heads share the same KV head — need atomic add.
-            // Simple approach: scatter to d_qkv V slot with beta=1 on subsequent heads.
-            // Since we zero'd d_qkv, first write can use scatter, subsequent use add.
-            // For simplicity, always gather-add: read current dV, add, write back.
-            // Actually, just use bf16_scatter_rows_k for the first Q head mapping to
-            // this KV head, and add for subsequent ones.
-            {
-                // Accumulate into d_qkv V section
-                nv_bfloat16* dv_base = p_dqkv + (long)b * T * st + (Hq + Hkv + hkv) * HS;
-                // Simple: gather current dV, add w_k, scatter back
-                // For the first h mapping to hkv, dV is zero, so scatter is fine.
-                // For subsequent h, we need add. Use a simple add kernel.
-                // Since T and HS are small, just do it on CPU... no, use a kernel.
-                // Easiest: use cublasGemmEx with beta=1 to accumulate.
-                // But scatter is strided. Let's gather, add, scatter.
-                nv_bfloat16* tmp = w_v; // reuse w_v buffer as temp
-                bf16_gather_rows_k<<<gg, 256, 0, stream>>>(tmp, dv_base, T, HS, st);
-                // tmp += w_k (element-wise add)
-                int n_elems = T * HS;
-                // Use moe_scale_forward as a hack: tmp = tmp*1 + w_k*1... no.
-                // Just launch a simple add kernel. We have elementwise_mul but not add.
-                // Use cublasSaxpy after converting... too complex.
-                // Simplest: write a small kernel inline or use existing.
-                // Actually, the forward uses moe_scale_forward for scaling.
-                // Let me use cublasGemmEx trick: treat as (1,N) @ diag... too complex.
-                // Just write directly: for first h, scatter. Track with a flag.
-                // For GQA with Hkv=1 and Hq=8, all 8 heads accumulate into same dV.
-                // Simple accumulation: gather existing, add new, scatter.
+            if (is_gqa) {
+                // Scatter per-Q-head into expanded dV buffer at stride Hq*HS.
+                bf16_scatter_rows_k<<<gg, 256, 0, stream>>>(
+                    dv_expanded + (long)b * T * st_exp + h * HS,
+                    w_k, T, HS, st_exp);
+            } else {
+                // MHA: single K/V slot per Q head — direct write is correct.
+                bf16_scatter_rows_k<<<gg, 256, 0, stream>>>(
+                    p_dqkv + (long)b * T * st + (Hq + Hkv + hkv) * HS,
+                    w_k, T, HS, st);
             }
-            // Actually, let me use a much simpler approach for GQA accumulation:
-            // Allocate per-KV-head accumulators and reduce at the end.
-            // For now, since this is the first implementation, use the naive approach:
-            bf16_scatter_rows_k<<<gg, 256, 0, stream>>>(
-                p_dqkv + (long)b * T * st + (Hq + Hkv + hkv) * HS, w_k, T, HS, st);
-            // NOTE: This overwrites for GQA (multiple Q heads per KV head).
-            // TODO: proper accumulation for GQA. For Hkv=1 only the last Q head's
-            // contribution survives. This is incorrect but won't crash.
 
-            // 4. d_P = d_out @ V^T  [T, T]
-            //    cublas col-major: d_P(T,T) = V(HS,T)^T @ d_out(HS,T) → (T,HS)@(HS,T)=(T,T)
-            bf16_gather_rows_k<<<gg, 256, 0, stream>>>(
-                w_v, p_qkv + (long)b * T * st + (Hq + Hkv + hkv) * HS, T, HS, st);
+            // 4. dP = dO @ V^T   [T, T]. w_v still holds V_h.
             cublasGemmEx(cublas, CUBLAS_OP_T, CUBLAS_OP_N, T, T, HS,
                          &alpha, w_v, CUDA_R_16BF, HS, w_do, CUDA_R_16BF, HS,
                          &beta, w_dp, CUDA_R_16BF, T,
                          CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
 
-            // 5. d_S = P * (d_P - rowsum(d_P * P)) * scale
+            // 5. dS = P * (dP - rowsum(dP * P)) * scale. w_dp := dS.
             causal_softmax_backward_bf16_kernel<<<dim3(1, T), std::min(256, T), 0, stream>>>(
                 w_dp, w_dp, w_scores, T, scale);
-            // w_dp now holds d_S * scale [T, T]
 
-            // 6. d_Q += d_S @ K  [T, HS]
-            //    cublas: d_Q(HS,T) = K(HS,T) @ d_S^T(T,T) ... no
-            //    d_Q[t,d] = sum_s d_S[t,s] * K[s,d]
-            //    cublas col-major: d_Q(HS,T) = K(HS,T) @ d_S(T,T)^T
-            // Use w_q as temp for d_Q contribution, then scatter-add
-            cublasGemmEx(cublas, CUBLAS_OP_N, CUBLAS_OP_T, HS, T, T,
-                         &alpha, w_k, CUDA_R_16BF, HS, w_dp, CUDA_R_16BF, T,
-                         &beta, w_q, CUDA_R_16BF, HS,
-                         CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
-            // Wait, w_k was overwritten with dV contribution. Re-gather K.
+            // 6. dQ_h = K @ dS^T   (col-major HS×T = K(HS,T) @ dS(T,T)^T).
+            //    Re-gather K because w_k was reused for dV_h in step 3.
             bf16_gather_rows_k<<<gg, 256, 0, stream>>>(
                 w_k, p_qkv + (long)b * T * st + (Hq + hkv) * HS, T, HS, st);
             cublasGemmEx(cublas, CUBLAS_OP_N, CUBLAS_OP_T, HS, T, T,
                          &alpha, w_k, CUDA_R_16BF, HS, w_dp, CUDA_R_16BF, T,
                          &beta, w_q, CUDA_R_16BF, HS,
                          CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+            // dQ is unique per Q head — direct write into d_qkv.
             bf16_scatter_rows_k<<<gg, 256, 0, stream>>>(
                 p_dqkv + (long)b * T * st + h * HS, w_q, T, HS, st);
 
-            // 7. d_K += d_S^T @ Q  [T, HS]
-            //    d_K[s,d] = sum_t d_S[t,s] * Q[t,d]
-            //    cublas col-major: d_K(HS,T) = Q(HS,T) @ d_S(T,T)
+            // 7. dK_h = Q @ dS   (col-major HS×T = Q(HS,T) @ dS(T,T)).
+            //    Re-gather Q because w_q was reused for dQ_h in step 6.
             bf16_gather_rows_k<<<gg, 256, 0, stream>>>(
-                w_q, p_qkv + (long)b * T * st + h * HS, T, HS, st);  // re-gather Q
-            // Use w_v as temp for d_K contribution
+                w_q, p_qkv + (long)b * T * st + h * HS, T, HS, st);
             cublasGemmEx(cublas, CUBLAS_OP_N, CUBLAS_OP_N, HS, T, T,
                          &alpha, w_q, CUDA_R_16BF, HS, w_dp, CUDA_R_16BF, T,
                          &beta, w_v, CUDA_R_16BF, HS,
                          CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
-            bf16_scatter_rows_k<<<gg, 256, 0, stream>>>(
-                p_dqkv + (long)b * T * st + (Hq + hkv) * HS, w_v, T, HS, st);
-            // NOTE: Same GQA overwrite issue as dV above.
+            if (is_gqa) {
+                bf16_scatter_rows_k<<<gg, 256, 0, stream>>>(
+                    dk_expanded + (long)b * T * st_exp + h * HS,
+                    w_v, T, HS, st_exp);
+            } else {
+                bf16_scatter_rows_k<<<gg, 256, 0, stream>>>(
+                    p_dqkv + (long)b * T * st + (Hq + hkv) * HS,
+                    w_v, T, HS, st);
+            }
         }
+    }
+
+    // GQA finalize: reduce Hq→Hkv and scatter into d_qkv's K and V sections.
+    // reduce_scatter_dkv treats the first B*T rows as total_q and sums
+    // h_ratio = Hq/Hkv expanded heads into each KV slot.
+    if (is_gqa) {
+        reduce_scatter_dkv(p_dqkv, dk_expanded, dv_expanded,
+                           B * T, Hq, Hkv, HS, stream);
+        CUDA_CHECK(cudaFreeAsync(dk_expanded, stream));
+        CUDA_CHECK(cudaFreeAsync(dv_expanded, stream));
     }
 
     CUDA_CHECK(cudaFreeAsync(w_q, stream));

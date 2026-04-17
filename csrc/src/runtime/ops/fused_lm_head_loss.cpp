@@ -298,6 +298,32 @@ void CompiledExecutor::dispatch_fused_lm_head_loss_backward(const CompiledOp& op
                static_cast<int>(V), static_cast<int>(nano_batch_size), static_cast<int>(C),
                swap_transpose(EMMTranspose::NT), false, mRunState.MainStream);
 
+        // Mirror forward's logit softcapping so softmax probabilities and the
+        // cross-entropy gradient match what the forward saw. Without this the
+        // backward computes softmax of *uncapped* raw logits, producing
+        // gradients many orders of magnitude too large for models like Gemma4
+        // that rely on softcap to keep logits finite.
+        if (op.attrs.softcap > 0.0f) {
+            softcap_logits(logits, op.attrs.softcap,
+                           static_cast<int>(nano_batch_size), V, mRunState.MainStream);
+        }
+
+        // Save capped logits for softcap backward (only needed when softcap is
+        // enabled and we will write d_logits back into the same buffer).
+        Tensor capped_copy{};
+        const bool need_softcap_bwd = (op.attrs.softcap > 0.0f);
+        if (need_softcap_bwd) {
+            capped_copy = mRunState.temp_alloc(logits.DType,
+                                               {nano_batch_size, V},
+                                               "fused_lm_head_softcap_capped");
+            mTemps.push_back(capped_copy);
+            CUDA_CHECK(cudaMemcpyAsync(capped_copy.Data, logits.Data,
+                                       static_cast<std::size_t>(nano_batch_size) *
+                                       static_cast<std::size_t>(V) *
+                                       get_dtype_size(logits.DType),
+                                       cudaMemcpyDeviceToDevice, mRunState.MainStream));
+        }
+
         Tensor logsumexp_view{};
         Tensor* logsumexp = nullptr;
         if (mRunState.scratch().cross_entropy_logsumexp.Data) {
@@ -326,6 +352,14 @@ void CompiledExecutor::dispatch_fused_lm_head_loss_backward(const CompiledOp& op
             const float* inv_t = mInvTemperatureGpu + token_offset;
             // Chain through temperature scaling: dlogits *= inv_temperature
             scale_logits_rows(logits, inv_t, static_cast<int>(nano_batch_size), V, P, mRunState.MainStream);
+        }
+
+        // Chain through softcap derivative to convert d_capped → d_raw before
+        // propagating to xF / W.
+        if (need_softcap_bwd) {
+            softcap_logits_backward(logits, capped_copy, op.attrs.softcap,
+                                    static_cast<int>(nano_batch_size), V,
+                                    mRunState.MainStream);
         }
 
         if (d_weight_ptr) {

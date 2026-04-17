@@ -105,20 +105,25 @@ void CompiledExecutor::dispatch_flash_attention(const CompiledOp& op) {
             throw std::logic_error("flash_attention: varlen path currently requires BF16 tensors");
         }
         // Document-level masking: Flash Attention varlen path (max head_dim=256).
+        // Pass window_size so sliding-window layers (e.g. Gemma4 sliding blocks)
+        // get local attention instead of silently falling through to full causal.
         attention_forward_flash_varlen(
             out.get<nv_bfloat16>(), lse.get<float>(), qkv.get<nv_bfloat16>(),
             cu_seqlens_ptr, num_docs, max_doc_seqlen, total_doc_tokens,
-            Hq, Hkv, Hs, mRunState.MainStream);
+            Hq, Hkv, Hs, mRunState.MainStream, op.attrs.softmax_scale,
+            window_size > 0 ? window_size : 0);
     } else if (window_size > 0) {
         // Sliding window attention: custom kernel (supports head_dim <= 128)
         attention_forward_custom(out, lse, qkv,
                                  static_cast<int>(mB), static_cast<int>(mT),
-                                 Hq, Hkv, Hs, window_size, mRunState.MainStream);
+                                 Hq, Hkv, Hs, window_size, mRunState.MainStream,
+                                 op.attrs.softmax_scale);
     } else if (!cudnn_supported) {
         // head_dim > 128: Use cuBLAS matmul-based attention (SDPA math equivalent).
         attention_forward_matmul(out, lse, qkv,
                                  static_cast<int>(mB), static_cast<int>(mT),
-                                 Hq, Hkv, Hs, mRunState.cublas_handle(), mRunState.MainStream);
+                                 Hq, Hkv, Hs, mRunState.cublas_handle(), mRunState.MainStream,
+                                 op.attrs.softmax_scale);
     } else {
         if (!mRunState.scratch().cudnn_workspace.Data) {
             mRunState.temp_acquire(mRunState.scratch().cudnn_workspace);
@@ -228,7 +233,8 @@ void CompiledExecutor::dispatch_flash_attention_backward(const CompiledOp& op) {
     if (use_varlen && Hs > 256) {
         attention_backward_matmul(d_qkv, lse, out, d_out, qkv,
                                   static_cast<int>(mB), static_cast<int>(mT),
-                                  Hq, Hkv, Hs, mRunState.cublas_handle(), mRunState.MainStream);
+                                  Hq, Hkv, Hs, mRunState.cublas_handle(), mRunState.MainStream,
+                                  op.attrs.softmax_scale);
     } else if (use_varlen) {
         if (out.DType != ETensorDType::BF16 ||
             d_out.DType != ETensorDType::BF16 ||
@@ -292,12 +298,15 @@ void CompiledExecutor::dispatch_flash_attention_backward(const CompiledOp& op) {
             cu_seqlens_ptr, dq_accum.get<float>(), dsoftmax.get<float>(),
             dk_exp_ptr, dv_exp_ptr,
             num_docs, max_doc_seqlen, total_doc_tokens,
-            Hq, Hkv, Hs, deterministic_bwd, mRunState.MainStream);
+            Hq, Hkv, Hs, deterministic_bwd, mRunState.MainStream,
+            op.attrs.softmax_scale,
+            window_size > 0 ? window_size : 0);
     } else if (window_size > 0) {
         if (out.DType == ETensorDType::FP32) {
             attention_backward_custom(d_qkv, lse, out, d_out, qkv,
                                       static_cast<int>(mB), static_cast<int>(mT),
-                                      Hq, Hkv, Hs, window_size, mRunState.MainStream);
+                                      Hq, Hkv, Hs, window_size, mRunState.MainStream,
+                                      op.attrs.softmax_scale);
         } else if (out.DType == ETensorDType::BF16) {
             auto shape_vec = [](const Tensor& t) {
                 return std::vector<long>(t.Sizes.begin(), t.Sizes.begin() + t.Rank);
@@ -317,7 +326,8 @@ void CompiledExecutor::dispatch_flash_attention_backward(const CompiledOp& op) {
 
             attention_backward_custom(d_qkv_f32, lse, out_f32, d_out_f32, qkv_f32,
                                       static_cast<int>(mB), static_cast<int>(mT),
-                                      Hq, Hkv, Hs, window_size, mRunState.MainStream);
+                                      Hq, Hkv, Hs, window_size, mRunState.MainStream,
+                                      op.attrs.softmax_scale);
             convert_dtype(d_qkv.get<nv_bfloat16>(), d_qkv_f32.get<float>(),
                           d_qkv.nelem(), mRunState.MainStream);
         } else {

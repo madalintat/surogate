@@ -1083,12 +1083,18 @@ std::vector<Operation> fused_lm_head_loss_backward(const BackwardRuleContext& ct
     outputs.push_back(ctx.needs_grad(0) ? ctx.d_inputs[0] : "");
     outputs.push_back(ctx.needs_grad(1) ? ctx.d_inputs[1] : "");
 
+    // Forward attrs (softcap, compute_accuracy, etc.) must propagate so that
+    // dispatch_fused_lm_head_loss_backward can mirror the forward's softcap /
+    // temperature pipeline. Without the softcap attr, the backward would
+    // recompute softmax of raw (uncapped) logits and produce gradients orders
+    // of magnitude too large for softcap-using models like Gemma4.
     ops.push_back(make_operation(
         "fused_lm_head_loss_backward_" + std::to_string(ctx.op_counter++),
         "fused_lm_head_loss_backward",
         "fused_lm_head_loss_backward",
         inputs,
-        outputs));
+        outputs,
+        fwd.attrs));
 
     return ops;
 }

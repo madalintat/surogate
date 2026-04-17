@@ -931,6 +931,14 @@ def _inline_stacked_blocks(
             # emit narrow+view ops for each layer to extract that layer's slice.
             pli_block_name = node.attrs.get("per_layer_input_name")  # block input name
             pli_tensor_ref = node.inputs[3] if len(node.inputs) > 3 and pli_block_name else None
+            # The 4D PLI tensor is produced BEFORE the block stack and re-sliced
+            # (via narrow+view) at the start of each layer's op range. Under
+            # backward recompute, replay_layer_forward re-runs those narrow+view
+            # ops, which reads the 4D tensor as an external input. Its stack
+            # storage is long dead by the time backward runs, so without an
+            # explicit save the narrow reads garbage → NaN in PLI gating.
+            if pli_tensor_ref:
+                new_save.append(pli_tensor_ref)
 
             # KV sharing: map shared layers' kv_source input to the source
             # layer's qkv_rope activation tensor.
@@ -1022,7 +1030,12 @@ def _inline_stacked_blocks(
                         kernel_type="view",
                         inputs=[narrow_out],
                         outputs=[pli_slice_name],
-                        attrs={},  # shape resolved at runtime from element count
+                        # narrow dim=2 produced [B, T, 1, PLI_D]; collapse the
+                        # singleton to [B, T, PLI_D]. Without this, shape
+                        # inference defaults to [1] and the saved activation is
+                        # misinterpreted during backward recompute (all NaNs
+                        # downstream of the PLI gating).
+                        attrs={"shape": ["B", "T", "PLI_D"]},
                     ))
                     mapping[pli_block_name] = pli_slice_name
                     # Save PLI narrow+view outputs for backward replay (stack-allocated,

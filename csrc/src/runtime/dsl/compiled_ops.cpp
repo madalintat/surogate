@@ -2159,6 +2159,7 @@ void CompiledExecutor::replay_layer_forward(int layer_idx, long B, long T,
             // Already bound?
             if (static_cast<std::size_t>(inp.tensor_id) < mTensors.size() && mTensors[inp.tensor_id].Data) continue;
 
+
             // Try to resolve from known sources
             Tensor resolved{};
 
@@ -4535,8 +4536,47 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
     const bool op_profile = op_profile_env && std::string(op_profile_env) != "0";
     const int debug_nonfinite_mode = env_int("SUROGATE_DEBUG_CHECK_NONFINITE", 0);
     const bool debug_nonfinite_backward = (debug_nonfinite_mode & 0x2) != 0;
+    // Optional extreme-magnitude threshold: flag when any backward-op output
+    // contains a finite value with |x| > this. Useful for finding ops that
+    // produce sane-looking (non-NaN) but astronomical gradients.
+    const float debug_extreme_threshold =
+        env_float("SUROGATE_DEBUG_BACKWARD_EXTREME", 0.0f);
+    const bool debug_extreme_backward = debug_extreme_threshold > 0.0f;
+    auto count_nonfinite_of = [&](const Tensor& t) -> int {
+        Tensor non_finite_count = mRunState.temp_alloc(ETensorDType::INT32, {1}, "non_finite_count");
+        CUDA_CHECK(cudaMemsetAsync(non_finite_count.Data, 0, sizeof(int), mRunState.MainStream));
+        count_non_finite(non_finite_count, t, mRunState.MainStream);
+        int host_count = 0;
+        CUDA_CHECK(cudaMemcpyAsync(&host_count,
+                                   non_finite_count.get<int>(),
+                                   sizeof(int),
+                                   cudaMemcpyDeviceToHost,
+                                   mRunState.MainStream));
+        CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
+        mRunState.temp_free(non_finite_count);
+        return host_count;
+    };
+    auto count_above_of = [&](const Tensor& t, float threshold) -> int {
+        if (t.DType != ETensorDType::BF16 && t.DType != ETensorDType::FP32) return 0;
+        Tensor cnt = mRunState.temp_alloc(ETensorDType::INT32, {1}, "count_above_threshold");
+        CUDA_CHECK(cudaMemsetAsync(cnt.Data, 0, sizeof(int), mRunState.MainStream));
+        const int n = static_cast<int>(t.nelem());
+        if (t.DType == ETensorDType::BF16) {
+            count_above_threshold(cnt.get<int>(), t.get<nv_bfloat16>(), n, threshold,
+                                  mRunState.MainStream);
+        } else {
+            count_above_threshold(cnt.get<int>(), t.get<float>(), n, threshold,
+                                  mRunState.MainStream);
+        }
+        int host = 0;
+        CUDA_CHECK(cudaMemcpyAsync(&host, cnt.get<int>(), sizeof(int),
+                                   cudaMemcpyDeviceToHost, mRunState.MainStream));
+        CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
+        mRunState.temp_free(cnt);
+        return host;
+    };
     auto check_nonfinite_refs = [&](const CompiledOp& op, const std::vector<TensorRef>& refs) {
-        if (!debug_nonfinite_backward) {
+        if (!debug_nonfinite_backward && !debug_extreme_backward) {
             return;
         }
         for (const auto& ref : refs) {
@@ -4551,19 +4591,60 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
                 continue;
             }
 
-            Tensor non_finite_count = mRunState.temp_alloc(ETensorDType::INT32, {1}, "non_finite_count");
-            CUDA_CHECK(cudaMemsetAsync(non_finite_count.Data, 0, sizeof(int), mRunState.MainStream));
-            count_non_finite(non_finite_count, *t, mRunState.MainStream);
-            int host_count = 0;
-            CUDA_CHECK(cudaMemcpyAsync(&host_count,
-                                       non_finite_count.get<int>(),
-                                       sizeof(int),
-                                       cudaMemcpyDeviceToHost,
-                                       mRunState.MainStream));
-            CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
-            mRunState.temp_free(non_finite_count);
+            int host_count = debug_nonfinite_backward ? count_nonfinite_of(*t) : 0;
+            int extreme_count = debug_extreme_backward ? count_above_of(*t, debug_extreme_threshold) : 0;
+
+            if (host_count == 0 && extreme_count > 0) {
+                // Emit a diagnostic but do NOT throw — extreme magnitudes are
+                // often legitimate mid-training. The goal is just to pinpoint
+                // the first op in the backward chain that inflates grads.
+                fprintf(stderr,
+                    "[EXTREME] backward op '%s' (id=%s type=%s): output '%s' has %d values with |x|>%.3g (nelem=%zu)\n",
+                    op.op_id.c_str(), op.op_id.c_str(), op_type_to_string(op.type),
+                    ref.name.c_str(), extreme_count, debug_extreme_threshold, (size_t)t->nelem());
+            }
 
             if (host_count > 0) {
+                // Also report input non-finite counts so we can distinguish
+                // upstream-propagated NaN from NaN introduced by this op.
+                std::ostringstream inputs_oss;
+                for (const auto& in_ref : op.inputs) {
+                    if (in_ref.name.empty()) continue;
+                    const Tensor* ti = nullptr;
+                    if (in_ref.tensor_id >= 0 &&
+                        static_cast<std::size_t>(in_ref.tensor_id) < mTensors.size() &&
+                        mTensors[in_ref.tensor_id].Data) {
+                        ti = &mTensors[in_ref.tensor_id];
+                    }
+                    if (!ti) ti = try_get_tensor(in_ref.name);
+                    if (!ti) ti = try_get_tensor_fuzzy(in_ref.name);
+                    if (!ti) {
+                        // Last resort: try resolve_tensor (may throw for some refs).
+                        try {
+                            Tensor& r = resolve_tensor(in_ref);
+                            ti = &r;
+                        } catch (...) {
+                            ti = nullptr;
+                        }
+                    }
+                    if (!ti) {
+                        inputs_oss << "\n  input '" << in_ref.name << "' <not resolvable>";
+                        continue;
+                    }
+                    if (!ti->Data) {
+                        inputs_oss << "\n  input '" << in_ref.name << "' <no data> dtype="
+                                   << static_cast<int>(ti->DType);
+                        continue;
+                    }
+                    if (ti->DType != ETensorDType::BF16 && ti->DType != ETensorDType::FP32) {
+                        inputs_oss << "\n  input '" << in_ref.name << "' <skipped dtype="
+                                   << static_cast<int>(ti->DType) << ">";
+                        continue;
+                    }
+                    int ic = count_nonfinite_of(*ti);
+                    inputs_oss << "\n  input '" << in_ref.name << "' nonfinite=" << ic
+                               << " dtype=" << static_cast<int>(ti->DType);
+                }
                 std::ostringstream oss;
                 oss << "Non-finite detected in backward output tensor '" << ref.name
                     << "' at op id=" << op.op_id
@@ -4575,7 +4656,7 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
                     if (d > 0) oss << ",";
                     oss << t->Sizes[d];
                 }
-                oss << "]";
+                oss << "]" << inputs_oss.str();
                 throw std::runtime_error(oss.str());
             }
         }

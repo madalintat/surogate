@@ -50,20 +50,20 @@ __global__ void encoder_forward_kernel3(floatX* out,
                                const int* inp, const floatX* wte, const floatX* wpe,
                                int B, int T, int C) {
     using x128 = GenericVector<floatX, 16/sizeof(floatX)>;
-    int idx = (blockIdx.x * blockDim.x + threadIdx.x) * x128::size;
-    int N = B * T * C;
+    long long idx = ((long long)blockIdx.x * blockDim.x + threadIdx.x) * x128::size;
+    long long N = (long long)B * T * C;
     if (idx >= N) { return; }
 
-    int bt = idx / C;
-    int b = bt / T;
-    int t = bt % T;
-    int c = idx % C;
+    long long bt = idx / C;
+    int b = (int)(bt / T);
+    int t = (int)(bt % T);
+    int c = (int)(idx % C);
 
     int ix = inp[b * T + t];
 
-    floatX* out_btc = out + b * T * C + t * C + c;
-    const floatX* wte_ix = wte + ix * C + c;
-    const floatX* wpe_tc = wpe + t * C + c;
+    floatX* out_btc = out + (long long)b * T * C + (long long)t * C + c;
+    const floatX* wte_ix = wte + (long long)ix * C + c;
+    const floatX* wpe_tc = wpe + (long long)t * C + c;
 
     x128 packed_out;
     x128 wte128 = load128cs(wte_ix);
@@ -95,17 +95,21 @@ __global__ void encoder_forward_kernel3_nowpe(floatX* out,
                                const int* inp, const floatX* wte,
                                int B, int T, int C, int V) {
     using x128 = GenericVector<floatX, 16/sizeof(floatX)>;
-    int idx = (blockIdx.x * blockDim.x + threadIdx.x) * x128::size;
-    int N = B * T * C;
+    // Use 64-bit arithmetic for element addressing: vocab_size * C can exceed
+    // INT32_MAX for large embeddings (e.g., Gemma4 PLI has V=262144, C=8960
+    // → V*C ≈ 2.35e9 > 2^31). INT32 overflow would make wte + ix*C + c point
+    // to garbage memory for high token ids, producing NaN output.
+    long long idx = ((long long)blockIdx.x * blockDim.x + threadIdx.x) * x128::size;
+    long long N = (long long)B * T * C;
     if (idx >= N) { return; }
-    int bt = idx / C;
-    int b = bt / T;
-    int t = bt % T;
-    int c = idx % C;
+    long long bt = idx / C;
+    int b = (int)(bt / T);
+    int t = (int)(bt % T);
+    int c = (int)(idx % C);
     int ix = inp[b * T + t];
     assert(0 <= ix && ix < V);
-    x128 wte128 = x128::load(wte + ix * C + c);
-    wte128.store(out + b * T * C + t * C + c);
+    x128 wte128 = x128::load(wte + (long long)ix * C + c);
+    wte128.store(out + (long long)b * T * C + (long long)t * C + c);
 }
 
 // ----------------------------------------------------------------------------
@@ -134,8 +138,10 @@ void encoder_forward_imp(floatX* out,
                          int B, int T, int C, int V, cudaStream_t stream) {
     using x128 = GenericVector<floatX, 16/sizeof(floatX)>;
     constexpr int block_size = 256;
-    const int N = B * T * C;
-    const int grid_size = div_ceil(N, (int)(block_size * x128::size));
+    const long long N = (long long)B * T * C;
+    const long long grid_ll = (N + (long long)block_size * x128::size - 1) /
+                              ((long long)block_size * x128::size);
+    const int grid_size = (int)grid_ll;
     if (wpe == nullptr) {
         // Llama 3 does not use positional encoder
         encoder_forward_kernel3_nowpe<<<grid_size, block_size, 0, stream>>>(out, inp, wte, B, T, C, V);

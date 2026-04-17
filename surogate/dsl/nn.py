@@ -1693,8 +1693,13 @@ class Gemma4Attention(Module):
             out_name=qkv_rope_slot,
         )
 
-        # Flash attention with optional sliding window
-        fa_kwargs: dict[str, Any] = {"causal": True}
+        # Flash attention with optional sliding window.
+        # Gemma4 uses softmax_scale=1.0 (not 1/sqrt(head_dim)) because Q/K-norm
+        # already produces unit-RMS Q and K, giving attention scores O(1)
+        # without an explicit 1/sqrt(head_dim) divisor. Matches HF:
+        # transformers/models/gemma4/modeling_gemma4.py
+        #   self.scaling = 1.0; attn_weights = Q @ K^T * self.scaling
+        fa_kwargs: dict[str, Any] = {"causal": True, "softmax_scale": 1.0}
         if self.sliding_window is not None:
             fa_kwargs["window_size"] = self.sliding_window
 
@@ -1855,8 +1860,9 @@ class Gemma4SharedKVAttention(Module):
                              split_size=[self.num_query_heads,
                                          2 * self.num_kv_heads])
 
+        # Gemma4 uses softmax_scale=1.0 (see Gemma4Attention above for why).
         attn_out, lse = g.flash_attention(
-            qkv_final, causal=True,
+            qkv_final, causal=True, softmax_scale=1.0,
             out_name=att_slot, lse_name=tracer.prefixed("lse"),
         )
 

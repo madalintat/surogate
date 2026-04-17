@@ -464,6 +464,7 @@ target_sources(surogate-common PRIVATE
 # Used for document-level attention masking in GRPO training
 set(FLASH_ATTN_DIR ${flash_attn_SOURCE_DIR}/csrc/flash_attn)
 set(FLASH_ATTN_SOURCES
+    # Is_causal=true instantiations (full causal attention)
     ${FLASH_ATTN_DIR}/src/flash_fwd_hdim64_bf16_causal_sm80.cu
     ${FLASH_ATTN_DIR}/src/flash_fwd_hdim96_bf16_causal_sm80.cu
     ${FLASH_ATTN_DIR}/src/flash_fwd_hdim128_bf16_causal_sm80.cu
@@ -472,6 +473,17 @@ set(FLASH_ATTN_SOURCES
     ${FLASH_ATTN_DIR}/src/flash_bwd_hdim96_bf16_causal_sm80.cu
     ${FLASH_ATTN_DIR}/src/flash_bwd_hdim128_bf16_causal_sm80.cu
     ${FLASH_ATTN_DIR}/src/flash_bwd_hdim256_bf16_causal_sm80.cu
+    # Is_causal=false instantiations (non-causal and local/sliding-window path).
+    # Flash-attn's Is_local kernel path requires Is_causal=false; sliding-window
+    # attention (Gemma4 sliding blocks, Mistral-style SWA) selects this path.
+    ${FLASH_ATTN_DIR}/src/flash_fwd_hdim64_bf16_sm80.cu
+    ${FLASH_ATTN_DIR}/src/flash_fwd_hdim96_bf16_sm80.cu
+    ${FLASH_ATTN_DIR}/src/flash_fwd_hdim128_bf16_sm80.cu
+    ${FLASH_ATTN_DIR}/src/flash_fwd_hdim256_bf16_sm80.cu
+    ${FLASH_ATTN_DIR}/src/flash_bwd_hdim64_bf16_sm80.cu
+    ${FLASH_ATTN_DIR}/src/flash_bwd_hdim96_bf16_sm80.cu
+    ${FLASH_ATTN_DIR}/src/flash_bwd_hdim128_bf16_sm80.cu
+    ${FLASH_ATTN_DIR}/src/flash_bwd_hdim256_bf16_sm80.cu
 )
 add_library(flash_attn STATIC ${FLASH_ATTN_SOURCES})
 set_target_properties(flash_attn PROPERTIES POSITION_INDEPENDENT_CODE ON)

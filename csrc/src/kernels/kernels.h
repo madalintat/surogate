@@ -403,6 +403,13 @@ void count_non_finite(int* out_count, const nv_bfloat16* data, int n, cudaStream
 void count_non_finite(int* out_count, const float* data, int n, cudaStream_t stream);
 void count_non_finite(Tensor& out_count, const Tensor& data, cudaStream_t stream);
 
+/// @brief Count finite entries with |x| > threshold.
+/// Useful for diagnosing backward ops producing extreme gradients.
+void count_above_threshold(int* out_count, const nv_bfloat16* data, int n,
+                           float threshold, cudaStream_t stream);
+void count_above_threshold(int* out_count, const float* data, int n,
+                           float threshold, cudaStream_t stream);
+
 /// @brief Count invalid expert indices (<0 or >= num_experts).
 void count_invalid_indices(int* out_count, const int* indices, int n, int num_experts, cudaStream_t stream);
 void count_invalid_indices(Tensor& out_count, const Tensor& indices, int num_experts, cudaStream_t stream);
@@ -452,28 +459,38 @@ void attention_forward_cudnn(Tensor& out,  // output: (B, T, Nq, HS)
                              int B, int T, int Hq, int Hkv, int HS, cudaStream_t stream);
 
 // Custom (non-cuDNN) attention forward using the in-tree kernel (supports FP32/BF16).
+// `scale` overrides the softmax scale. 0.0f → 1/sqrt(HS) (default SDPA).
+// Non-zero → used verbatim (e.g., Gemma4 passes 1.0 because Q/K-norm already
+// produces unit-RMS Q and K).
 void attention_forward_custom(Tensor& out,  // output: (B, T, Nq, HS)
                               Tensor& stats, // output for backward pass: (B, Hq, T)
                               const Tensor& inp,  // input: (B, T, Hq + 2Hkv, HS) QKV
-                              int B, int T, int Hq, int Hkv, int HS, int window_size, cudaStream_t stream);
+                              int B, int T, int Hq, int Hkv, int HS, int window_size, cudaStream_t stream,
+                              float scale = 0.0f);
 // Custom (non-cuDNN) attention backward using the in-tree kernel (supports FP32/BF16).
 void attention_backward_custom(Tensor& dqkv, const Tensor& stats,
                                const Tensor& out, const Tensor& dout, const Tensor& qkv,
-                               int B, int T, int Hq, int Hkv, int HS, int window_size, cudaStream_t stream);
+                               int B, int T, int Hq, int Hkv, int HS, int window_size, cudaStream_t stream,
+                               float scale = 0.0f);
 
 // cuBLAS matmul-based attention (SDPA math equivalent). No head_dim limit.
 // Computes: scores = Q @ K^T * scale, causal mask, softmax, out = attn @ V.
 // Uses temporary memory for the (B, Hq, T, T) attention matrix.
+// `scale` overrides the softmax scale. 0.0f (default) → 1/sqrt(HS) (standard
+// SDPA). Non-zero → used verbatim (e.g., Gemma4 passes 1.0 because Q/K-norm
+// already produces unit-RMS Q and K).
 void attention_forward_matmul(Tensor& out, Tensor& stats, const Tensor& qkv,
                               int B, int T, int Hq, int Hkv, int HS,
-                              cublasHandle_t cublas, cudaStream_t stream);
+                              cublasHandle_t cublas, cudaStream_t stream,
+                              float scale = 0.0f);
 
 // cuBLAS matmul-based attention backward. Matches forward_matmul precision.
 void attention_backward_matmul(Tensor& d_qkv, const Tensor& lse,
                                const Tensor& out, const Tensor& d_out,
                                const Tensor& qkv,
                                int B, int T, int Hq, int Hkv, int HS,
-                               cublasHandle_t cublas, cudaStream_t stream);
+                               cublasHandle_t cublas, cudaStream_t stream,
+                               float scale = 0.0f);
 
 struct AttnBwdDebugConfig {
     int enabled = 0;
@@ -515,11 +532,17 @@ void attention_backward_cudnn(Tensor& dqkv, const Tensor& stats,
 // Flash Attention varlen forward (for document-level attention masking in packed sequences).
 // Q/K/V read from interleaved qkv buffer via strides; output written to out (total_q, Hq, HS).
 // LSE written in unpadded (Hq, total_q) format.
+// `scale` overrides the softmax scale. 0.0f → 1/sqrt(HS) (default); non-zero → used verbatim.
+// `window_size > 0` enables sliding-window (local) attention: each token
+// attends to its `window_size` most recent tokens (including itself),
+// matching HF's sliding_window convention. 0 → full causal (default).
 void attention_forward_flash_varlen(
     nv_bfloat16* out, float* lse, const nv_bfloat16* qkv,
     const int32_t* cu_seqlens_gpu,
     int B_ragged, int max_seqlen, int total_q,
-    int Hq, int Hkv, int HS, cudaStream_t stream);
+    int Hq, int Hkv, int HS, cudaStream_t stream,
+    float scale = 0.0f,
+    int window_size = 0);
 
 // Flash Attention varlen backward.
 // dq_accum: (total_q + 128*B_ragged, Hq, HS_rounded) FP32 temp.
@@ -529,6 +552,7 @@ void attention_forward_flash_varlen(
 //   Hq head indices; these buffers are then reduced to Hkv heads and scattered
 //   into the K/V sections of interleaved dqkv.
 //   When Hq == Hkv (MHA), pass nullptr — dK/dV are written directly to dqkv.
+// `scale` must match the forward scale used for this tensor (0.0f → 1/sqrt(HS) default).
 void attention_backward_flash_varlen(
     nv_bfloat16* dqkv, const float* lse,
     const nv_bfloat16* out, const nv_bfloat16* dout, const nv_bfloat16* qkv,
@@ -536,7 +560,9 @@ void attention_backward_flash_varlen(
     float* dq_accum, float* dsoftmax_sum,
     nv_bfloat16* dk_expanded, nv_bfloat16* dv_expanded,
     int B_ragged, int max_seqlen, int total_q,
-    int Hq, int Hkv, int HS, bool deterministic, cudaStream_t stream);
+    int Hq, int Hkv, int HS, bool deterministic, cudaStream_t stream,
+    float scale = 0.0f,
+    int window_size = 0);
 
 // Reduce dk_expanded/dv_expanded (Hq heads) to Hkv KV heads and scatter
 // into the K/V sections of interleaved dqkv buffer (total_q, Hq+2*Hkv, HS).
@@ -645,6 +671,12 @@ void scale_logits_rows(Tensor& logits, const float* inv_temperature,
 
 /// Apply logit softcapping in-place: logits[i] = softcap * tanh(logits[i] / softcap).
 void softcap_logits(Tensor& logits, float softcap, int BT, int V, cudaStream_t stream);
+
+/// Backward of softcap_logits, in-place on `d_logits`:
+///   d_logits[i] *= 1 - (capped_logits[i] / softcap)^2
+/// `capped_logits` must hold the forward output of softcap_logits (not raw).
+void softcap_logits_backward(Tensor& d_logits, const Tensor& capped_logits,
+                             float softcap, int BT, int V, cudaStream_t stream);
 
 int get_max_num_block_sums(const cudaDeviceProp& dp);
 void global_norm_squared(float* out, const float* values, size_t count, const cudaDeviceProp& dp, cudaStream_t stream);

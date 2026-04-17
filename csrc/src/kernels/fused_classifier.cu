@@ -966,3 +966,42 @@ void launch_softcap_logits_fp32(float* data, float softcap, long n, cudaStream_t
     softcap_logits_kernel<<<grid, block_size, 0, stream>>>(data, 1.0f / softcap, softcap, n);
     CUDA_CHECK(cudaGetLastError());
 }
+
+// ---------------------------------------------------------------------------
+// Logit softcapping backward: d_raw = d_capped * (1 - (capped / softcap)^2)
+//
+// Forward was: capped = softcap * tanh(raw / softcap).
+// Derivative: d(capped)/d(raw) = 1 - tanh^2(raw/softcap) = 1 - (capped/softcap)^2.
+// We multiply the incoming gradient (stored in `d_logits`) by that factor,
+// using the saved capped logits. Operates in-place on `d_logits`.
+// ---------------------------------------------------------------------------
+template <typename TDLogits, typename TCap>
+__global__ void softcap_logits_backward_kernel(TDLogits* d_logits,
+                                               const TCap* capped,
+                                               float inv_softcap, long n) {
+    long idx = static_cast<long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        float y = static_cast<float>(capped[idx]) * inv_softcap;  // tanh(raw/cap)
+        float scale = 1.0f - y * y;                               // sech^2(raw/cap)
+        float d = static_cast<float>(d_logits[idx]) * scale;
+        d_logits[idx] = static_cast<TDLogits>(d);
+    }
+}
+
+void launch_softcap_logits_backward_bf16(nv_bfloat16* d_logits, const nv_bfloat16* capped,
+                                         float softcap, long n, cudaStream_t stream) {
+    const int block_size = 256;
+    int grid = static_cast<int>((n + block_size - 1) / block_size);
+    softcap_logits_backward_kernel<<<grid, block_size, 0, stream>>>(
+        d_logits, capped, 1.0f / softcap, n);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void launch_softcap_logits_backward_fp32(float* d_logits, const float* capped,
+                                         float softcap, long n, cudaStream_t stream) {
+    const int block_size = 256;
+    int grid = static_cast<int>((n + block_size - 1) / block_size);
+    softcap_logits_backward_kernel<<<grid, block_size, 0, stream>>>(
+        d_logits, capped, 1.0f / softcap, n);
+    CUDA_CHECK(cudaGetLastError());
+}

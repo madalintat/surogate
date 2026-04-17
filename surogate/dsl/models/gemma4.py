@@ -85,7 +85,8 @@ def _gemma4_layer_mappings(layer_prefix: str, *, k_eq_v: bool = False) -> dict[s
         "out_weight": f"{layer_prefix}.self_attn.o_proj.weight",
         "q_norm_weight": f"{layer_prefix}.self_attn.q_norm.weight",
         "k_norm_weight": f"{layer_prefix}.self_attn.k_norm.weight",
-        # MLP
+        # MLP (separate gate/up matmuls; see Gemma4 LoRA hook path in
+        # matmul.cpp which fires distinct forward hooks for each).
         "mlp_gate_weight": f"{layer_prefix}.mlp.gate_proj.weight",
         "mlp_up_weight": f"{layer_prefix}.mlp.up_proj.weight",
         "mlp_down_weight": f"{layer_prefix}.mlp.down_proj.weight",

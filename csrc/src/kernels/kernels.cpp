@@ -657,6 +657,30 @@ void softcap_logits(Tensor& logits, float softcap, int BT, int V, cudaStream_t s
     }
 }
 
+void softcap_logits_backward(Tensor& d_logits, const Tensor& capped_logits,
+                             float softcap, int BT, int V, cudaStream_t stream) {
+    if (softcap <= 0.0f) return;
+    extern void launch_softcap_logits_backward_bf16(nv_bfloat16* d_logits, const nv_bfloat16* capped,
+                                                    float softcap, long n, cudaStream_t stream);
+    extern void launch_softcap_logits_backward_fp32(float* d_logits, const float* capped,
+                                                    float softcap, long n, cudaStream_t stream);
+    const long total = static_cast<long>(BT) * static_cast<long>(V);
+    if (d_logits.DType != capped_logits.DType) {
+        throw std::runtime_error("softcap_logits_backward: d_logits and capped_logits dtype must match");
+    }
+    if (d_logits.DType == ETensorDType::BF16) {
+        launch_softcap_logits_backward_bf16(d_logits.get<nv_bfloat16>(),
+                                            capped_logits.get<nv_bfloat16>(),
+                                            softcap, total, stream);
+    } else if (d_logits.DType == ETensorDType::FP32) {
+        launch_softcap_logits_backward_fp32(d_logits.get<float>(),
+                                            capped_logits.get<float>(),
+                                            softcap, total, stream);
+    } else {
+        throw std::runtime_error("softcap_logits_backward: unsupported logits dtype");
+    }
+}
+
 /**
  * @brief Performs the forward pass of the encoder layer (embedding lookup + positional encoding).
  *

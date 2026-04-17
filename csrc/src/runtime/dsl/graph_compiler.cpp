@@ -910,6 +910,15 @@ CompiledAttrs GraphCompiler::resolve_attrs(const Operation& op, CompiledOpType t
         }
     }
 
+    // Flash-attention softmax scale override. 0.0f keeps the kernel default
+    // (1/sqrt(head_dim)); any other value is used verbatim. Gemma4 sets
+    // softmax_scale=1.0 because Q/K-norm already provides the implicit scaling.
+    if (auto* sm_scale_attr = find_attr(op.attrs, "softmax_scale")) {
+        if (auto v = attr_double(*sm_scale_attr)) {
+            attrs.softmax_scale = static_cast<float>(*v);
+        }
+    }
+
     if (auto* window_attr = find_attr(op.attrs, "window_size")) {
         if (auto v = attr_int(*window_attr)) {
             attrs.window_size = static_cast<int>(*v);

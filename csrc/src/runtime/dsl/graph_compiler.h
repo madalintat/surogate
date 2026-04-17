@@ -261,6 +261,12 @@ struct CompiledAttrs {
 
     // Logit softcapping (fused_lm_head_loss)
     float softcap = 0.0f;  // 0 = disabled
+
+    // Attention softmax scale override (flash_attention op).
+    // 0.0f (default) means: use 1/sqrt(head_dim) as usual.
+    // Non-zero means: use this exact value as the softmax scale (e.g.,
+    // Gemma4 passes 1.0 because QK-norm provides the implicit scaling).
+    float softmax_scale = 0.0f;
 };
 
 // ============================================================================

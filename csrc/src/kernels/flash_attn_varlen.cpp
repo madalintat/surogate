@@ -23,7 +23,9 @@ void set_common_params(surogate_flash::Flash_fwd_params& params,
                        const nv_bfloat16* qkv_ptr, nv_bfloat16* out_ptr, float* lse_ptr,
                        int B_ragged, int max_seqlen, int total_q,
                        int Hq, int Hkv, int HS,
-                       const int32_t* cu_seqlens_gpu) {
+                       const int32_t* cu_seqlens_gpu,
+                       float scale_override = 0.0f,
+                       int window_size = 0) {
     const int H = Hq + 2 * Hkv;
     std::memset(&params, 0, sizeof(params));
 
@@ -61,7 +63,9 @@ void set_common_params(surogate_flash::Flash_fwd_params& params,
     params.seqlen_k_rounded = ((max_seqlen + 127) / 128) * 128;
     params.total_q = total_q;
 
-    params.scale_softmax = 1.0f / std::sqrt(static_cast<float>(HS));
+    params.scale_softmax = (scale_override != 0.0f)
+                               ? scale_override
+                               : 1.0f / std::sqrt(static_cast<float>(HS));
     params.scale_softmax_log2 = params.scale_softmax * static_cast<float>(M_LOG2E);
 
     // Variable-length sequence support
@@ -71,7 +75,14 @@ void set_common_params(surogate_flash::Flash_fwd_params& params,
 
     params.softmax_lse_ptr = lse_ptr;
     params.is_bf16 = true;
-    params.is_causal = true;
+    // Sliding window (window_size > 0): Is_local path in flash-attn, which
+    // requires is_causal=false and the kernel instantiated with Is_causal=false.
+    // Within the window we still want causal semantics (no right context).
+    // HF convention: position i attends to [i - window_size + 1, i], i.e.
+    // window_size tokens total. Flash-attn convention: window_size_left is the
+    // count of *past* tokens attendable, so window_size_left = window_size - 1.
+    const bool use_window = window_size > 0;
+    params.is_causal = !use_window;
     // Flash-attn internal convention: p_dropout = probability of KEEPING (not dropping).
     // p_dropout = 1.0 → keep everything → DROPOUT_SWITCH(1.0 < 1.0) = false → non-dropout kernel.
     // p_dropout < 1.0 triggers the dropout kernel which writes to params.rng_state (nullptr for us).
@@ -79,21 +90,21 @@ void set_common_params(surogate_flash::Flash_fwd_params& params,
     params.rp_dropout = 1.0f;
     params.scale_softmax_rp_dropout = params.scale_softmax;
     params.p_dropout_in_uint8_t = 255;  // floor(1.0 * 255) — not used when Is_dropout=false
-    params.window_size_left = -1;   // no window limit left
-    params.window_size_right = 0;   // causal: no right context
+    params.window_size_left = use_window ? (window_size - 1) : -1;
+    params.window_size_right = 0;   // causal-within-window: no right context
     params.softcap = 0.0f;
     params.unpadded_lse = true;     // LSE in (Hq, total_q) format
     params.num_splits = 0;          // unused — run_mha_fwd_ uses standard (non-split) kernel
 }
 
-template <int HeadDim>
+template <int HeadDim, bool IsCausal>
 void run_fwd(surogate_flash::Flash_fwd_params& params, cudaStream_t stream) {
-    surogate_flash::run_mha_fwd_<cutlass::bfloat16_t, HeadDim, /*Is_causal=*/true>(params, stream);
+    surogate_flash::run_mha_fwd_<cutlass::bfloat16_t, HeadDim, IsCausal>(params, stream);
 }
 
-template <int HeadDim>
+template <int HeadDim, bool IsCausal>
 void run_bwd(surogate_flash::Flash_bwd_params& params, cudaStream_t stream) {
-    surogate_flash::run_mha_bwd_<cutlass::bfloat16_t, HeadDim, /*Is_causal=*/true>(params, stream);
+    surogate_flash::run_mha_bwd_<cutlass::bfloat16_t, HeadDim, IsCausal>(params, stream);
 }
 
 }  // anonymous namespace
@@ -102,16 +113,29 @@ void attention_forward_flash_varlen(
         nv_bfloat16* out, float* lse, const nv_bfloat16* qkv,
         const int32_t* cu_seqlens_gpu,
         int B_ragged, int max_seqlen, int total_q,
-        int Hq, int Hkv, int HS, cudaStream_t stream) {
+        int Hq, int Hkv, int HS, cudaStream_t stream,
+        float scale_override,
+        int window_size) {
     surogate_flash::Flash_fwd_params params;
     set_common_params(params, qkv, out, lse, B_ragged, max_seqlen, total_q,
-                      Hq, Hkv, HS, cu_seqlens_gpu);
+                      Hq, Hkv, HS, cu_seqlens_gpu, scale_override, window_size);
 
-    if      (HS <= 64)  run_fwd<64>(params, stream);
-    else if (HS <= 96)  run_fwd<96>(params, stream);
-    else if (HS <= 128) run_fwd<128>(params, stream);
-    else if (HS <= 256) run_fwd<256>(params, stream);
-    else throw std::runtime_error("Flash Attention varlen: head_size > 256 not supported");
+    const bool use_window = window_size > 0;
+    // Flash-attn requires !(Is_causal && Is_local); for sliding we pass
+    // Is_causal=false and rely on window_size_left/right to get local attn.
+    if (use_window) {
+        if      (HS <= 64)  run_fwd<64,  false>(params, stream);
+        else if (HS <= 96)  run_fwd<96,  false>(params, stream);
+        else if (HS <= 128) run_fwd<128, false>(params, stream);
+        else if (HS <= 256) run_fwd<256, false>(params, stream);
+        else throw std::runtime_error("Flash Attention varlen: head_size > 256 not supported");
+    } else {
+        if      (HS <= 64)  run_fwd<64,  true>(params, stream);
+        else if (HS <= 96)  run_fwd<96,  true>(params, stream);
+        else if (HS <= 128) run_fwd<128, true>(params, stream);
+        else if (HS <= 256) run_fwd<256, true>(params, stream);
+        else throw std::runtime_error("Flash Attention varlen: head_size > 256 not supported");
+    }
 
     CUDA_CHECK(cudaGetLastError());
 }
@@ -131,7 +155,9 @@ void attention_backward_flash_varlen(
         float* dq_accum, float* dsoftmax_sum,
         nv_bfloat16* dk_expanded, nv_bfloat16* dv_expanded,
         int B_ragged, int max_seqlen, int total_q,
-        int Hq, int Hkv, int HS, bool deterministic, cudaStream_t stream) {
+        int Hq, int Hkv, int HS, bool deterministic, cudaStream_t stream,
+        float scale_override,
+        int window_size) {
     surogate_flash::Flash_bwd_params params;
     // IMPORTANT: zero ALL fields first. set_common_params takes Flash_fwd_params&,
     // so its memset only zeros sizeof(Flash_fwd_params) bytes, leaving backward-
@@ -140,7 +166,8 @@ void attention_backward_flash_varlen(
     // Set forward-compatible common params (redundantly zeros fwd portion, harmless)
     set_common_params(params, qkv, const_cast<nv_bfloat16*>(out),
                       const_cast<float*>(lse),
-                      B_ragged, max_seqlen, total_q, Hq, Hkv, HS, cu_seqlens_gpu);
+                      B_ragged, max_seqlen, total_q, Hq, Hkv, HS, cu_seqlens_gpu,
+                      scale_override, window_size);
 
     const int H = Hq + 2 * Hkv;
     const bool is_gqa = (Hq != Hkv);
@@ -195,11 +222,20 @@ void attention_backward_flash_varlen(
             static_cast<int64_t>(total_q + 128 * B_ragged) * Hq * HS_rounded;
     }
 
-    if      (HS <= 64)  run_bwd<64>(params, stream);
-    else if (HS <= 96)  run_bwd<96>(params, stream);
-    else if (HS <= 128) run_bwd<128>(params, stream);
-    else if (HS <= 256) run_bwd<256>(params, stream);
-    else throw std::runtime_error("Flash Attention varlen backward: head_size > 256 not supported");
+    const bool use_window = window_size > 0;
+    if (use_window) {
+        if      (HS <= 64)  run_bwd<64,  false>(params, stream);
+        else if (HS <= 96)  run_bwd<96,  false>(params, stream);
+        else if (HS <= 128) run_bwd<128, false>(params, stream);
+        else if (HS <= 256) run_bwd<256, false>(params, stream);
+        else throw std::runtime_error("Flash Attention varlen backward: head_size > 256 not supported");
+    } else {
+        if      (HS <= 64)  run_bwd<64,  true>(params, stream);
+        else if (HS <= 96)  run_bwd<96,  true>(params, stream);
+        else if (HS <= 128) run_bwd<128, true>(params, stream);
+        else if (HS <= 256) run_bwd<256, true>(params, stream);
+        else throw std::runtime_error("Flash Attention varlen backward: head_size > 256 not supported");
+    }
 
     CUDA_CHECK(cudaGetLastError());
 

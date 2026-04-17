@@ -746,6 +746,39 @@ void count_non_finite(int* out_count, const float* data, int n, cudaStream_t str
 }
 
 // ============================================================================
+// Utility: count values with |x| > threshold (for diagnosing extreme grads).
+// ============================================================================
+template<typename T>
+__global__ void count_above_threshold_kernel(int* out_count, const T* data, int n, float threshold) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    const float v = fabsf(static_cast<float>(data[idx]));
+    if (isfinite(v) && v > threshold) {
+        atomicAdd(out_count, 1);
+    }
+}
+
+template<typename T>
+static void count_above_threshold_impl(int* out_count, const T* data, int n,
+                                       float threshold, cudaStream_t stream) {
+    if (n <= 0) return;
+    const int block = 256;
+    const int grid = (n + block - 1) / block;
+    count_above_threshold_kernel<<<grid, block, 0, stream>>>(out_count, data, n, threshold);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void count_above_threshold(int* out_count, const nv_bfloat16* data, int n,
+                           float threshold, cudaStream_t stream) {
+    count_above_threshold_impl(out_count, data, n, threshold, stream);
+}
+
+void count_above_threshold(int* out_count, const float* data, int n,
+                           float threshold, cudaStream_t stream) {
+    count_above_threshold_impl(out_count, data, n, threshold, stream);
+}
+
+// ============================================================================
 // Utility: count invalid indices
 // ============================================================================
 __global__ void count_invalid_indices_kernel(int* out_count, const int* indices, int n, int num_experts) {
