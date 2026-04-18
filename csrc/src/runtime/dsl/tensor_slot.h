@@ -29,6 +29,7 @@ enum class TensorSlot : std::uint8_t {
     BlockSwiGLU,
     BlockMLPDown,
     BlockResidualFFN,
+    BlockHOut,  ///< Block final output (post layer_scalar); used by Gemma4 to avoid mlp_down collision
     // Gradient slots (layer-indexed)
     BlockDLN1,
     BlockDQKV,
@@ -36,6 +37,7 @@ enum class TensorSlot : std::uint8_t {
     BlockDSwiGLU,
     BlockDMLPUp,
     BlockDMLPDown,
+    BlockDHOut,
     BlockDLN2,
     BlockDResAtt,
     BlockDAttOut,

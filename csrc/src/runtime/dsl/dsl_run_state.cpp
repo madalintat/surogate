@@ -682,6 +682,11 @@ void DslRunState::allocate_simplified_activations(const PretrainedConfig& cfg) {
         }
 
         acts.mlp_down = share_mlp_down ? shared_mlp_down : mAllocator->allocate(dtype, "mlp_down", kind, {B, T, C});
+        // Dedicated per-layer block output slot used by Gemma4 (keeps the
+        // block's final h_out separate from the MLP's mlp_down so the
+        // autodiff's produced_by map doesn't lose the MLP → post_ff_ln
+        // dependency that drives MLP LoRA gradients).
+        acts.h_out = mAllocator->allocate(dtype, "h_out", kind, {B, T, C});
 
         if (NumExperts > 0) {
             const long num_tokens = B * T;
@@ -858,6 +863,10 @@ void DslRunState::allocate_simplified_gradients(const PretrainedConfig& cfg) {
 
         g.d_mlp_down = share_mlp_down ? mSharedDMlpDown[static_cast<std::size_t>(i % 2)]
                                       : mAllocator->allocate(dtype, "d_mlp_down", kind, {B, T, C});
+        // Per-layer h_out gradient (Gemma4: block's final-output grad,
+        // separate from MLP's d_mlp_down so the backward chain doesn't
+        // collide across the MLP / _finalize split).
+        g.d_h_out = mAllocator->allocate(dtype, "d_h_out", kind, {B, T, C});
         g.d_att = share_grads ? mSharedDAtt : mAllocator->allocate(dtype, "d_att", kind, {B, T, lAttnDim});
         g.d_ln1 = share_grads ? mSharedDLn1 : mAllocator->allocate(dtype, "d_ln1", kind, {B, T, C});
     }
@@ -959,6 +968,11 @@ void DslRunState::build_activation_grad_zero_segments() {
         // the backward graph and don't need blanket zeroing.
         add(g.d_res_att);
         add(g.d_att_out);
+        // d_h_out is an accumulation target for the next block's backward
+        // (gemma4 routes block output through a dedicated h_out slot to
+        // avoid mlp_down collision). Without zeroing, garbage in d_h_out
+        // leaks into the first backward that reads it (→ NaN cascade).
+        add(g.d_h_out);
     }
 
     mActGradZeroCount = static_cast<int>(ptrs.size());

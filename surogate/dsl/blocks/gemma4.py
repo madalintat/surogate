@@ -170,26 +170,19 @@ def _per_layer_input_phase(block, residual, per_layer_input):
 
 
 def _finalize(block, residual):
-    """Apply layer_scalar and return (state, zeros).
-
-    The block output is the scaled hidden state. The residual is always zero
-    (Gemma4 doesn't use a running residual sum across blocks).
-    We return the output as BOTH values: (h_out, h_out). The next block's
-    input_layernorm receives (residual=h_out, x=h_out) and computes
-    new_residual = h_out + h_out. We compensate by halving the result
-    via the layer_scalar or adjusting the fused_residual_rmsnorm behavior.
-
-    Actually — simpler: return the state in the first position and a zero
-    in the second. Use the names that the inliner maps to blocks[N].* for
-    persistence: "att_out" and "mlp_down" (both are C-dimensional slots
-    in the simplified activations that are available at layer boundaries).
-    """
+    # Block's final output: residual scaled by layer_scalar, written to a
+    # dedicated per-layer "h_out" slot. Historically we wrote to "mlp_down"
+    # (reusing the MLP's persistent slot as a memory optimization), but
+    # that created a name collision with the MLP's own down output — and
+    # the autodiff's produced_by map keeps only the last writer, so the
+    # MLP → post_ff_ln dependency was silently dropped from the backward
+    # graph and every MLP LoRA gradient stayed zero. h_out has its own
+    # per-layer buffer (simplified_acts::h_out) and is mapped in
+    # try_get_tensor_fuzzy so the next block can read it as input.
+    block._register_activation("h_out", ("B", "T", "d_model"), share_policy="per_layer", save=True)
     scaled = block._scale_by_param(residual, "layer_scalar")
-    # Copy the scaled output into the mlp_down slot (persists across layer
-    # boundaries). Must use _add(scaled, 0) not _view to trigger a real copy —
-    # _view creates an alias that dangles when the temp stack is restored.
     zero_copy = block._zeros(["B", "T", "d_model"], name="copy_zero")
-    h_out = block._add(scaled, zero_copy, name="mlp_down")
+    h_out = block._add(scaled, zero_copy, name="h_out")
     return h_out, h_out
 
 

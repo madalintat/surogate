@@ -47,6 +47,7 @@ const std::unordered_map<std::string, TensorSlot> kSlotMappings = {
     {"mlp_down", TensorSlot::BlockMLPDown},
     {"mlp_down_flat", TensorSlot::BlockMLPDown},
     {"out", TensorSlot::BlockMLPDown},
+    {"h_out", TensorSlot::BlockHOut},
     {"res_ffn", TensorSlot::BlockResidualFFN},
     {"residual_ffn", TensorSlot::BlockResidualFFN},
     {"res_in", TensorSlot::BlockResidualFFN},
@@ -61,6 +62,7 @@ const std::unordered_map<std::string, TensorSlot> kSlotMappings = {
     {"d_mlp_up", TensorSlot::BlockDMLPUp},
     {"d_mlp_down", TensorSlot::BlockDMLPDown},
     {"d_out", TensorSlot::BlockDMLPDown},
+    {"d_h_out", TensorSlot::BlockDHOut},
     {"d_ln2", TensorSlot::BlockDLN2},
     {"d_res_att", TensorSlot::BlockDResAtt},
     {"d_att_out", TensorSlot::BlockDAttOut},
@@ -104,6 +106,7 @@ const char* slot_to_name(TensorSlot slot) {
         case TensorSlot::BlockMLPUp: return "mlp_up";
         case TensorSlot::BlockSwiGLU: return "swiglu";
         case TensorSlot::BlockMLPDown: return "mlp_down";
+        case TensorSlot::BlockHOut: return "h_out";
         case TensorSlot::BlockResidualFFN: return "res_ffn";
         case TensorSlot::BlockDLN1: return "d_ln1";
         case TensorSlot::BlockDQKV: return "d_qkv";

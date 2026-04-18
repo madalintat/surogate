@@ -1202,6 +1202,7 @@ Tensor& CompiledExecutor::resolve_tensor(const TensorRef& ref) {
         case TensorSlot::BlockMLPUp: return rs.simplified_acts(ref.layer_idx).mlp_up;
         case TensorSlot::BlockSwiGLU: return rs.simplified_acts(ref.layer_idx).swiglu;
         case TensorSlot::BlockMLPDown: return rs.simplified_acts(ref.layer_idx).mlp_down;
+        case TensorSlot::BlockHOut: return rs.simplified_acts(ref.layer_idx).h_out;
         case TensorSlot::BlockResidualFFN: return rs.get_residual(ref.layer_idx, rs.MainStream);
         case TensorSlot::BlockDLN1: return rs.simplified_grads(ref.layer_idx).d_ln1;
         case TensorSlot::BlockDQKV: return rs.simplified_grads(ref.layer_idx).d_qkv;
@@ -1209,6 +1210,7 @@ Tensor& CompiledExecutor::resolve_tensor(const TensorRef& ref) {
         case TensorSlot::BlockDSwiGLU: return rs.simplified_grads(ref.layer_idx).d_swiglu;
         case TensorSlot::BlockDMLPUp: return rs.simplified_grads(ref.layer_idx).d_mlp_up;
         case TensorSlot::BlockDMLPDown: return rs.simplified_grads(ref.layer_idx).d_mlp_down;
+        case TensorSlot::BlockDHOut: return rs.simplified_grads(ref.layer_idx).d_h_out;
         case TensorSlot::BlockDLN2: return rs.simplified_grads(ref.layer_idx).d_ln2;
         case TensorSlot::BlockDResAtt: return rs.simplified_grads(ref.layer_idx).d_res_att;
         case TensorSlot::BlockDAttOut: return rs.simplified_grads(ref.layer_idx).d_att_out;

@@ -546,6 +546,8 @@ const Tensor* CompiledExecutor::try_get_tensor_fuzzy(const std::string& name) {
     if (base_field == "mlp_up" || base_field == "mlp_up_flat") return &acts.mlp_up;
     if (base_field == "swiglu" || base_field == "swiglu_flat") return &acts.swiglu;
     if (base_field == "mlp_down" || base_field == "mlp_down_flat") return &acts.mlp_down;
+    if (base_field == "h_out") return &acts.h_out;
+    if (base_field == "d_h_out") return &mRunState.simplified_grads(layer_idx).d_h_out;
     if (base_field == "res_att" || base_field == "residual_att") return &acts.residual_att;
     if (base_field == "res_ffn" || base_field == "residual_ffn" || base_field == "res_in") {
         Tensor& res = mRunState.get_residual(layer_idx, mRunState.MainStream);

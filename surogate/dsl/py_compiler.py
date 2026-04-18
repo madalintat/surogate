@@ -993,7 +993,7 @@ def _inline_stacked_blocks(
                     # use a neutral name to avoid the block-activation resolver.
                     layer_outputs = [
                         f"blocks[{layer_idx}].{name}"
-                        if name in ("res_in", "res_ffn", "res_att", "mlp_down")
+                        if name in ("res_in", "res_ffn", "res_att", "mlp_down", "h_out")
                         else f"layer{layer_idx}.{name}"
                         for name in block_outputs
                     ]
