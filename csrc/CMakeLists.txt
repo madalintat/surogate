@@ -351,6 +351,9 @@ target_sources(surogate-common PRIVATE
     src/runtime/ops/ep_combine.cpp
     src/runtime/ep/lpt_planner.cpp
     src/runtime/ep/weight_transfer.cpp
+    src/runtime/ep/ep_state.cpp
+    src/runtime/ep/ep_buffer_pool.cpp
+    src/runtime/ep/ep_strategy.cpp
 
     src/runtime/ops/mamba_split_proj.cpp
     src/runtime/ops/mamba_conv1d.cpp
@@ -636,8 +639,8 @@ if (BUILD_TESTS OR BUILD_TESTS_UNIT OR BUILD_TESTS_INTEGRATION)
             # MoE
             src/testing/moe/test-moe.cu
 
-            # Models
-            src/testing/models/test_pretrained_config.cpp
+            # Expert Parallelism
+            src/testing/ep/test-ep-buffer-pool.cpp
 
             # JIT kernel loader
             src/testing/jit/test-jit-kernel.cpp

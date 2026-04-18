@@ -131,7 +131,7 @@ void CompiledExecutor::dispatch_moe_expert_bias_add(const CompiledOp& op) {
 
     // Check if LLEP is active for this layer (merged experts != local experts)
     int num_experts = static_cast<int>(mConfig.NumLocalExperts);
-    const LLEPLayerState* llep = nullptr;
+    const ep::LLEPLayerState* llep = nullptr;
     if (layer_idx >= 0) {
         auto it = mLLEPStates.find(ep_key);
         if (it != mLLEPStates.end() && it->second.active) {

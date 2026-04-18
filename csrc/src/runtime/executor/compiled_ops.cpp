@@ -26,6 +26,7 @@
 #include "runtime/executor/compiled_ops_helpers.h"
 #include "runtime/dsl/dsl_runtime.h"
 #include "runtime/dsl/dsl_weight_manager.h"
+#include "runtime/ep/ep_strategy.h"
 #include "runtime/executor/graph_executor_helpers.h"
 #include "runtime/executor/graph_executor_utils.h"
 #include "runtime/dsl/op_shape_signatures.h"
@@ -347,7 +348,11 @@ CompiledExecutor::CompiledExecutor(DslRunState& run_state,
       mWeights(weights),
       mGrads(grads),
       mConfig(config),
-      mOptions(options) {
+      mOptions(options),
+      mEpStrategy(ep::create_strategy(options)),
+      mEpStates(mEpStrategy->ep_states()),
+      mLLEPStates(mEpStrategy->llep_states()),
+      mEPLayerMeta(mEpStrategy->layer_meta()) {
     // Load JIT-compiled Triton kernels for gated delta rule (if manifests available)
     if (!options.JitKernelManifests.empty()) {
         mGdrKernels.load(options.JitKernelManifests);
@@ -371,70 +376,9 @@ CompiledExecutor::~CompiledExecutor() {
     mMoeSavedBuffers.clear();
     mMoeSavedSizes.clear();
 
-    // Free EP per-layer persistent buffers
-    for (auto& [layer, state] : mEpStates) {
-        if (state.send_order_gpu) cudaFree(state.send_order_gpu);
-        if (state.recv_reorder_gpu) cudaFree(state.recv_reorder_gpu);
-        if (state.llep_send_reorder_gpu) cudaFree(state.llep_send_reorder_gpu);
-        if (state.local_scatter_gpu) cudaFree(state.local_scatter_gpu);
-        if (state.sorted_recv_gpu) cudaFree(state.sorted_recv_gpu);
-        if (state.combined_gpu) cudaFree(state.combined_gpu);
-        if (state.llep_combined_gpu) cudaFree(state.llep_combined_gpu);
-        if (state.dispatch_bwd_send_gpu) cudaFree(state.dispatch_bwd_send_gpu);
-        if (state.dispatch_bwd_out_gpu) cudaFree(state.dispatch_bwd_out_gpu);
-        if (state.combine_bwd_sorted_gpu) cudaFree(state.combine_bwd_sorted_gpu);
-    }
-    mEpStates.clear();
-
-    // Free shared EP buffers (shared across layers)
-    if (mSharedEpCombinedGpu) cudaFree(mSharedEpCombinedGpu);
-    if (mSharedEpSortedRecvGpu) cudaFree(mSharedEpSortedRecvGpu);
-    if (mSharedEpLlepCombineGpu) cudaFree(mSharedEpLlepCombineGpu);
-
-    // Free retired shared EP buffers (old allocations kept alive during forward/backward)
-    for (auto& e : mEpRetiredBufs) {
-        if (e.ptr) cudaFree(e.ptr);
-    }
-    mEpRetiredBufs.clear();
-
-    // Free EP buffer pool
-    for (auto& e : mEpBufPool) {
-        if (e.ptr) cudaFree(e.ptr);
-    }
-    mEpBufPool.clear();
-
-    // Destroy weight transfer stream
-    if (mWeightTransferStream) {
-        cudaStreamDestroy(mWeightTransferStream);
-        mWeightTransferStream = nullptr;
-    }
-}
-
-void* CompiledExecutor::ep_buf_acquire(size_t need) {
-    if (need == 0) return nullptr;
-    // Find smallest buffer that fits (best-fit to reduce waste)
-    size_t best_size = SIZE_MAX;
-    int best_idx = -1;
-    for (int i = 0; i < static_cast<int>(mEpBufPool.size()); ++i) {
-        if (mEpBufPool[i].bytes >= need && mEpBufPool[i].bytes < best_size) {
-            best_size = mEpBufPool[i].bytes;
-            best_idx = i;
-        }
-    }
-    if (best_idx >= 0) {
-        void* ptr = mEpBufPool[best_idx].ptr;
-        mEpBufPool.erase(mEpBufPool.begin() + best_idx);
-        return ptr;
-    }
-    void* ptr = nullptr;
-    CUDA_CHECK(cudaMalloc(&ptr, need));
-    return ptr;
-}
-
-void CompiledExecutor::ep_buf_release(void* ptr, size_t bytes) {
-    if (ptr && bytes > 0) {
-        mEpBufPool.push_back({ptr, bytes});
-    }
+    // EP per-layer state, LLEP state, shared buffers, buffer pool, and
+    // the weight-transfer stream are all owned by mEpStrategy and released
+    // by its destructor automatically via unique_ptr cleanup.
 }
 
 void CompiledExecutor::clear_replay_copied_refs() {

@@ -23,6 +23,7 @@
 #include <cuda_runtime.h>
 
 #include "runtime/dsl/forward_plan.h"
+#include "runtime/ep/ep_state.h"
 #include "runtime/executor/graph_executor_internal.h"
 #include "runtime/dsl/ir.h"
 #include "runtime/dsl/tensor_slot.h"
@@ -33,6 +34,10 @@
 #include "utilities/tensor.h"
 #include "runtime/dsl/graph_compiler.h"
 #include "runtime/jit/gated_delta_rule_kernels.h"
+
+namespace ep {
+class EPStrategy;
+}  // namespace ep
 
 namespace modules {
 struct ModelConfig;
@@ -67,6 +72,11 @@ class DslWeightManager;
 
 class CompiledExecutor {
 public:
+    // EPStrategy moves forward/backward dispatch + combine off the executor
+    // but still needs to drive the executor's tensor resolution, per-layer
+    // MoE bookkeeping, and the NCCL/LoRA handles it depends on. Grant access.
+    friend class ::ep::EPStrategy;
+
     CompiledExecutor(DslRunState& run_state,
                      DslParamStore& weights,
                      DslGradStore& grads,
@@ -378,6 +388,23 @@ private:
     const modules::ModelConfig& mConfig;
     const RuntimeOptions& mOptions;
 
+    // Expert Parallelism strategy: owns all per-layer EP/LLEP state, the GPU
+    // buffer pool, shared cross-layer buffers, and the weight-transfer stream.
+    // Built via ep::create_strategy(); defaults to LLEP with per-layer
+    // auto-fallback to static mapping when rebalancing isn't warranted.
+    //
+    // Declared here (immediately after mOptions) so the reference aliases
+    // below can be initialized in the same list-order as declaration,
+    // avoiding -Wreorder warnings.
+    std::unique_ptr<ep::EPStrategy> mEpStrategy;
+
+    // Reference aliases into the strategy's state maps. Existing MoE/EP
+    // dispatch code keeps using `mEpStates`/`mLLEPStates`/`mEPLayerMeta`
+    // unchanged; each name now resolves to a map owned by the strategy.
+    std::unordered_map<int, ep::EpLayerState>& mEpStates;
+    std::unordered_map<int, ep::LLEPLayerState>& mLLEPStates;
+    std::unordered_map<int, ep::EPLayerMeta>& mEPLayerMeta;
+
     // JIT-compiled Triton kernels for gated delta rule (loaded once from manifests)
     GatedDeltaRuleKernels mGdrKernels;
 
@@ -505,140 +532,6 @@ private:
     std::unordered_map<std::string, void*> mMoeSavedBuffers;
     std::unordered_map<std::string, size_t> mMoeSavedSizes;
 
-    // Expert Parallelism (EP) per-layer state: send/recv splits, token reorder mapping
-    struct EpLayerState {
-        std::vector<int> send_splits;      // tokens sent to each EP peer
-        std::vector<int> recv_splits;      // tokens received from each EP peer
-        int total_send = 0;                // sum of send_splits
-        int total_recv = 0;                // sum of recv_splits
-        void* send_order_gpu = nullptr;    // GPU buffer: reorder indices for recv re-sort gather
-        void* recv_reorder_gpu = nullptr;  // GPU buffer: reorder indices for recv → local expert order
-        size_t send_order_bytes = 0;
-        size_t recv_reorder_bytes = 0;
-        // LLEP send reorder: when LLEP is active, tokens are reordered before A2A.
-        // llep_send_reorder_gpu[new_pos] = old_pos in expert-sorted input.
-        // Null when standard EP (no reorder needed).
-        void* llep_send_reorder_gpu = nullptr;
-        size_t llep_send_reorder_bytes = 0;
-        void* local_scatter_gpu = nullptr;  // local_scatter [total_recv] indices output
-        size_t local_scatter_bytes = 0;
-        // Forward EP outputs must remain valid until backward of this layer.
-        // Shared cross-layer buffers can be overwritten by subsequent layers/recompute.
-        void* sorted_recv_gpu = nullptr;  // ep_dispatch output [total_recv, hidden]
-        size_t sorted_recv_bytes = 0;
-        void* combined_gpu = nullptr;  // ep_combine output [total_send, hidden]
-        size_t combined_bytes = 0;
-        void* llep_combined_gpu = nullptr;  // ep_combine LLEP reorder output [total_send, hidden]
-        size_t llep_combined_bytes = 0;
-        // Backward EP outputs must also remain valid until their consumer runs.
-        // Shared cross-layer buffers can be overwritten by later EP ops.
-        void* dispatch_bwd_send_gpu = nullptr;  // ep_dispatch_backward reverse A2A [total_send, hidden]
-        size_t dispatch_bwd_send_bytes = 0;
-        void* dispatch_bwd_out_gpu = nullptr;  // ep_dispatch_backward LLEP reorder output [total_send, hidden]
-        size_t dispatch_bwd_out_bytes = 0;
-        void* combine_bwd_sorted_gpu = nullptr;  // ep_combine_backward output [total_recv, hidden]
-        size_t combine_bwd_sorted_bytes = 0;
-    };
-    std::unordered_map<int, EpLayerState> mEpStates;  // keyed by ep_state_key(layer_idx)
-
-    // LLEP (Least-Loaded EP) per-layer state for dynamic load balancing.
-    // When active, merged weight tensors contain native + foreign expert weights,
-    // and the GEMM ops use these instead of the QLoRA-resolved weights.
-    struct LLEPLayerState {
-        bool active = false;         // Whether LLEP rebalancing is active this step
-        int num_merged_experts = 0;  // Total experts on this GPU (native + foreign)
-
-        // Per-expert weight pointers (indexed by merged expert index 0..num_merged-1).
-        // Each pointer points to one expert's weight slice in either:
-        //  - native dequant buffer (for native experts), or
-        //  - foreign weight receive buffer (for received foreign experts).
-        // No contiguous merged buffer needed — saves ~465 MB GPU memory.
-        std::vector<const void*> gate_up_weight_ptrs;  // [num_merged]: ptr to gate_up [2*D, C]
-        std::vector<const void*> down_weight_ptrs;     // [num_merged]: ptr to down [C, D]
-        ETensorDType weight_dtype = ETensorDType::BF16;
-
-        std::vector<int> merged_offsets_host;  // Host expert offsets for merged set
-        void* merged_offsets_gpu = nullptr;    // GPU expert offsets
-        size_t merged_offsets_gpu_bytes = 0;
-        // Map from merged expert index → global expert ID
-        std::vector<int> merged_to_global;
-        // Map from global expert ID → merged expert index (-1 if not on this GPU)
-        std::vector<int> global_to_merged;
-
-        // Merged LoRA weights [num_merged, ...] for use in GEMM dispatch.
-        // Built from native expert LoRA + transferred foreign expert LoRA.
-        // Null/inactive when LoRA is not enabled.
-        // Per-layer owned GPU memory (NOT shared across layers).
-        modules::LoRAGroupedExpertWeights<Tensor> merged_lora;
-        bool has_merged_lora = false;
-        // Per-layer owned GPU pointers for merged LoRA (freed on layer state clear)
-        std::vector<void*> owned_lora_ptrs;
-
-        // Foreign weight P2P receive buffers — owned by this state.
-        // Must stay alive as long as weight pointers reference them.
-        std::vector<void*> owned_foreign_ptrs;
-
-        void free_lora_gpu() {
-            for (void* p : owned_lora_ptrs) {
-                if (p) cudaFree(p);
-            }
-            owned_lora_ptrs.clear();
-            has_merged_lora = false;
-        }
-        void free_foreign_gpu() {
-            for (void* p : owned_foreign_ptrs) {
-                if (p) cudaFree(p);
-            }
-            owned_foreign_ptrs.clear();
-            gate_up_weight_ptrs.clear();
-            down_weight_ptrs.clear();
-        }
-    };
-    std::unordered_map<int, LLEPLayerState> mLLEPStates;  // keyed by ep_state_key(layer_idx)
-
-    // Lightweight per-layer EP metadata — survives LLEP state clearing.
-    // Backward uses this to reconstruct native-only weight pointers when
-    // the full LLEP state has been freed to save GPU memory.
-    struct EPLayerMeta {
-        int num_merged = 0;                 // total experts on this GPU (native + foreign)
-        int native_start = 0;               // first native expert's global ID
-        int num_local = 0;                  // number of native experts
-        std::vector<int> merged_to_global;  // merged_idx → global expert ID
-    };
-    std::unordered_map<int, EPLayerMeta> mEPLayerMeta;  // keyed by ep_state_key(layer_idx)
-
-    // Shared GPU buffers for EP combine / dispatch_backward output (off-stack).
-    // Only one layer uses these at a time, so sharing saves ~1.2 GB vs per-layer.
-    void* mSharedEpCombinedGpu = nullptr;  // ep_combine reverse A2A output [total_send, hidden]
-    size_t mSharedEpCombinedBytes = 0;
-    void* mSharedEpSortedRecvGpu = nullptr;  // ep_dispatch_backward output [total_send, hidden]
-    size_t mSharedEpSortedRecvBytes = 0;
-    void* mSharedEpLlepCombineGpu = nullptr;  // ep_combine LLEP reorder output [total_send, hidden]
-    size_t mSharedEpLlepCombineBytes = 0;
-
-    // CUDA stream for LLEP weight transfer (overlaps with token A2A on MainStream).
-    // Lazily created on first LLEP activation. Uses separate NCCL weight_transfer_comm.
-    cudaStream_t mWeightTransferStream = nullptr;
-
-    // GPU buffer pool for EP intermediates — eliminates cudaStreamSynchronize + cudaFree
-    // barriers in the hot path. All EP ops run on MainStream, so CUDA stream ordering
-    // guarantees safe buffer reuse without explicit synchronization.
-    // Pattern: acquire() finds a recycled buffer >= requested size (or cudaMalloc's a new one);
-    //          release() returns the buffer to the pool for reuse by subsequent layers.
-    struct EpPoolEntry {
-        void* ptr;
-        size_t bytes;
-    };
-    std::vector<EpPoolEntry> mEpBufPool;
-    void* ep_buf_acquire(size_t need);
-    void ep_buf_release(void* ptr, size_t bytes);
-
-    // Retired shared EP buffers — old allocations kept alive until end-of-step because
-    // save_moe_layer_tensors copies tensor data at layer boundaries, and the copy source
-    // may reference the old buffer via stored mTensors entries. Cannot go into mEpBufPool
-    // because the pool recycles buffers for temporary EP intermediates, which would overwrite
-    // data still referenced by saved tensors. Freed at destructor time.
-    std::vector<EpPoolEntry> mEpRetiredBufs;
     void clear_replay_copied_refs();
 
     // Reusable per-forward layer tracking vectors (avoid heap allocation every forward call).

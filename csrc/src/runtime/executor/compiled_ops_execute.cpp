@@ -6,6 +6,8 @@
 
 #include "runtime/executor/compiled_ops.h"
 
+#include "runtime/ep/ep_strategy.h"
+
 #include <algorithm>
 #include <array>
 #include <cctype>
@@ -537,18 +539,12 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
     if (!cleanup_capturing) {
         // Free retired shared EP buffers from previous steps (accumulated during reallocation).
         // Previous step is fully complete, so these are no longer referenced.
-        for (auto& e : mEpRetiredBufs) {
-            if (e.ptr) cudaFree(e.ptr);
-        }
-        mEpRetiredBufs.clear();
+        mEpStrategy->buffer_pool().clear_retired();
         // Free EP buffer pool — temporary buffers with short lifetimes (acquired/released
         // within a single dispatch call). As routing imbalance changes during training,
         // buffer sizes drift and stale entries become unreusable zombies. Clearing per-step
         // prevents this accumulation; cudaMalloc overhead is negligible vs A2A/GEMM costs.
-        for (auto& e : mEpBufPool) {
-            if (e.ptr) cudaFree(e.ptr);
-        }
-        mEpBufPool.clear();
+        mEpStrategy->buffer_pool().clear_pool();
         // Trim CUDA stream-ordered memory pool to release cached allocations.
         // cuBLAS cublasGemmGroupedBatchedEx internally uses cudaMallocAsync;
         // trimming reclaims unused cached blocks from previous steps.
