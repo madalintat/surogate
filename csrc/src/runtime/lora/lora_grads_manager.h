@@ -6,8 +6,10 @@
 #define SUROGATE_SRC_MODULES_LORA_LORA_GRADS_MANAGER_H
 
 #include <memory>
+#include <vector>
 
 #include "lora_types.h"
+#include "runtime/dsl/dsl_runtime_config.h"
 #include "utilities/tensor.h"
 #include "utilities/dtype.h"
 
@@ -44,6 +46,10 @@ public:
         bool train_router = false;      ///< Train MoE router gate during LoRA fine-tuning
 
         const ModelConfig* model_config = nullptr;  ///< Per-layer block type (hybrid models)
+
+        /// Per-layer attention dims for hybrid models. Must mirror the weights
+        /// manager so gradient buffers line up with the LoRA weights.
+        std::vector<dsl::BlockTypeDims> per_layer_dims;
 
         [[nodiscard]] int effective_moe_intermediate() const {
             return moe_intermediate_size > 0 ? moe_intermediate_size : intermediate_size;

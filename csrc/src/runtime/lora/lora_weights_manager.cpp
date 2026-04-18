@@ -62,12 +62,34 @@ void ModularLoRAWeightsManager::allocate_block_weights(int layer_idx) {
     if (!enabled()) return;
 
     const int C = mConfig.hidden_size;
-    const int D = mConfig.intermediate_size;
     const int Hq = mConfig.num_query_heads;
     const int Hkv = mConfig.num_kv_heads;
     const int Hs = mConfig.head_size;
-    const int q_out = Hq * Hs;
-    const int kv_out = Hkv * Hs;
+    // For hybrid models (e.g. Gemma4's sliding/full mix, and its shared-KV
+    // double-wide MLP), each layer's attention and MLP dims may differ from
+    // the global defaults. Use the per-layer dims when available so LoRA
+    // weights have the right output size — otherwise lora_B at a
+    // full-attention or double-wide-MLP layer is allocated with the
+    // smaller default size, and apply_lora_contribution reads past the end
+    // of the buffer (→ NaN on the first layer that exercises it).
+    int q_out = Hq * Hs;
+    int kv_out = Hkv * Hs;
+    int D = mConfig.intermediate_size;
+    if (layer_idx >= 0 && static_cast<size_t>(layer_idx) < mConfig.per_layer_dims.size()) {
+        const auto& d = mConfig.per_layer_dims[static_cast<size_t>(layer_idx)];
+        if (d.attn_dim > 0) {
+            q_out = static_cast<int>(d.attn_dim);
+        }
+        // Derive kv_out from the per-layer head_size, assuming Hkv tracks the
+        // global config (true for Gemma4 — only head_size varies between
+        // sliding and full layers, Hkv is the same).
+        if (d.head_size > 0) {
+            kv_out = Hkv * static_cast<int>(d.head_size);
+        }
+        if (d.intermediate > 0) {
+            D = static_cast<int>(d.intermediate);
+        }
+    }
     int q_lora_out = q_out;
     const bool use_shared_expert = mConfig.model_config && mConfig.model_config->moe_config.has_value() &&
                                    mConfig.model_config->moe_config->use_shared_expert;

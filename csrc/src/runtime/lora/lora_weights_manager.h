@@ -11,6 +11,7 @@
 #include <functional>
 
 #include "lora_types.h"
+#include "runtime/dsl/dsl_runtime_config.h"
 #include "utilities/tensor.h"
 #include "utilities/tensor_container.h"
 #include "utilities/dtype.h"
@@ -51,6 +52,14 @@ public:
         bool train_router = false;      ///< Train MoE router gate during LoRA fine-tuning
 
         const ModelConfig* model_config = nullptr;  ///< Per-layer block type (hybrid models)
+
+        /// Per-layer attention dims for hybrid models (Gemma4-like sliding/full mix).
+        /// Empty for homogeneous models; when populated, Q/K/V/O LoRA weights at
+        /// layer ``i`` are sized from ``per_layer_dims[i]`` instead of the global
+        /// num_query_heads/num_kv_heads/head_size. Allocating with the global
+        /// (smaller) dims when a full-attention layer needs the larger ones lets
+        /// apply_lora_contribution read past the end of lora_B (→ NaN/garbage).
+        std::vector<dsl::BlockTypeDims> per_layer_dims;
 
         [[nodiscard]] int effective_moe_intermediate() const {
             return moe_intermediate_size > 0 ? moe_intermediate_size : intermediate_size;

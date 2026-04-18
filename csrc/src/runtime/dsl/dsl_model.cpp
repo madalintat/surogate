@@ -1189,6 +1189,7 @@ DslModel::DslModel(const PretrainedConfig& config,
         wm.num_shards = mNumShards;
         wm.is_moe = mIsMoEModel;
         wm.model_config = &mModelConfig;
+        wm.per_layer_dims = mRuntimeConfig.per_layer_dims;
         if (mIsMoEModel && mModelConfig.moe_config.has_value()) {
             wm.num_experts = mModelConfig.moe_config->num_experts;
             wm.moe_intermediate_size = mModelConfig.moe_config->moe_intermediate_size > 0
@@ -1211,6 +1212,7 @@ DslModel::DslModel(const PretrainedConfig& config,
         gm.num_shards = mNumShards;
         gm.is_moe = mIsMoEModel;
         gm.model_config = &mModelConfig;
+        gm.per_layer_dims = mRuntimeConfig.per_layer_dims;
         if (mIsMoEModel && mModelConfig.moe_config.has_value()) {
             gm.num_experts = mModelConfig.moe_config->num_experts;
             gm.moe_intermediate_size = mModelConfig.moe_config->moe_intermediate_size > 0

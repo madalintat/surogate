@@ -26,3 +26,4 @@ tmp/**
 reverse*/
 surogate.db
 .claude/**
+debug/**

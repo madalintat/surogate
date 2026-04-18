@@ -41,10 +41,36 @@ void ModularLoRAGradsManager::allocate_gradients() {
     const int C = mConfig.hidden_size;
     const int D = mConfig.intermediate_size;
     const int D_moe = mConfig.effective_moe_intermediate();
-    const int q_out = mConfig.num_query_heads * mConfig.head_size;
-    const int kv_out = mConfig.num_kv_heads * mConfig.head_size;
+    const int global_q_out = mConfig.num_query_heads * mConfig.head_size;
+    const int global_kv_out = mConfig.num_kv_heads * mConfig.head_size;
     const int r = mConfig.lora_config.rank;
     const int E = mConfig.num_experts;
+
+    // For hybrid models, per-layer attention / MLP dims may differ from the
+    // global defaults. Resolve Q/K/V/O and MLP sizes per layer to avoid
+    // mismatches between the forward LoRA weights (sized per-layer) and the
+    // grad buffers.
+    struct LayerDims {
+        int q_out;
+        int kv_out;
+        int d_ff;
+    };
+    auto resolve_layer_dims = [&](int layer_idx) -> LayerDims {
+        LayerDims out{global_q_out, global_kv_out, D};
+        if (layer_idx >= 0 && static_cast<size_t>(layer_idx) < mConfig.per_layer_dims.size()) {
+            const auto& d = mConfig.per_layer_dims[static_cast<size_t>(layer_idx)];
+            if (d.attn_dim > 0) {
+                out.q_out = static_cast<int>(d.attn_dim);
+            }
+            if (d.head_size > 0) {
+                out.kv_out = mConfig.num_kv_heads * static_cast<int>(d.head_size);
+            }
+            if (d.intermediate > 0) {
+                out.d_ff = static_cast<int>(d.intermediate);
+            }
+        }
+        return out;
+    };
     auto contains_ci = [](std::string_view haystack, std::string_view needle) {
         std::string h(haystack);
         std::string n(needle);
@@ -124,7 +150,11 @@ void ModularLoRAGradsManager::allocate_gradients() {
                                          contains_ci(mConfig.model_config->ArchitectureName, "qwen3");
             is_qwen3_hybrid = is_hybrid && is_qwen3_family;
         }
-        const int q_lora_out = model_is_qwen3_5 ? (2 * q_out) : q_out;
+        const auto layer_dims = resolve_layer_dims(l);
+        const int layer_q_out = layer_dims.q_out;
+        const int layer_kv_out = layer_dims.kv_out;
+        const int layer_d_ff = layer_dims.d_ff;
+        const int q_lora_out = model_is_qwen3_5 ? (2 * layer_q_out) : layer_q_out;
 
         // Attention LoRA grads: Dense always, Attention always, MoE/SwitchMoE only in non-hybrid.
         // Non-hybrid MoE layers contain both attention AND MoE; hybrid MoE layers have only MoE.
@@ -136,16 +166,16 @@ void ModularLoRAGradsManager::allocate_gradients() {
                 shard.attention.q = alloc_shard(C, q_lora_out, prefix + "_q_shard");
             }
             if (mConfig.lora_config.applies_to_k()) {
-                full.attention.k = alloc_full(C, kv_out, prefix + "_k");
-                shard.attention.k = alloc_shard(C, kv_out, prefix + "_k_shard");
+                full.attention.k = alloc_full(C, layer_kv_out, prefix + "_k");
+                shard.attention.k = alloc_shard(C, layer_kv_out, prefix + "_k_shard");
             }
             if (mConfig.lora_config.applies_to_v()) {
-                full.attention.v = alloc_full(C, kv_out, prefix + "_v");
-                shard.attention.v = alloc_shard(C, kv_out, prefix + "_v_shard");
+                full.attention.v = alloc_full(C, layer_kv_out, prefix + "_v");
+                shard.attention.v = alloc_shard(C, layer_kv_out, prefix + "_v_shard");
             }
             if (mConfig.lora_config.applies_to_o()) {
-                full.attention.o = alloc_full(q_out, C, prefix + "_o");
-                shard.attention.o = alloc_shard(q_out, C, prefix + "_o_shard");
+                full.attention.o = alloc_full(layer_q_out, C, prefix + "_o");
+                shard.attention.o = alloc_shard(layer_q_out, C, prefix + "_o_shard");
             }
         }
 
@@ -211,16 +241,16 @@ void ModularLoRAGradsManager::allocate_gradients() {
             }
         } else if (layer_is_dense_mlp) {
             if (mConfig.lora_config.applies_to_gate()) {
-                full.mlp.gate = alloc_full(C, D, prefix + "_gate");
-                shard.mlp.gate = alloc_shard(C, D, prefix + "_gate_shard");
+                full.mlp.gate = alloc_full(C, layer_d_ff, prefix + "_gate");
+                shard.mlp.gate = alloc_shard(C, layer_d_ff, prefix + "_gate_shard");
             }
             if (mConfig.lora_config.applies_to_up()) {
-                full.mlp.up = alloc_full(C, D, prefix + "_up");
-                shard.mlp.up = alloc_shard(C, D, prefix + "_up_shard");
+                full.mlp.up = alloc_full(C, layer_d_ff, prefix + "_up");
+                shard.mlp.up = alloc_shard(C, layer_d_ff, prefix + "_up_shard");
             }
             if (mConfig.lora_config.applies_to_down()) {
-                full.mlp.down = alloc_full(D, C, prefix + "_down");
-                shard.mlp.down = alloc_shard(D, C, prefix + "_down_shard");
+                full.mlp.down = alloc_full(layer_d_ff, C, prefix + "_down");
+                shard.mlp.down = alloc_shard(layer_d_ff, C, prefix + "_down_shard");
             }
         }
         // Non-Qwen3 Mamba/SSM blocks still do not have dedicated LoRA gradient coverage here.
