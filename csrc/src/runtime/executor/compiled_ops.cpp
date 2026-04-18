@@ -501,6 +501,12 @@ const Tensor* CompiledExecutor::try_get_tensor_fuzzy(const std::string& name) {
     if (const Tensor* direct = try_get_tensor(name)) {
         return direct;
     }
+    // Backward-phase tensors (d_blocks[N].<base>, d_xF, d_encoded, ...) are
+    // registered via bind_tensor in execute_backward; they land in
+    // mNamedTensors even when the backward graph has no SSA id for the name.
+    if (auto it = mNamedTensors.find(name); it != mNamedTensors.end() && it->second.Data) {
+        return &it->second;
+    }
     // Try SSA-suffixed entries via pre-computed ssa_base_to_id (O(1) vs O(N) scan).
     if (mCurrentGraph) {
         auto ssa_it = mCurrentGraph->ssa_base_to_id.find(name);

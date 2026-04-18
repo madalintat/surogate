@@ -18,6 +18,7 @@ COMMAND_MAPPING: dict[str, str] = {
     "vf-eval": "surogate.cli.vf_eval",
     "tokenize": "surogate.cli.tokenize_cmd",
     "merge": "surogate.cli.merge",
+    "debug": "surogate.cli.debug",
 }
 
 
@@ -91,6 +92,11 @@ def parse_args():
     from surogate.cli.merge import prepare_command_parser as merge_prepare_command_parser
 
     merge_prepare_command_parser(subparsers.add_parser("merge", help="Merge a LoRA checkpoint into the base model"))
+
+    # debug command
+    from surogate.cli.debug import prepare_command_parser as debug_prepare_command_parser
+
+    debug_prepare_command_parser(subparsers.add_parser("debug", help="Introspection and diagnostics for DSL models"))
 
     args = parser.parse_args(sys.argv[1:])
     if args.command is None:

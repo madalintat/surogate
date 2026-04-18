@@ -2218,6 +2218,12 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
                     // Release this layer's offloaded weights (if applicable)
                     handle_layer_end(op.layer_end);
 
+                    // Dump backward-phase tensors for this layer before the stack
+                    // gets pruned or rebound. Runtime names are "d_blocks[N].<base>"
+                    // (e.g. d_blocks[3].qkv) — distinct from forward "blocks[N].<base>"
+                    // so the two phases write to separate files.
+                    if (mDebugDumpLayerFn) mDebugDumpLayerFn(op.layer_end);
+
                     if (mGrads.is_streaming_grads()) {
                         // CPU-RAM centric: reduce (multi-GPU) then D2H to CPU
                         if (mComm && mComm->world_size() > 1) {

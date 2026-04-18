@@ -680,15 +680,27 @@ void GraphExecutor::init_compiled_execution() {
     // (before shared activation buffers are overwritten by the next layer).
     mCompiledExecutor->set_debug_dump_layer_fn([this](int layer_idx) {
         static const char* dump_tensors_env = std::getenv("SUROGATE_DEBUG_DUMP_TENSORS");
-        static const char* dump_dir_env = std::getenv("SUROGATE_DEBUG_DUMP_DIR");
+        // Parse the (static, immutable) tensor list once — the layer hook fires
+        // 70–700× per multi-step run and re-splitting the comma-separated env on
+        // every call would be ~500k tiny allocations for a typical run.
+        static const std::vector<std::string> tensor_names = debug_dump_parse_tensor_list(dump_tensors_env);
+        // Non-static so the Python-side gradient subcommand can rotate per-step
+        // dump directories between trainer.step() calls.
+        const char* dump_dir_env = std::getenv("SUROGATE_DEBUG_DUMP_DIR");
         if (!dump_tensors_env || !dump_dir_env || !*dump_tensors_env || !*dump_dir_env) {
             return;
         }
-        const std::string prefix = "blocks[" + std::to_string(layer_idx) + "].";
-        auto tensor_names = debug_dump_parse_tensor_list(dump_tensors_env);
+        // Forward block tensors use "blocks[N]." prefix; backward gradient
+        // tensors use "d_blocks[N]." prefix. Accept both so the same hook
+        // serves forward activations and backward intermediates.
+        const std::string fwd_prefix = "blocks[" + std::to_string(layer_idx) + "].";
+        const std::string bwd_prefix = "d_blocks[" + std::to_string(layer_idx) + "].";
+        auto matches_this_layer = [&](const std::string& n) {
+            return n.rfind(fwd_prefix, 0) == 0 || n.rfind(bwd_prefix, 0) == 0;
+        };
         bool found = false;
         for (const auto& name : tensor_names) {
-            if (name.rfind(prefix, 0) == 0) {
+            if (matches_this_layer(name)) {
                 found = true;
                 break;
             }
@@ -698,7 +710,7 @@ void GraphExecutor::init_compiled_execution() {
         }
         CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
         for (const auto& name : tensor_names) {
-            if (name.rfind(prefix, 0) != 0) {
+            if (!matches_this_layer(name)) {
                 continue;
             }
             const Tensor* t = mCompiledExecutor->try_get_tensor_fuzzy(name);
