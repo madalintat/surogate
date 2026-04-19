@@ -77,6 +77,7 @@ Grep recipes
 from __future__ import annotations
 
 import os
+import tempfile
 from pathlib import Path
 from typing import Any, NamedTuple
 
@@ -255,6 +256,13 @@ def _run_with_dumps_root(
 
     os.environ["SUROGATE_DEBUG_DUMP_DIR"] = str(dump_dir)
     os.environ["SUROGATE_DEBUG_DUMP_TENSORS"] = ",".join(f"blocks[{i}].{dsl_slot}" for i in range(n_layers))
+    # The diff tool compares a short synthetic sequence by default. Run the DSL
+    # side at that exact length as well; allocating the full training
+    # ``sequence_len`` makes the compare path much heavier than the HF side and
+    # can OOM needlessly on otherwise valid configs.
+    config.sequence_len = seq_len
+    # Keep debug tokenization/logs isolated from the user's training output dir.
+    config.output_dir = tempfile.mkdtemp(prefix="surogate_debug_diff_run_", dir=str(dumps_root))
     configure_for_single_step(config, steps=1)
     disable_cuda_graphs(config)
 
@@ -568,7 +576,10 @@ def _run_dsl_with_tokens(
     in_tokens[:, :w] = token_ids[:total_rows, :w]
     out_tokens[:, : max(0, w - 1)] = in_tokens[:, 1:w]
 
-    ok, err = capture_exception(lambda: wrapper.trainer.step(in_tokens, out_tokens, pos_ids))
+    def _validate_once() -> None:
+        wrapper.trainer.validate(in_tokens, out_tokens, pos_ids)
+
+    ok, err = capture_exception(_validate_once)
     return None if ok else err
 
 

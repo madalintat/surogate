@@ -2,6 +2,7 @@
 
 Subcommands:
     weights      Static audit: HF safetensors keys vs DSL expected params.
+    registry     Static audit: which tensor names in the IR have no DSL declaration.
     activations  Per-layer forward activation stats from a single step.
     gradients    Per-step, per-param, and per-intermediate backward gradient stats.
     diff         Layer-by-layer numerical diff vs HuggingFace transformers reference.
@@ -43,6 +44,14 @@ def prepare_command_parser(parser=None):
     )
     _add_config_arg(p_weights)
     p_weights.add_argument("--hub_token", type=str, default=None, help="HuggingFace Hub token for private models")
+
+    p_registry = sub.add_parser(
+        "registry",
+        help="Static audit of the slot registry: tensor names in the IR that have no DSL declaration "
+        "(gaps the C++ side would have to special-case by string match)",
+    )
+    _add_config_arg(p_registry)
+    p_registry.add_argument("--hub_token", type=str, default=None, help="HuggingFace Hub token for private models")
 
     p_acts = sub.add_parser("activations", help="Trace forward activation stats per layer/op")
     _add_config_arg(p_acts)
@@ -107,6 +116,11 @@ def _dispatch(args: argparse.Namespace) -> int:
         from surogate.debug.weights import run_weight_audit
 
         return run_weight_audit(args.config, output=args.output, hub_token=args.hub_token)
+
+    if args.subcommand == "registry":
+        from surogate.debug.registry import run_registry_audit
+
+        return run_registry_audit(args.config, output=args.output, hub_token=args.hub_token)
 
     if args.subcommand == "activations":
         from surogate.debug.activations import run_activation_trace

@@ -939,15 +939,17 @@ def _inline_stacked_blocks(
 
             # Per-layer input support: if a 4D tensor [B, T, n_layers, D] is
             # provided as a 4th input and "per_layer_input_name" is set, we
-            # emit narrow+view ops for each layer to extract that layer's slice.
+            # extract the per-layer [B, T, D] slice on first use inside each
+            # inlined block instead of at the layer prologue. Emitting the
+            # slice too early leaves it live across most of the layer and lets
+            # stack-backed storage get reused before the PLI branch consumes it.
             pli_block_name = node.attrs.get("per_layer_input_name")  # block input name
             pli_tensor_ref = node.inputs[3] if len(node.inputs) > 3 and pli_block_name else None
-            # The 4D PLI tensor is produced BEFORE the block stack and re-sliced
-            # (via narrow+view) at the start of each layer's op range. Under
-            # backward recompute, replay_layer_forward re-runs those narrow+view
-            # ops, which reads the 4D tensor as an external input. Its stack
+            # The 4D PLI tensor is produced BEFORE the block stack. Under
+            # backward recompute, replay_layer_forward re-runs the narrow+view
+            # slice ops and reads this tensor as an external input. Its stack
             # storage is long dead by the time backward runs, so without an
-            # explicit save the narrow reads garbage → NaN in PLI gating.
+            # explicit save the replay path reads garbage.
             if pli_tensor_ref:
                 new_save.append(pli_tensor_ref)
 
@@ -1020,43 +1022,10 @@ def _inline_stacked_blocks(
                     if mapping[p] not in new_params:
                         new_params[mapping[p]] = block_graph.params[p]
 
-                # Per-layer input: narrow dim=2 to get [B, T, 1, D], then
-                # view to [B, T, D] for this layer.
-                if pli_tensor_ref and pli_block_name in block_inputs:
-                    narrow_out = f"pli_narrow_layer{layer_idx}"
-                    pli_slice_name = f"pli_slice_layer{layer_idx}"
-                    op_id += 1
-                    new_nodes.append(
-                        OpIR(
-                            id=op_id,
-                            name=f"narrow_pli_{layer_idx}",
-                            kernel_type="narrow",
-                            inputs=[pli_tensor_ref],
-                            outputs=[narrow_out],
-                            attrs={"dim": 2, "start": layer_idx, "length": 1},
-                        )
-                    )
-                    op_id += 1
-                    new_nodes.append(
-                        OpIR(
-                            id=op_id,
-                            name=f"view_pli_{layer_idx}",
-                            kernel_type="view",
-                            inputs=[narrow_out],
-                            outputs=[pli_slice_name],
-                            # narrow dim=2 produced [B, T, 1, PLI_D]; collapse the
-                            # singleton to [B, T, PLI_D]. Without this, shape
-                            # inference defaults to [1] and the saved activation is
-                            # misinterpreted during backward recompute (all NaNs
-                            # downstream of the PLI gating).
-                            attrs={"shape": ["B", "T", "PLI_D"]},
-                        )
-                    )
-                    mapping[pli_block_name] = pli_slice_name
-                    # Save PLI narrow+view outputs for backward replay (stack-allocated,
-                    # freed after forward layer boundary).
-                    new_save.append(narrow_out)
-                    new_save.append(pli_slice_name)
+                pli_needs_slice = bool(pli_tensor_ref and pli_block_name in block_inputs)
+                pli_slice_emitted = False
+                narrow_out = f"pli_narrow_layer{layer_idx}"
+                pli_slice_name = f"pli_slice_layer{layer_idx}"
 
                 # KV sharing: wire kv_source to the source layer's qkv_rope
                 if layer_idx in kv_sharing_map and "kv_source" in block_inputs:
@@ -1065,6 +1034,38 @@ def _inline_stacked_blocks(
 
                 # Inline block nodes
                 for bnode in block_graph.nodes:
+                    if pli_needs_slice and not pli_slice_emitted and pli_block_name in bnode.inputs:
+                        op_id += 1
+                        new_nodes.append(
+                            OpIR(
+                                id=op_id,
+                                name=f"narrow_pli_{layer_idx}",
+                                kernel_type="narrow",
+                                inputs=[pli_tensor_ref],
+                                outputs=[narrow_out],
+                                attrs={"dim": 2, "start": layer_idx, "length": 1},
+                            )
+                        )
+                        op_id += 1
+                        new_nodes.append(
+                            OpIR(
+                                id=op_id,
+                                name=f"view_pli_{layer_idx}",
+                                kernel_type="view",
+                                inputs=[narrow_out],
+                                outputs=[pli_slice_name],
+                                # narrow dim=2 produced [B, T, 1, PLI_D]; collapse the
+                                # singleton to [B, T, PLI_D]. Without this, shape
+                                # inference defaults to [1] and backward replay
+                                # misinterprets the saved activation.
+                                attrs={"shape": ["B", "T", "PLI_D"]},
+                            )
+                        )
+                        mapping[pli_block_name] = pli_slice_name
+                        # Save PLI narrow+view outputs for backward replay.
+                        new_save.append(narrow_out)
+                        new_save.append(pli_slice_name)
+                        pli_slice_emitted = True
                     op_id += 1
                     mapped_inputs = [mapping.get(i, f"{prefix}{i}") for i in bnode.inputs]
                     mapped_outputs = [mapping.get(o, f"{prefix}{o}") for o in bnode.outputs]

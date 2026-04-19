@@ -18,6 +18,8 @@ Key architectural features:
 
 from __future__ import annotations
 
+import struct
+
 from .. import nn
 from ..modules import LMHead, RMSNorm, ScaledEmbedding
 from ..blocks.gemma4 import (
@@ -30,6 +32,19 @@ from ..blocks.gemma4 import (
 from ..hf import fuse
 from ..blocks.gemma4 import GEMMA4_MODEL_NAME_REMAP
 from ..specs import ActivationScope
+
+
+def _round_bf16_scalar(value: float) -> float:
+    """Round a Python float to the nearest representable BF16 value.
+
+    HF Gemma4 stores ``embed_scale`` as a BF16 buffer and multiplies embeddings
+    by that rounded constant. Matching that rounding removes a small but
+    systematic scale drift at layer 0.
+    """
+    bits = struct.unpack("<I", struct.pack("<f", float(value)))[0]
+    bits += 0x7FFF + ((bits >> 16) & 1)
+    rounded = bits & 0xFFFF0000
+    return struct.unpack("<f", struct.pack("<I", rounded))[0]
 
 
 def _parse_gemma4_layer_types(
@@ -135,8 +150,12 @@ def _build_gemma4_model(
     eps,
     sliding_window,
     layer_types,
+    sliding_rope_theta,
+    sliding_rope_type,
     global_head_dim,
     global_num_kv_heads,
+    full_rope_theta,
+    full_rope_type,
     full_partial_rotary_factor,
     d_per_layer_input,
     vocab_size_per_layer_input,
@@ -160,7 +179,11 @@ def _build_gemma4_model(
     cls.head_size = head_size
     cls.eps = eps
     cls.sliding_window = sliding_window
+    cls.sliding_rope_theta = sliding_rope_theta
+    cls.sliding_rope_type = sliding_rope_type
     cls.global_head_dim = global_head_dim
+    cls.full_rope_theta = full_rope_theta
+    cls.full_rope_type = full_rope_type
     cls.full_partial_rotary_factor = full_partial_rotary_factor
     cls.d_per_layer_input = d_per_layer_input
     cls.vocab_size_per_layer_input = vocab_size_per_layer_input
@@ -285,6 +308,7 @@ def _build_gemma4_model(
                         d_ff=d_ff,
                         max_seq=max_seq,
                         partial_rotary_factor=full_partial_rotary_factor,
+                        proportional_rope=(full_rope_type == "proportional"),
                         k_eq_v=k_eq_v,
                         d_per_layer_input=d_per_layer_input,
                         eps=eps,
@@ -306,6 +330,7 @@ def _build_gemma4_model(
                     head_size=head_size,
                     d_ff=d_ff,
                     max_seq=max_seq,
+                    sliding_window=sliding_window,
                     partial_rotary_factor=1.0,
                     d_per_layer_input=d_per_layer_input,
                     use_double_wide_mlp=use_double_wide_mlp,
@@ -328,6 +353,7 @@ def _build_gemma4_model(
                     d_ff=d_ff,
                     max_seq=max_seq,
                     partial_rotary_factor=full_partial_rotary_factor,
+                    proportional_rope=(full_rope_type == "proportional"),
                     d_per_layer_input=d_per_layer_input,
                     use_double_wide_mlp=use_double_wide_mlp,
                     eps=eps,
@@ -335,7 +361,7 @@ def _build_gemma4_model(
             )
         )
 
-    cls.embedding = ScaledEmbedding(vocab_size, d_model)
+    cls.embedding = ScaledEmbedding(vocab_size, d_model, embed_scale=_round_bf16_scalar(float(d_model) ** 0.5))
 
     # Per-layer input embeddings (only when d_per_layer_input > 0)
     if d_per_layer_input > 0:
@@ -442,8 +468,12 @@ def _gemma4_forward(model, token_ids, position_ids, targets):
     eps="rms_norm_eps",
     sliding_window="sliding_window",
     layer_types="layer_types",
+    sliding_rope_theta="rope_parameters.sliding_attention.rope_theta",
+    sliding_rope_type="rope_parameters.sliding_attention.rope_type",
     global_head_dim="global_head_dim",
     global_num_kv_heads="num_global_key_value_heads",
+    full_rope_theta="rope_parameters.full_attention.rope_theta",
+    full_rope_type="rope_parameters.full_attention.rope_type",
     full_partial_rotary_factor="rope_parameters.full_attention.partial_rotary_factor",
     d_per_layer_input="hidden_size_per_layer_input",
     vocab_size_per_layer_input="vocab_size_per_layer_input",
@@ -478,8 +508,12 @@ class Gemma4CausalModel(nn.Model):
         eps: float = 1e-6,
         sliding_window: int = 512,
         layer_types: list[str] | None = None,
+        sliding_rope_theta: float = 10000.0,
+        sliding_rope_type: str = "default",
         global_head_dim: int = 512,
         global_num_kv_heads: int | None = None,
+        full_rope_theta: float = 1000000.0,
+        full_rope_type: str = "proportional",
         full_partial_rotary_factor: float = 0.25,
         d_per_layer_input: int = 256,
         vocab_size_per_layer_input: int = 262144,
@@ -506,8 +540,12 @@ class Gemma4CausalModel(nn.Model):
             eps,
             sliding_window,
             layer_types,
+            sliding_rope_theta,
+            sliding_rope_type,
             global_head_dim,
             global_num_kv_heads,
+            full_rope_theta,
+            full_rope_type,
             full_partial_rotary_factor,
             d_per_layer_input,
             vocab_size_per_layer_input,
@@ -539,8 +577,12 @@ class Gemma4CausalModel(nn.Model):
     eps="text_config.rms_norm_eps",
     sliding_window="text_config.sliding_window",
     layer_types="text_config.layer_types",
+    sliding_rope_theta="text_config.rope_parameters.sliding_attention.rope_theta",
+    sliding_rope_type="text_config.rope_parameters.sliding_attention.rope_type",
     global_head_dim="text_config.global_head_dim",
     global_num_kv_heads="text_config.num_global_key_value_heads",
+    full_rope_theta="text_config.rope_parameters.full_attention.rope_theta",
+    full_rope_type="text_config.rope_parameters.full_attention.rope_type",
     full_partial_rotary_factor="text_config.rope_parameters.full_attention.partial_rotary_factor",
     d_per_layer_input="text_config.hidden_size_per_layer_input",
     vocab_size_per_layer_input="text_config.vocab_size_per_layer_input",
@@ -575,8 +617,12 @@ class Gemma4ConditionalModel(nn.Model):
         eps: float = 1e-6,
         sliding_window: int = 512,
         layer_types: list[str] | None = None,
+        sliding_rope_theta: float = 10000.0,
+        sliding_rope_type: str = "default",
         global_head_dim: int = 512,
         global_num_kv_heads: int | None = None,
+        full_rope_theta: float = 1000000.0,
+        full_rope_type: str = "proportional",
         full_partial_rotary_factor: float = 0.25,
         d_per_layer_input: int = 256,
         vocab_size_per_layer_input: int = 262144,
@@ -603,8 +649,12 @@ class Gemma4ConditionalModel(nn.Model):
             eps,
             sliding_window,
             layer_types,
+            sliding_rope_theta,
+            sliding_rope_type,
             global_head_dim,
             global_num_kv_heads,
+            full_rope_theta,
+            full_rope_type,
             full_partial_rotary_factor,
             d_per_layer_input,
             vocab_size_per_layer_input,

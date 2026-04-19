@@ -9,6 +9,7 @@
 #include <array>
 #include <cstddef>
 #include <memory>
+#include <string_view>
 #include <vector>
 
 #include <cuda_runtime.h>
@@ -106,6 +107,8 @@ public:
     modules::ScratchBuffers& scratch() {
         return mScratch;
     }
+    Tensor& rope_freqs(std::string_view name);
+    const Tensor& rope_freqs(std::string_view name) const;
 
     Tensor& get_residual(int layer_idx, cudaStream_t stream);
     Tensor& get_final_residual();
@@ -302,6 +305,7 @@ private:
     modules::NonBlockGradientBuffers mNonBlockGradients;
     modules::ScratchBuffers mScratch;
     TensorSlotRegistry mSlotRegistry;
+    std::vector<Tensor> mPerLayerRopeFreqs;
 
     std::vector<modules::SimplifiedLayerActivations> mSimplifiedActivations;
     std::vector<modules::SimplifiedLayerGradients> mSimplifiedGradients;

@@ -1912,6 +1912,7 @@ void GraphExecutor::backward_with_custom_dloss(Tensor inputs,
 
 void GraphExecutor::set_doc_masking(const std::int32_t* cu_seqlens_cpu, int num_docs, int max_seqlen, int total_q) {
     const int count = num_docs + 1;
+    mCuSeqlensCpu.assign(cu_seqlens_cpu, cu_seqlens_cpu + count);
     // Reallocate GPU buffer if size changed
     if (mCuSeqlensGpu && mCuSeqlensCount != count) {
         CUDA_CHECK(cudaFree(mCuSeqlensGpu));
@@ -1930,7 +1931,7 @@ void GraphExecutor::set_doc_masking(const std::int32_t* cu_seqlens_cpu, int num_
     mDocMaskingMaxSeqlen = max_seqlen;
     mDocMaskingTotalQ = total_q;
     if (mCompiledExecutor) {
-        mCompiledExecutor->set_doc_masking_context(mCuSeqlensGpu, num_docs, max_seqlen, total_q);
+        mCompiledExecutor->set_doc_masking_context(mCuSeqlensGpu, mCuSeqlensCpu.data(), num_docs, max_seqlen, total_q);
     }
 }
 

@@ -873,6 +873,7 @@ class Gemma4Attention(Module):
         max_seq: int,
         sliding_window: int | None = None,
         partial_rotary_factor: float = 1.0,
+        proportional_rope: bool | None = None,
         k_eq_v: bool = False,
         eps: float = 1e-6,
     ) -> None:
@@ -884,6 +885,9 @@ class Gemma4Attention(Module):
         self.max_seq = max_seq
         self.sliding_window = sliding_window
         self.partial_rotary_factor = partial_rotary_factor
+        if proportional_rope is None:
+            proportional_rope = sliding_window is None and partial_rotary_factor < 1.0
+        self.proportional_rope = proportional_rope
         self.k_eq_v = k_eq_v
         self.eps = eps
 
@@ -899,7 +903,9 @@ class Gemma4Attention(Module):
             # Q+K+V
             self.QKV = (self.Hq + 2 * self.Hkv) * self.D
         self.AttnDim = self.Hq * self.D
-        self.RotaryDim = _resolve_rotary_dim(head_size, partial_rotary_factor)
+        # HF Gemma4 proportional RoPE rotates the full head with trailing
+        # zero frequencies, not a GLM-style contiguous prefix.
+        self.RotaryDim = head_size if proportional_rope else _resolve_rotary_dim(head_size, partial_rotary_factor)
 
         # Override HF mapping for k_eq_v
         if k_eq_v:
@@ -1182,7 +1188,9 @@ class Gemma4SharedKVAttention(Module):
         num_kv_heads: int,
         head_size: int,
         max_seq: int,
+        sliding_window: int | None = None,
         partial_rotary_factor: float = 0.25,
+        proportional_rope: bool | None = None,
         eps: float = 1e-6,
     ) -> None:
         super().__init__()
@@ -1191,7 +1199,11 @@ class Gemma4SharedKVAttention(Module):
         self.num_kv_heads = num_kv_heads
         self.head_size = head_size
         self.max_seq = max_seq
+        self.sliding_window = sliding_window
         self.partial_rotary_factor = partial_rotary_factor
+        if proportional_rope is None:
+            proportional_rope = sliding_window is None and partial_rotary_factor < 1.0
+        self.proportional_rope = proportional_rope
         self.eps = eps
 
         self.C = Dim("C")
@@ -1201,7 +1213,7 @@ class Gemma4SharedKVAttention(Module):
         self.MaxSeq = Dim("MaxSeq")
         self.QDim = self.Hq * self.D
         self.AttnDim = self.Hq * self.D
-        self.RotaryDim = _resolve_rotary_dim(head_size, partial_rotary_factor)
+        self.RotaryDim = head_size if proportional_rope else _resolve_rotary_dim(head_size, partial_rotary_factor)
 
     def _trace(self, tracer: Tracer, *args: Proxy, **kwargs: Any) -> Proxy:
         g = tracer.graph
@@ -1309,12 +1321,15 @@ class Gemma4SharedKVAttention(Module):
         qkv_final = g.concat(q_roped, kv_part, dim=2, split_size=[self.num_query_heads, 2 * self.num_kv_heads])
 
         # Gemma4 uses softmax_scale=1.0 (see Gemma4Attention above for why).
+        fa_kwargs: dict[str, Any] = {"causal": True, "softmax_scale": 1.0}
+        if self.sliding_window is not None:
+            fa_kwargs["window_size"] = self.sliding_window
+
         attn_out, lse = g.flash_attention(
             qkv_final,
-            causal=True,
-            softmax_scale=1.0,
             out_name=att_slot,
             lse_name=tracer.prefixed("lse"),
+            **fa_kwargs,
         )
 
         # Output projection

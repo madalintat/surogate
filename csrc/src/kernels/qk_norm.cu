@@ -408,10 +408,10 @@ void launch_backward_dweight_fp32(float* d_weight,
 
 template <typename floatX>
 __device__ __forceinline__ void
-load_cos_sin(const floatX* freqs_cis, int pos, int head_size, int pair_idx, float& c, float& s) {
+load_cos_sin(const floatX* freqs_cis, int pos, int freq_row_width, int pair_idx, float& c, float& s) {
     // freqs_cis stores interleaved cos/sin pairs: [cos0, sin0, cos1, sin1, ...]
     // indexed by pair_idx in [0, head_size/2).
-    const int base = pos * head_size + 2 * pair_idx;
+    const int base = pos * freq_row_width + 2 * pair_idx;
     c = to_float(freqs_cis[base + 0]);
     s = to_float(freqs_cis[base + 1]);
 }
@@ -430,6 +430,8 @@ __global__ void qkv_qk_norm_rope_forward_kernel(floatX* qkv,
                                                 int Hq,
                                                 int Hkv,
                                                 int head_size,
+                                                int rotary_dim,
+                                                int freq_row_width,
                                                 int qkv_channels) {
     // One warp per (token, head) vector. Supports head_size/2 multiple of 32.
     constexpr int WARP = 32;
@@ -453,6 +455,7 @@ __global__ void qkv_qk_norm_rope_forward_kernel(floatX* qkv,
     const int pos = position_ids ? position_ids[token_idx] : t;
 
     const int half = head_size / 2;
+    const int rotary_half = rotary_dim / 2;
     if ((half % WARP) != 0) return;  // unsupported shape
 
     // Compute mean square over head_size.
@@ -482,11 +485,14 @@ __global__ void qkv_qk_norm_rope_forward_kernel(floatX* qkv,
         const float y0 = (v0 * s) * w0;
         const float y1 = (v1 * s) * w1;
 
-        float c, sin;
-        load_cos_sin(freqs_cis, pos, head_size, i, c, sin);
-
-        const float o0 = y0 * c - y1 * sin;
-        const float o1 = y1 * c + y0 * sin;
+        float o0 = y0;
+        float o1 = y1;
+        if (i < rotary_half) {
+            float c, sin;
+            load_cos_sin(freqs_cis, pos, freq_row_width, i, c, sin);
+            o0 = y0 * c - y1 * sin;
+            o1 = y1 * c + y0 * sin;
+        }
 
         x[i] = from_float<floatX>(o0);
         x[i + half] = from_float<floatX>(o1);
@@ -505,6 +511,8 @@ __global__ void qkv_head_rmsnorm_rope_backward_dx_kernel(floatX* d_qkv,
                                                          int qkv_channels,
                                                          int num_heads,
                                                          int head_size,
+                                                         int rotary_dim,
+                                                         int freq_row_width,
                                                          int channel_offset,
                                                          float* abs_max_ptr) {
     constexpr int WARP = 32;
@@ -529,6 +537,7 @@ __global__ void qkv_head_rmsnorm_rope_backward_dx_kernel(floatX* d_qkv,
     floatX* dptr = (!active) ? nullptr : d_qkv + token_idx * qkv_channels + channel_offset + head_idx * head_size;
 
     const int half = head_size / 2;
+    const int rotary_half = rotary_dim / 2;
     if ((half % WARP) != 0) return;
 
     // dot = sum(dy_pre * out_pre) over head_size.
@@ -542,14 +551,20 @@ __global__ void qkv_head_rmsnorm_rope_backward_dx_kernel(floatX* d_qkv,
             const float dy0 = to_float(dptr[i]);
             const float dy1 = to_float(dptr[i + half]);
 
-            float c, sin;
-            load_cos_sin(freqs_cis, pos, head_size, i, c, sin);
+            float out0 = o0;
+            float out1 = o1;
+            float d0 = dy0;
+            float d1 = dy1;
+            if (i < rotary_half) {
+                float c, sin;
+                load_cos_sin(freqs_cis, pos, freq_row_width, i, c, sin);
 
-            // Inverse RoPE: a0 = b0*c + b1*s; a1 = b1*c - b0*s
-            const float out0 = o0 * c + o1 * sin;
-            const float out1 = o1 * c - o0 * sin;
-            const float d0 = dy0 * c + dy1 * sin;
-            const float d1 = dy1 * c - dy0 * sin;
+                // Inverse RoPE: a0 = b0*c + b1*s; a1 = b1*c - b0*s
+                out0 = o0 * c + o1 * sin;
+                out1 = o1 * c - o0 * sin;
+                d0 = dy0 * c + dy1 * sin;
+                d1 = dy1 * c - dy0 * sin;
+            }
 
             dot += d0 * out0 + d1 * out1;
         }
@@ -575,13 +590,18 @@ __global__ void qkv_head_rmsnorm_rope_backward_dx_kernel(floatX* d_qkv,
             const float dy0 = to_float(dptr[i]);
             const float dy1 = to_float(dptr[i + half]);
 
-            float c, sin;
-            load_cos_sin(freqs_cis, pos, head_size, i, c, sin);
-
-            const float out0 = o0 * c + o1 * sin;
-            const float out1 = o1 * c - o0 * sin;
-            const float d0 = dy0 * c + dy1 * sin;
-            const float d1 = dy1 * c - dy0 * sin;
+            float out0 = o0;
+            float out1 = o1;
+            float d0 = dy0;
+            float d1 = dy1;
+            if (i < rotary_half) {
+                float c, sin;
+                load_cos_sin(freqs_cis, pos, freq_row_width, i, c, sin);
+                out0 = o0 * c + o1 * sin;
+                out1 = o1 * c - o0 * sin;
+                d0 = dy0 * c + dy1 * sin;
+                d1 = dy1 * c - dy0 * sin;
+            }
 
             const float w0 = to_float(weight[i]);
             const float w1 = to_float(weight[i + half]);
@@ -627,6 +647,8 @@ __global__ void qkv_head_rmsnorm_rope_backward_dweight_kernel(floatX* d_weight,
                                                               int qkv_channels,
                                                               int num_heads,
                                                               int head_size,
+                                                              int rotary_dim,
+                                                              int freq_row_width,
                                                               int channel_offset,
                                                               bool accumulate) {
     const int c = static_cast<int>(blockIdx.x);
@@ -636,6 +658,7 @@ __global__ void qkv_head_rmsnorm_rope_backward_dweight_kernel(floatX* d_weight,
     const float inv_w = (wf != 0.f) ? (1.0f / wf) : 0.0f;
 
     const int half = head_size / 2;
+    const int rotary_half = rotary_dim / 2;
     float sum = 0.f;
 
     const int total_vecs = tokens * num_heads;
@@ -656,10 +679,15 @@ __global__ void qkv_head_rmsnorm_rope_backward_dweight_kernel(floatX* d_weight,
             const float dy0 = to_float(dptr[c]);
             const float dy1 = to_float(dptr[c + half]);
 
-            float cosv, sinv;
-            load_cos_sin(freqs_cis, pos, head_size, c, cosv, sinv);
-            out_c = o0 * cosv + o1 * sinv;
-            dy_c = dy0 * cosv + dy1 * sinv;
+            if (c < rotary_half) {
+                float cosv, sinv;
+                load_cos_sin(freqs_cis, pos, freq_row_width, c, cosv, sinv);
+                out_c = o0 * cosv + o1 * sinv;
+                dy_c = dy0 * cosv + dy1 * sinv;
+            } else {
+                out_c = o0;
+                dy_c = dy0;
+            }
         } else {
             const int p = c - half;
             const float o0 = to_float(outp[p]);
@@ -667,10 +695,15 @@ __global__ void qkv_head_rmsnorm_rope_backward_dweight_kernel(floatX* d_weight,
             const float dy0 = to_float(dptr[p]);
             const float dy1 = to_float(dptr[p + half]);
 
-            float cosv, sinv;
-            load_cos_sin(freqs_cis, pos, head_size, p, cosv, sinv);
-            out_c = o1 * cosv - o0 * sinv;
-            dy_c = dy1 * cosv - dy0 * sinv;
+            if (p < rotary_half) {
+                float cosv, sinv;
+                load_cos_sin(freqs_cis, pos, freq_row_width, p, cosv, sinv);
+                out_c = o1 * cosv - o0 * sinv;
+                dy_c = dy1 * cosv - dy0 * sinv;
+            } else {
+                out_c = o1;
+                dy_c = dy1;
+            }
         }
 
         sum += dy_c * out_c;
@@ -703,6 +736,8 @@ __global__ void qkv_head_rmsnorm_rope_backward_dweight_fp32_kernel(float* d_weig
                                                                    int qkv_channels,
                                                                    int num_heads,
                                                                    int head_size,
+                                                                   int rotary_dim,
+                                                                   int freq_row_width,
                                                                    int channel_offset,
                                                                    bool accumulate) {
     const int c = static_cast<int>(blockIdx.x);
@@ -712,6 +747,7 @@ __global__ void qkv_head_rmsnorm_rope_backward_dweight_fp32_kernel(float* d_weig
     const float inv_w = (wf != 0.f) ? (1.0f / wf) : 0.0f;
 
     const int half = head_size / 2;
+    const int rotary_half = rotary_dim / 2;
     float sum = 0.f;
 
     const int total_vecs = tokens * num_heads;
@@ -732,10 +768,15 @@ __global__ void qkv_head_rmsnorm_rope_backward_dweight_fp32_kernel(float* d_weig
             const float dy0 = to_float(dptr[c]);
             const float dy1 = to_float(dptr[c + half]);
 
-            float cosv, sinv;
-            load_cos_sin(freqs_cis, pos, head_size, c, cosv, sinv);
-            out_c = o0 * cosv + o1 * sinv;
-            dy_c = dy0 * cosv + dy1 * sinv;
+            if (c < rotary_half) {
+                float cosv, sinv;
+                load_cos_sin(freqs_cis, pos, freq_row_width, c, cosv, sinv);
+                out_c = o0 * cosv + o1 * sinv;
+                dy_c = dy0 * cosv + dy1 * sinv;
+            } else {
+                out_c = o0;
+                dy_c = dy0;
+            }
         } else {
             const int p = c - half;
             const float o0 = to_float(outp[p]);
@@ -743,10 +784,15 @@ __global__ void qkv_head_rmsnorm_rope_backward_dweight_fp32_kernel(float* d_weig
             const float dy0 = to_float(dptr[p]);
             const float dy1 = to_float(dptr[p + half]);
 
-            float cosv, sinv;
-            load_cos_sin(freqs_cis, pos, head_size, p, cosv, sinv);
-            out_c = o1 * cosv - o0 * sinv;
-            dy_c = dy1 * cosv - dy0 * sinv;
+            if (p < rotary_half) {
+                float cosv, sinv;
+                load_cos_sin(freqs_cis, pos, freq_row_width, p, cosv, sinv);
+                out_c = o1 * cosv - o0 * sinv;
+                dy_c = dy1 * cosv - dy0 * sinv;
+            } else {
+                out_c = o1;
+                dy_c = dy1;
+            }
         }
 
         sum += dy_c * out_c;
@@ -808,6 +854,8 @@ void launch_qk_norm_rope_forward(floatX* qkv,
                                  int Hq,
                                  int Hkv,
                                  int head_size,
+                                 int rotary_dim,
+                                 int freq_row_width,
                                  int qkv_channels,
                                  cudaStream_t stream) {
     constexpr int block_y = 4;
@@ -826,6 +874,8 @@ void launch_qk_norm_rope_forward(floatX* qkv,
                                                                         Hq,
                                                                         Hkv,
                                                                         head_size,
+                                                                        rotary_dim,
+                                                                        freq_row_width,
                                                                         qkv_channels);
     CUDA_CHECK(cudaGetLastError());
 }
@@ -842,6 +892,8 @@ void launch_rmsnorm_rope_backward_dx(floatX* d_qkv,
                                      int qkv_channels,
                                      int num_heads,
                                      int head_size,
+                                     int rotary_dim,
+                                     int freq_row_width,
                                      int channel_offset,
                                      cudaStream_t stream,
                                      float* abs_max_ptr) {
@@ -859,6 +911,8 @@ void launch_rmsnorm_rope_backward_dx(floatX* d_qkv,
                                                                                  qkv_channels,
                                                                                  num_heads,
                                                                                  head_size,
+                                                                                 rotary_dim,
+                                                                                 freq_row_width,
                                                                                  channel_offset,
                                                                                  abs_max_ptr);
     CUDA_CHECK(cudaGetLastError());
@@ -876,6 +930,8 @@ void launch_rmsnorm_rope_backward_dweight(floatX* d_weight,
                                           int qkv_channels,
                                           int num_heads,
                                           int head_size,
+                                          int rotary_dim,
+                                          int freq_row_width,
                                           int channel_offset,
                                           bool accumulate,
                                           cudaStream_t stream) {
@@ -892,6 +948,8 @@ void launch_rmsnorm_rope_backward_dweight(floatX* d_weight,
                                                                                       qkv_channels,
                                                                                       num_heads,
                                                                                       head_size,
+                                                                                      rotary_dim,
+                                                                                      freq_row_width,
                                                                                       channel_offset,
                                                                                       accumulate);
     CUDA_CHECK(cudaGetLastError());
@@ -909,6 +967,8 @@ void launch_rmsnorm_rope_backward_dweight_fp32(float* d_weight,
                                                int qkv_channels,
                                                int num_heads,
                                                int head_size,
+                                               int rotary_dim,
+                                               int freq_row_width,
                                                int channel_offset,
                                                bool accumulate,
                                                cudaStream_t stream) {
@@ -925,6 +985,8 @@ void launch_rmsnorm_rope_backward_dweight_fp32(float* d_weight,
                                                                                            qkv_channels,
                                                                                            num_heads,
                                                                                            head_size,
+                                                                                           rotary_dim,
+                                                                                           freq_row_width,
                                                                                            channel_offset,
                                                                                            accumulate);
     CUDA_CHECK(cudaGetLastError());
@@ -1203,6 +1265,7 @@ void qkv_qk_norm_rope_forward(Tensor& qkv,
                               int Hq,
                               int Hkv,
                               int head_size,
+                              int rotary_dim,
                               cudaStream_t stream) {
     if (qkv.DType != q_weight.DType || qkv.DType != k_weight.DType || qkv.DType != freqs_cis.DType) {
         throw std::logic_error("qkv_qk_norm_rope_forward: dtype mismatch");
@@ -1230,8 +1293,13 @@ void qkv_qk_norm_rope_forward(Tensor& qkv,
     if (((head_size / 2) % WARP_SIZE) != 0) {
         throw std::logic_error("qkv_qk_norm_rope_forward: head_size/2 must be a multiple of 32");
     }
-    // freqs_cis is expected to be at least (max_pos, head_size) with interleaved cos/sin pairs.
-    if (freqs_cis.Rank < 2 || freqs_cis.Sizes[1] < head_size) {
+    if (rotary_dim <= 0 || rotary_dim > head_size || (rotary_dim % 2) != 0) {
+        throw std::logic_error("qkv_qk_norm_rope_forward: invalid rotary_dim");
+    }
+    const int freq_row_width = (freqs_cis.Rank >= 3 && freqs_cis.Sizes[2] == 2)
+                                   ? static_cast<int>(freqs_cis.Sizes[1] * freqs_cis.Sizes[2])
+                                   : (freqs_cis.Rank >= 2 ? static_cast<int>(freqs_cis.Sizes[1]) : 0);
+    if (freq_row_width < rotary_dim) {
         throw std::logic_error("qkv_qk_norm_rope_forward: unexpected freqs_cis shape");
     }
 
@@ -1249,6 +1317,8 @@ void qkv_qk_norm_rope_forward(Tensor& qkv,
                                     Hq,
                                     Hkv,
                                     head_size,
+                                    rotary_dim,
+                                    freq_row_width,
                                     qkv_channels,
                                     stream);
     } else if (qkv.DType == ETensorDType::FP32) {
@@ -1265,6 +1335,8 @@ void qkv_qk_norm_rope_forward(Tensor& qkv,
                                     Hq,
                                     Hkv,
                                     head_size,
+                                    rotary_dim,
+                                    freq_row_width,
                                     qkv_channels,
                                     stream);
     } else {
@@ -1283,6 +1355,7 @@ void qkv_head_rmsnorm_rope_backward_dx(Tensor& d_qkv,
                                        int qkv_channels,
                                        int num_heads,
                                        int head_size,
+                                       int rotary_dim,
                                        int channel_offset,
                                        cudaStream_t stream,
                                        float* abs_max_ptr) {
@@ -1299,6 +1372,15 @@ void qkv_head_rmsnorm_rope_backward_dx(Tensor& d_qkv,
     if (((head_size / 2) % WARP_SIZE) != 0) {
         throw std::logic_error("qkv_head_rmsnorm_rope_backward_dx: head_size/2 must be a multiple of 32");
     }
+    if (rotary_dim <= 0 || rotary_dim > head_size || (rotary_dim % 2) != 0) {
+        throw std::logic_error("qkv_head_rmsnorm_rope_backward_dx: invalid rotary_dim");
+    }
+    const int freq_row_width = (freqs_cis.Rank >= 3 && freqs_cis.Sizes[2] == 2)
+                                   ? static_cast<int>(freqs_cis.Sizes[1] * freqs_cis.Sizes[2])
+                                   : (freqs_cis.Rank >= 2 ? static_cast<int>(freqs_cis.Sizes[1]) : 0);
+    if (freq_row_width < rotary_dim) {
+        throw std::logic_error("qkv_head_rmsnorm_rope_backward_dx: unexpected freqs_cis shape");
+    }
 
     if (d_qkv.DType == ETensorDType::BF16) {
         launch_rmsnorm_rope_backward_dx(d_qkv.get<nv_bfloat16>(),
@@ -1312,6 +1394,8 @@ void qkv_head_rmsnorm_rope_backward_dx(Tensor& d_qkv,
                                         qkv_channels,
                                         num_heads,
                                         head_size,
+                                        rotary_dim,
+                                        freq_row_width,
                                         channel_offset,
                                         stream,
                                         abs_max_ptr);
@@ -1327,6 +1411,8 @@ void qkv_head_rmsnorm_rope_backward_dx(Tensor& d_qkv,
                                         qkv_channels,
                                         num_heads,
                                         head_size,
+                                        rotary_dim,
+                                        freq_row_width,
                                         channel_offset,
                                         stream,
                                         abs_max_ptr);
@@ -1346,6 +1432,7 @@ void qkv_head_rmsnorm_rope_backward_dweight(Tensor& d_weight,
                                             int qkv_channels,
                                             int num_heads,
                                             int head_size,
+                                            int rotary_dim,
                                             int channel_offset,
                                             bool accumulate,
                                             cudaStream_t stream) {
@@ -1363,6 +1450,15 @@ void qkv_head_rmsnorm_rope_backward_dweight(Tensor& d_weight,
     if (((head_size / 2) % WARP_SIZE) != 0) {
         throw std::logic_error("qkv_head_rmsnorm_rope_backward_dweight: head_size/2 must be a multiple of 32");
     }
+    if (rotary_dim <= 0 || rotary_dim > head_size || (rotary_dim % 2) != 0) {
+        throw std::logic_error("qkv_head_rmsnorm_rope_backward_dweight: invalid rotary_dim");
+    }
+    const int freq_row_width = (freqs_cis.Rank >= 3 && freqs_cis.Sizes[2] == 2)
+                                   ? static_cast<int>(freqs_cis.Sizes[1] * freqs_cis.Sizes[2])
+                                   : (freqs_cis.Rank >= 2 ? static_cast<int>(freqs_cis.Sizes[1]) : 0);
+    if (freq_row_width < rotary_dim) {
+        throw std::logic_error("qkv_head_rmsnorm_rope_backward_dweight: unexpected freqs_cis shape");
+    }
 
     if (d_weight.DType == ETensorDType::BF16) {
         launch_rmsnorm_rope_backward_dweight(d_weight.get<nv_bfloat16>(),
@@ -1376,6 +1472,8 @@ void qkv_head_rmsnorm_rope_backward_dweight(Tensor& d_weight,
                                              qkv_channels,
                                              num_heads,
                                              head_size,
+                                             rotary_dim,
+                                             freq_row_width,
                                              channel_offset,
                                              accumulate,
                                              stream);
@@ -1391,6 +1489,8 @@ void qkv_head_rmsnorm_rope_backward_dweight(Tensor& d_weight,
                                              qkv_channels,
                                              num_heads,
                                              head_size,
+                                             rotary_dim,
+                                             freq_row_width,
                                              channel_offset,
                                              accumulate,
                                              stream);
@@ -1410,6 +1510,7 @@ void qkv_head_rmsnorm_rope_backward_dweight_fp32(Tensor& d_weight_fp32,
                                                  int qkv_channels,
                                                  int num_heads,
                                                  int head_size,
+                                                 int rotary_dim,
                                                  int channel_offset,
                                                  bool accumulate,
                                                  cudaStream_t stream) {
@@ -1429,6 +1530,15 @@ void qkv_head_rmsnorm_rope_backward_dweight_fp32(Tensor& d_weight_fp32,
     if (((head_size / 2) % WARP_SIZE) != 0) {
         throw std::logic_error("qkv_head_rmsnorm_rope_backward_dweight_fp32: head_size/2 must be a multiple of 32");
     }
+    if (rotary_dim <= 0 || rotary_dim > head_size || (rotary_dim % 2) != 0) {
+        throw std::logic_error("qkv_head_rmsnorm_rope_backward_dweight_fp32: invalid rotary_dim");
+    }
+    const int freq_row_width = (freqs_cis.Rank >= 3 && freqs_cis.Sizes[2] == 2)
+                                   ? static_cast<int>(freqs_cis.Sizes[1] * freqs_cis.Sizes[2])
+                                   : (freqs_cis.Rank >= 2 ? static_cast<int>(freqs_cis.Sizes[1]) : 0);
+    if (freq_row_width < rotary_dim) {
+        throw std::logic_error("qkv_head_rmsnorm_rope_backward_dweight_fp32: unexpected freqs_cis shape");
+    }
 
     if (d_qkv.DType == ETensorDType::BF16) {
         launch_rmsnorm_rope_backward_dweight_fp32(d_weight_fp32.get<float>(),
@@ -1442,6 +1552,8 @@ void qkv_head_rmsnorm_rope_backward_dweight_fp32(Tensor& d_weight_fp32,
                                                   qkv_channels,
                                                   num_heads,
                                                   head_size,
+                                                  rotary_dim,
+                                                  freq_row_width,
                                                   channel_offset,
                                                   accumulate,
                                                   stream);
@@ -1457,6 +1569,8 @@ void qkv_head_rmsnorm_rope_backward_dweight_fp32(Tensor& d_weight_fp32,
                                                   qkv_channels,
                                                   num_heads,
                                                   head_size,
+                                                  rotary_dim,
+                                                  freq_row_width,
                                                   channel_offset,
                                                   accumulate,
                                                   stream);
@@ -1472,6 +1586,8 @@ void qkv_head_rmsnorm_rope_backward_dweight_fp32(Tensor& d_weight_fp32,
                                              qkv_channels,
                                              num_heads,
                                              head_size,
+                                             rotary_dim,
+                                             freq_row_width,
                                              channel_offset,
                                              accumulate,
                                              stream);

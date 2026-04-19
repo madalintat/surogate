@@ -352,6 +352,7 @@ private:
 
     // Document masking (Flash Attention varlen) — GPU cu_seqlens buffer
     std::int32_t* mCuSeqlensGpu = nullptr;
+    std::vector<std::int32_t> mCuSeqlensCpu;
     int mCuSeqlensCount = 0;  // num_docs + 1
     int mDocMaskingNumDocs = 0;
     int mDocMaskingMaxSeqlen = 0;

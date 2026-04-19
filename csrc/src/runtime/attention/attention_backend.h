@@ -80,6 +80,10 @@ struct AttentionParams {
     /// support varlen must reject when this is non-null unless the shape
     /// happens to be a single dense document.
     const int32_t* cu_seqlens = nullptr;
+    /// Host mirror of ``cu_seqlens`` when available. Packed-sequence
+    /// fallbacks that need to iterate document ranges use this to avoid a
+    /// per-op device-to-host copy.
+    const int32_t* cu_seqlens_cpu = nullptr;
     int num_docs = 0;
     int max_doc_seqlen = 0;
     int total_doc_tokens = 0;

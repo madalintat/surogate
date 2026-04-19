@@ -143,8 +143,31 @@ float DslModel::validate(Tensor inputs, Tensor position_ids, Tensor targets, NCC
         throw std::logic_error("DslModel::validate called before allocate_run_state()");
     }
 
+    // Packed-sequence validation must mirror forward() so debug/compare tools
+    // see the same document-level attention masking as training.
+    mDocMaskingActive = false;
+    if (mOptions.DocMasking && position_ids.Data && position_ids.Device == -1) {
+        const auto* pos_ptr = reinterpret_cast<const std::int32_t*>(position_ids.Data);
+        const int B = static_cast<int>(inputs.Sizes[0]);
+        const int T = static_cast<int>(inputs.Sizes[1]);
+        const bool mrope = mModelConfig.Rope.is_multimodal();
+        auto doc_info = compute_doc_masking(pos_ptr, B, T, mrope);
+        if (doc_info) {
+            mExecutor->set_doc_masking(doc_info->cu_seqlens.data(),
+                                       doc_info->num_docs,
+                                       doc_info->max_seqlen,
+                                       doc_info->total_q);
+            mDocMaskingActive = true;
+        }
+    }
+
     if (!lora_enabled()) {
-        return mExecutor->validate(inputs, position_ids, targets, comm, micro_step);
+        const float loss = mExecutor->validate(inputs, position_ids, targets, comm, micro_step);
+        if (mDocMaskingActive) {
+            mExecutor->clear_doc_masking();
+            mDocMaskingActive = false;
+        }
+        return loss;
     }
 
     ensure_lora_run_state(comm, (int)inputs.Sizes[0], (int)inputs.Sizes[1]);
@@ -153,7 +176,12 @@ float DslModel::validate(Tensor inputs, Tensor position_ids, Tensor targets, NCC
     mLoRARunState->is_training = false;
     mLoRARunState->micro_step = micro_step;
 
-    return mExecutor->validate(inputs, position_ids, targets, comm, micro_step);
+    const float loss = mExecutor->validate(inputs, position_ids, targets, comm, micro_step);
+    if (mDocMaskingActive) {
+        mExecutor->clear_doc_masking();
+        mDocMaskingActive = false;
+    }
+    return loss;
 }
 
 void DslModel::backward(Tensor inputs, Tensor targets, NCCLCommunicator& comm, int grad_accum_steps, int micro_step) {

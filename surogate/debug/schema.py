@@ -46,6 +46,11 @@ class Tag(str, Enum):
     REFERENCE = "REFERENCE"
     DIFF = "DIFF"
 
+    # Slot-registry audit (DSL-declared globals vs tensors used in the IR)
+    SLOT = "SLOT"
+    TENSOR = "TENSOR"
+    GAP = "GAP"
+
     # Terminal
     SUMMARY = "SUMMARY"
     ERROR = "ERROR"

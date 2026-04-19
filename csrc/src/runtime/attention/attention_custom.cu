@@ -169,22 +169,25 @@ __global__ void __launch_bounds__(512) attention_forward_gpu_kernel(scalar_t* ou
         store.store(scratch + e + E * sub_warp.meta_group_rank());
     }
 
-    if (warp.meta_group_rank() != 0) return;
     __syncthreads();
-    // write result
-    for (int e = vec_t::size * warp.thread_rank(); e < E; e += vec_t::size * warp.size()) {
-        fvec_t res = fvec_t::zeros();
-        for (int j = 0; j < sub_warp.meta_group_size(); ++j) {
-            fvec_t sv = fvec_t::load(scratch + e + E * j);
-            for (int jj = 0; jj < vec_t::size; ++jj) {
-                res[jj] += sv[jj];
+    if (warp.meta_group_rank() == 0) {
+        // All warps must reach the barrier above before warp 0 reduces the
+        // per-subwarp partial outputs from scratch. Returning other warps
+        // before __syncthreads() is illegal and corrupts the reduction.
+        for (int e = vec_t::size * warp.thread_rank(); e < E; e += vec_t::size * warp.size()) {
+            fvec_t res = fvec_t::zeros();
+            for (int j = 0; j < sub_warp.meta_group_size(); ++j) {
+                fvec_t sv = fvec_t::load(scratch + e + E * j);
+                for (int jj = 0; jj < vec_t::size; ++jj) {
+                    res[jj] += sv[jj];
+                }
             }
+            vec_t cv;
+            for (int j = 0; j < vec_t::size; ++j) {
+                cv[j] = (scalar_t)res[j];
+            }
+            cv.store(out + ((b * T + t) * Hq + h) * E + e);
         }
-        vec_t cv;
-        for (int j = 0; j < vec_t::size; ++j) {
-            cv[j] = (scalar_t)res[j];
-        }
-        cv.store(out + ((b * T + t) * Hq + h) * E + e);
     }
 }
 
@@ -798,6 +801,7 @@ __global__ void causal_softmax_lse_kernel(float* scores, float* lse_out, int T, 
     int bh = blockIdx.x, t = blockIdx.y;
     float* row = scores + (static_cast<long long>(bh) * T + t) * T;
     __shared__ float sdata[32];
+    const int num_warps = (blockDim.x + 31) / 32;
     // Scale + max
     float mx = -1e30f;
     for (int j = threadIdx.x; j <= t; j += blockDim.x) {
@@ -808,11 +812,12 @@ __global__ void causal_softmax_lse_kernel(float* scores, float* lse_out, int T, 
         mx = fmaxf(mx, __shfl_down_sync(0xffffffff, mx, o));
     if (threadIdx.x % 32 == 0) sdata[threadIdx.x / 32] = mx;
     __syncthreads();
-    if (threadIdx.x < blockDim.x / 32) {
-        mx = sdata[threadIdx.x];
-        for (int o = 16; o > 0; o >>= 1)
-            mx = fmaxf(mx, __shfl_down_sync(0xffffffff, mx, o));
-        if (threadIdx.x == 0) sdata[0] = mx;
+    if (threadIdx.x == 0) {
+        mx = sdata[0];
+        for (int i = 1; i < num_warps; ++i) {
+            mx = fmaxf(mx, sdata[i]);
+        }
+        sdata[0] = mx;
     }
     __syncthreads();
     mx = sdata[0];
@@ -829,11 +834,12 @@ __global__ void causal_softmax_lse_kernel(float* scores, float* lse_out, int T, 
         se += __shfl_down_sync(0xffffffff, se, o);
     if (threadIdx.x % 32 == 0) sdata[threadIdx.x / 32] = se;
     __syncthreads();
-    if (threadIdx.x < blockDim.x / 32) {
-        se = sdata[threadIdx.x];
-        for (int o = 16; o > 0; o >>= 1)
-            se += __shfl_down_sync(0xffffffff, se, o);
-        if (threadIdx.x == 0) sdata[0] = se;
+    if (threadIdx.x == 0) {
+        se = 0.0f;
+        for (int i = 0; i < num_warps; ++i) {
+            se += sdata[i];
+        }
+        sdata[0] = se;
     }
     __syncthreads();
     se = sdata[0];
@@ -858,14 +864,25 @@ __global__ void bf16_scatter_rows_k(nv_bfloat16* dst, const nv_bfloat16* src, in
 // Causal softmax matching HF eager precision:
 //   BF16 scores * BF16 scale → BF16 (truncated), then FP32 softmax → BF16 output
 // HF: `scores = matmul(Q,K^T) * scaling` in BF16, then `softmax(scores, dtype=float32).to(bf16)`
-__global__ void causal_softmax_bf16_kernel(nv_bfloat16* scores_bf16, float* lse_out, int T, nv_bfloat16 scale_bf16) {
+__global__ void
+causal_softmax_bf16_kernel(nv_bfloat16* scores_bf16, float* lse_out, int T, nv_bfloat16 scale_bf16, int window_size) {
     int bh = blockIdx.x, t = blockIdx.y;
     nv_bfloat16* row = scores_bf16 + (static_cast<long long>(bh) * T + t) * T;
     __shared__ float sdata[32];
+    int start = 0;
+    if (window_size > 0) {
+        start = t - window_size + 1;
+        if (start < 0) start = 0;
+    }
 
     // Apply BF16 scaling in-place (matches HF's `* scaling` in BF16 space)
-    for (int j = threadIdx.x; j <= t; j += blockDim.x)
-        row[j] = __float2bfloat16(__bfloat162float(row[j]) * __bfloat162float(scale_bf16));
+    for (int j = threadIdx.x; j <= t; j += blockDim.x) {
+        if (j < start) {
+            row[j] = __float2bfloat16(-1e30f);
+        } else {
+            row[j] = __float2bfloat16(__bfloat162float(row[j]) * __bfloat162float(scale_bf16));
+        }
+    }
     for (int j = t + 1 + threadIdx.x; j < T; j += blockDim.x)
         row[j] = __float2bfloat16(-1e30f);  // causal mask: -inf for future positions
     __syncthreads();
@@ -885,16 +902,14 @@ __global__ void causal_softmax_bf16_kernel(nv_bfloat16* scores_bf16, float* lse_
         mx = fmaxf(mx, __shfl_down_sync(0xffffffff, mx, o));
     if (threadIdx.x % 32 == 0) sdata[threadIdx.x / 32] = mx;
     __syncthreads();
-    if (num_warps_local > 1) {
-        if (threadIdx.x < num_warps_local) {
-            mx = sdata[threadIdx.x];
-            const unsigned mask = (num_warps_local == 32) ? 0xffffffffu : ((1u << num_warps_local) - 1u);
-            for (int o = num_warps_local >> 1; o > 0; o >>= 1)
-                mx = fmaxf(mx, __shfl_down_sync(mask, mx, o));
-            if (threadIdx.x == 0) sdata[0] = mx;
+    if (threadIdx.x == 0) {
+        mx = sdata[0];
+        for (int i = 1; i < num_warps_local; ++i) {
+            mx = fmaxf(mx, sdata[i]);
         }
-        __syncthreads();
+        sdata[0] = mx;
     }
+    __syncthreads();
     mx = sdata[0];
 
     // Exp + sum
@@ -908,16 +923,14 @@ __global__ void causal_softmax_bf16_kernel(nv_bfloat16* scores_bf16, float* lse_
         se += __shfl_down_sync(0xffffffff, se, o);
     if (threadIdx.x % 32 == 0) sdata[threadIdx.x / 32] = se;
     __syncthreads();
-    if (num_warps_local > 1) {
-        if (threadIdx.x < num_warps_local) {
-            se = sdata[threadIdx.x];
-            const unsigned mask = (num_warps_local == 32) ? 0xffffffffu : ((1u << num_warps_local) - 1u);
-            for (int o = num_warps_local >> 1; o > 0; o >>= 1)
-                se += __shfl_down_sync(mask, se, o);
-            if (threadIdx.x == 0) sdata[0] = se;
+    if (threadIdx.x == 0) {
+        se = 0.0f;
+        for (int i = 0; i < num_warps_local; ++i) {
+            se += sdata[i];
         }
-        __syncthreads();
+        sdata[0] = se;
     }
+    __syncthreads();
     se = sdata[0];
 
     // Normalize → BF16 (matches HF's `.to(query.dtype)`)
@@ -939,7 +952,8 @@ void attention_forward_matmul(Tensor& out,
                               int HS,
                               cublasHandle_t cublas,
                               cudaStream_t stream,
-                              float scale_override) {
+                              float scale_override,
+                              int window_size) {
     const int H = Hq + 2 * Hkv;
     const float scale = (scale_override != 0.0f) ? scale_override : 1.f / sqrtf(static_cast<float>(HS));
     cublasSetStream(cublas, stream);
@@ -990,7 +1004,8 @@ void attention_forward_matmul(Tensor& out,
     causal_softmax_bf16_kernel<<<dim3(B * Hq, T), std::min(256, T), 0, stream>>>(d_scores,
                                                                                  stats.get<float>(),
                                                                                  T,
-                                                                                 scale_bf16);
+                                                                                 scale_bf16,
+                                                                                 window_size);
 
     // Phase 3: attn@V → BF16 output (per head, per batch)
     auto* out_p = out.get<nv_bfloat16>();
@@ -1039,12 +1054,18 @@ __global__ void causal_softmax_backward_bf16_kernel(nv_bfloat16* d_scores,   // 
                                                     const nv_bfloat16* d_P,  // [BH, T, T] input: d_out @ V^T
                                                     const nv_bfloat16* P,    // [BH, T, T] input: softmax output
                                                     int T,
-                                                    float scale) {
+                                                    float scale,
+                                                    int window_size) {
     int bh = blockIdx.x, t = blockIdx.y;
     const nv_bfloat16* dp_row = d_P + (static_cast<long long>(bh) * T + t) * T;
     const nv_bfloat16* p_row = P + (static_cast<long long>(bh) * T + t) * T;
     nv_bfloat16* ds_row = d_scores + (static_cast<long long>(bh) * T + t) * T;
     __shared__ float sdata[32];
+    int start = 0;
+    if (window_size > 0) {
+        start = t - window_size + 1;
+        if (start < 0) start = 0;
+    }
 
     // Compute rowsum(d_P * P) in FP32. Two-stage reduction:
     //   (1) each warp reduces via __shfl_down_sync → lane 0 holds warp sum
@@ -1056,23 +1077,24 @@ __global__ void causal_softmax_backward_bf16_kernel(nv_bfloat16* d_scores,   // 
     //     has the block sum in thread 0).
     //   - In stage 2, use a mask reflecting the actual active threads.
     float dot = 0.f;
-    for (int j = threadIdx.x; j <= t; j += blockDim.x)
-        dot += __bfloat162float(dp_row[j]) * __bfloat162float(p_row[j]);
+    for (int j = threadIdx.x; j <= t; j += blockDim.x) {
+        if (j >= start) {
+            dot += __bfloat162float(dp_row[j]) * __bfloat162float(p_row[j]);
+        }
+    }
     for (int o = 16; o > 0; o >>= 1)
         dot += __shfl_down_sync(0xffffffff, dot, o);
     if (threadIdx.x % 32 == 0) sdata[threadIdx.x / 32] = dot;
     __syncthreads();
     const int num_warps = (blockDim.x + 31) / 32;
-    if (num_warps > 1) {
-        if (threadIdx.x < num_warps) {
-            dot = sdata[threadIdx.x];
-            const unsigned active_mask = (num_warps == 32) ? 0xffffffffu : ((1u << num_warps) - 1u);
-            for (int o = num_warps >> 1; o > 0; o >>= 1)
-                dot += __shfl_down_sync(active_mask, dot, o);
-            if (threadIdx.x == 0) sdata[0] = dot;
+    if (threadIdx.x == 0) {
+        dot = 0.0f;
+        for (int i = 0; i < num_warps; ++i) {
+            dot += sdata[i];
         }
-        __syncthreads();
+        sdata[0] = dot;
     }
+    __syncthreads();
     // Single warp: sdata[0] already holds the full block sum (written by
     // thread 0 in stage 1). Multi-warp: thread 0 above just wrote it. Either
     // way, every thread can now load the block sum from sdata[0].
@@ -1080,9 +1102,13 @@ __global__ void causal_softmax_backward_bf16_kernel(nv_bfloat16* d_scores,   // 
 
     // d_S = P * (d_P - dot) * scale; zero for future positions (causal)
     for (int j = threadIdx.x; j <= t; j += blockDim.x) {
-        float p = __bfloat162float(p_row[j]);
-        float dp = __bfloat162float(dp_row[j]);
-        ds_row[j] = __float2bfloat16(p * (dp - dot) * scale);
+        if (j < start) {
+            ds_row[j] = __float2bfloat16(0.f);
+        } else {
+            float p = __bfloat162float(p_row[j]);
+            float dp = __bfloat162float(dp_row[j]);
+            ds_row[j] = __float2bfloat16(p * (dp - dot) * scale);
+        }
     }
     for (int j = t + 1 + threadIdx.x; j < T; j += blockDim.x)
         ds_row[j] = __float2bfloat16(0.f);
@@ -1100,7 +1126,8 @@ void attention_backward_matmul(Tensor& d_qkv,
                                int HS,
                                cublasHandle_t cublas,
                                cudaStream_t stream,
-                               float scale_override) {
+                               float scale_override,
+                               int window_size) {
     // SDPA backward using cuBLAS GEMMs, matching the forward's BF16 precision.
     //
     // Per-(b, h) we compute:
@@ -1191,7 +1218,11 @@ void attention_backward_matmul(Tensor& d_qkv,
                          CUBLAS_GEMM_DEFAULT);
 
             // 2. Recompute softmax: P = causal_softmax(S * scale). w_scores := P.
-            causal_softmax_bf16_kernel<<<dim3(1, T), std::min(256, T), 0, stream>>>(w_scores, nullptr, T, scale_bf16);
+            causal_softmax_bf16_kernel<<<dim3(1, T), std::min(256, T), 0, stream>>>(w_scores,
+                                                                                    nullptr,
+                                                                                    T,
+                                                                                    scale_bf16,
+                                                                                    window_size);
 
             // 3. dV_h = dO @ P^T   (col-major HS×T = dO(HS,T) @ P(T,T)^T).
             //    Write into w_k (K_h is no longer needed until step 6,
@@ -1257,14 +1288,17 @@ void attention_backward_matmul(Tensor& d_qkv,
                                                                                              w_dp,
                                                                                              w_scores,
                                                                                              T,
-                                                                                             scale);
+                                                                                             scale,
+                                                                                             window_size);
 
-            // 6. dQ_h = K @ dS^T   (col-major HS×T = K(HS,T) @ dS(T,T)^T).
+            // 6. dQ_h = dS @ K   (row-major [T,T]@[T,HS]). The row-major
+            // buffers are fed to cuBLAS as column-major transposes, so this
+            // becomes K_cm @ dS_cm with both operands left untransposed.
             //    Re-gather K because w_k was reused for dV_h in step 3.
             bf16_gather_rows_k<<<gg, 256, 0, stream>>>(w_k, p_qkv + (long)b * T * st + (Hq + hkv) * HS, T, HS, st);
             cublasGemmEx(cublas,
                          CUBLAS_OP_N,
-                         CUBLAS_OP_T,
+                         CUBLAS_OP_N,
                          HS,
                          T,
                          T,
@@ -1284,12 +1318,14 @@ void attention_backward_matmul(Tensor& d_qkv,
             // dQ is unique per Q head — direct write into d_qkv.
             bf16_scatter_rows_k<<<gg, 256, 0, stream>>>(p_dqkv + (long)b * T * st + h * HS, w_q, T, HS, st);
 
-            // 7. dK_h = Q @ dS   (col-major HS×T = Q(HS,T) @ dS(T,T)).
+            // 7. dK_h = dS^T @ Q   (row-major [T,T]^T@[T,HS]). Under the
+            // row-major→column-major reinterpretation this is Q_cm @ dS_cm^T,
+            // so the second operand must be transposed here.
             //    Re-gather Q because w_q was reused for dQ_h in step 6.
             bf16_gather_rows_k<<<gg, 256, 0, stream>>>(w_q, p_qkv + (long)b * T * st + h * HS, T, HS, st);
             cublasGemmEx(cublas,
                          CUBLAS_OP_N,
-                         CUBLAS_OP_N,
+                         CUBLAS_OP_T,
                          HS,
                          T,
                          T,

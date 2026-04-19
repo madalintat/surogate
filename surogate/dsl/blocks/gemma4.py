@@ -77,8 +77,8 @@ GEMMA4_BLOCK_NAME_REMAP: dict[str, str] = {
     "post_ff_layernorm_weight": "ln_post_ff_weight",
     "post_ff_layernorm_y": "ln_post_ff",
     "post_ff_layernorm_rstd": "ln_post_ff_rstd",
-    # --- res_attn (explicit residual add) ---
-    "res_attn": "res_attn",
+    # --- res_att (canonical residual-after-attention slot) ---
+    "res_att": "res_att",
     # --- per-layer input gating ---
     "pli_gate_weight": "pli_gate_weight",
     "pli_proj_weight": "pli_proj_weight",
@@ -134,7 +134,11 @@ def _sandwich_attn_phase(block, x, residual, position_ids):
     residual, h = block.input_layernorm(fresh_zeros, x)
     h = block.self_attn(h, position_ids)
     h = block.post_attn_layernorm(h)
-    residual = block._add(residual, h, name="res_attn")
+    # Gemma4 forms the post-attention residual with a raw add instead of the
+    # fused residual+rmsnorm op, so we must register the canonical slot
+    # explicitly or the compiler treats `res_att` as a generic mapped tensor.
+    block._register_activation("res_att", ("B", "T", "d_model"), share_policy="when_recomputed")
+    residual = block._add(residual, h, name="res_att")
     return residual
 
 
@@ -376,6 +380,7 @@ class Gemma4FullMoEBlock(nn.Block):
         d_ff,
         max_seq,
         partial_rotary_factor=0.25,
+        proportional_rope=True,
         k_eq_v=True,
         num_experts=128,
         num_experts_per_tok=8,
@@ -384,7 +389,7 @@ class Gemma4FullMoEBlock(nn.Block):
         ep_size=1,
     ):
         super().__init__()
-        rotary_dim = _resolve_rotary_dim(head_size, partial_rotary_factor)
+        rotary_dim = head_size if proportional_rope else _resolve_rotary_dim(head_size, partial_rotary_factor)
         _make_dims(self, d_model, head_size, num_query_heads, num_kv_heads, d_ff, max_seq, 0, rotary_dim=rotary_dim)
         if k_eq_v:
             self.QKV = (num_query_heads + num_kv_heads) * head_size
@@ -401,6 +406,7 @@ class Gemma4FullMoEBlock(nn.Block):
             head_size,
             max_seq,
             partial_rotary_factor=partial_rotary_factor,
+            proportional_rope=proportional_rope,
             k_eq_v=k_eq_v,
             eps=eps,
         )
@@ -445,12 +451,13 @@ class Gemma4FullBlock(nn.Block):
         d_ff,
         max_seq,
         partial_rotary_factor=0.25,
+        proportional_rope=True,
         k_eq_v=False,
         d_per_layer_input=0,
         eps=1e-6,
     ):
         super().__init__()
-        rotary_dim = _resolve_rotary_dim(head_size, partial_rotary_factor)
+        rotary_dim = head_size if proportional_rope else _resolve_rotary_dim(head_size, partial_rotary_factor)
         _make_dims(
             self,
             d_model,
@@ -475,6 +482,7 @@ class Gemma4FullBlock(nn.Block):
             head_size,
             max_seq,
             partial_rotary_factor=partial_rotary_factor,
+            proportional_rope=proportional_rope,
             k_eq_v=k_eq_v,
             eps=eps,
         )
@@ -509,7 +517,8 @@ def _sandwich_shared_attn_phase(block, x, residual, position_ids, kv_source):
     residual, h = block.input_layernorm(fresh_zeros, x)
     h = block.self_attn(h, position_ids, kv_source)
     h = block.post_attn_layernorm(h)
-    residual = block._add(residual, h, name="res_attn")
+    block._register_activation("res_att", ("B", "T", "d_model"), share_policy="when_recomputed")
+    residual = block._add(residual, h, name="res_att")
     return residual
 
 
@@ -531,13 +540,17 @@ class Gemma4SharedKVBlock(nn.Block):
         head_size,
         d_ff,
         max_seq,
+        sliding_window=None,
         partial_rotary_factor=0.25,
+        proportional_rope=None,
         d_per_layer_input=256,
         use_double_wide_mlp=False,
         eps=1e-6,
     ):
         super().__init__()
-        rotary_dim = _resolve_rotary_dim(head_size, partial_rotary_factor)
+        if proportional_rope is None:
+            proportional_rope = sliding_window is None and partial_rotary_factor < 1.0
+        rotary_dim = head_size if proportional_rope else _resolve_rotary_dim(head_size, partial_rotary_factor)
         effective_d_ff = d_ff * 2 if use_double_wide_mlp else d_ff
         _make_dims(
             self,
@@ -559,7 +572,9 @@ class Gemma4SharedKVBlock(nn.Block):
             num_kv_heads,
             head_size,
             max_seq,
+            sliding_window=sliding_window,
             partial_rotary_factor=partial_rotary_factor,
+            proportional_rope=proportional_rope,
             eps=eps,
         )
         self.post_attn_layernorm = RMSNorm(d_model, eps=eps)

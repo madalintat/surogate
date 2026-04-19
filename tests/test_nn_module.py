@@ -1,5 +1,7 @@
 """Tests for the torch.nn-like DSL authoring layer (surogate.dsl.nn)."""
 
+import json
+
 import pytest
 
 from surogate.dsl import nn
@@ -32,6 +34,60 @@ def _make_qwen3_block(**overrides):
 
     cfg = {**QWEN3_CONFIG, **overrides}
     return Qwen3Block(**cfg)
+
+
+GEMMA4_CONFIG = dict(
+    d_model=256,
+    num_query_heads=4,
+    num_kv_heads=2,
+    head_size=64,
+    d_ff=512,
+    max_seq=256,
+    partial_rotary_factor=0.25,
+    d_per_layer_input=16,
+    eps=1e-6,
+)
+
+GEMMA4_HF_CONFIG = dict(
+    hidden_size=256,
+    num_hidden_layers=18,
+    num_attention_heads=4,
+    num_key_value_heads=2,
+    intermediate_size=512,
+    vocab_size=32000,
+    max_position_embeddings=256,
+    head_dim=64,
+    rms_norm_eps=1e-6,
+    sliding_window=32,
+    layer_types=["sliding_attention"] * 15 + ["full_attention"] * 3,
+    global_head_dim=64,
+    num_global_key_value_heads=2,
+    rope_parameters={"full_attention": {"partial_rotary_factor": 0.25}},
+    hidden_size_per_layer_input=16,
+    vocab_size_per_layer_input=32000,
+    attention_k_eq_v=True,
+    final_logit_softcapping=30.0,
+    enable_moe_block=False,
+    num_experts=1,
+    top_k_experts=1,
+    moe_intermediate_size=512,
+    num_kv_shared_layers=3,
+    use_double_wide_mlp=False,
+)
+
+
+def _make_gemma4_full_block(**overrides):
+    from surogate.dsl.blocks.gemma4 import Gemma4FullBlock
+
+    cfg = {**GEMMA4_CONFIG, **overrides}
+    return Gemma4FullBlock(**cfg)
+
+
+def _make_gemma4_shared_kv_block(**overrides):
+    from surogate.dsl.blocks.gemma4 import Gemma4SharedKVBlock
+
+    cfg = {**GEMMA4_CONFIG, **overrides}
+    return Gemma4SharedKVBlock(**cfg)
 
 
 # ============================================================================
@@ -172,6 +228,140 @@ class TestGraphNodes:
         assert "view" in op_types
         assert "flash_attention" in op_types
         assert "swiglu" in op_types
+
+
+class TestGemma4ResidualNaming:
+    """Gemma4 must use the canonical res_att runtime slot name."""
+
+    @staticmethod
+    def _graph_outputs(spec):
+        return {out for node in spec.forward._traced_graph.nodes for out in node.outputs}
+
+    @staticmethod
+    def _slot_names(spec):
+        return {slot.name for slot in spec.activations.slots}
+
+    @staticmethod
+    def _grad_slot_names(spec):
+        return {slot.name for slot in spec.activations.gradient_slots}
+
+    def test_standard_block_uses_res_att(self):
+        spec = _make_gemma4_full_block().compile()
+        outputs = self._graph_outputs(spec)
+        assert "res_att" in outputs
+        assert "res_attn" not in outputs
+        assert "res_att" in self._slot_names(spec)
+        assert "d_res_att" in self._grad_slot_names(spec)
+
+    def test_shared_kv_block_uses_res_att(self):
+        spec = _make_gemma4_shared_kv_block(use_double_wide_mlp=False).compile()
+        outputs = self._graph_outputs(spec)
+        assert "res_att" in outputs
+        assert "res_attn" not in outputs
+        assert "res_att" in self._slot_names(spec)
+        assert "d_res_att" in self._grad_slot_names(spec)
+
+
+class TestGemma4SharedKVAttention:
+    """Shared-KV Gemma4 blocks must preserve sliding-vs-full attention mode."""
+
+    @staticmethod
+    def _flash_attention_node(spec):
+        nodes = [node for node in spec.forward._traced_graph.nodes if node.op == "flash_attention"]
+        assert len(nodes) == 1
+        return nodes[0]
+
+    def test_shared_sliding_block_sets_window_size(self):
+        spec = _make_gemma4_shared_kv_block(sliding_window=32, partial_rotary_factor=1.0).compile()
+        node = self._flash_attention_node(spec)
+        assert node.attrs.get("window_size") == 32
+
+    def test_shared_full_block_does_not_set_window_size(self):
+        spec = _make_gemma4_shared_kv_block(sliding_window=None, partial_rotary_factor=0.25).compile()
+        node = self._flash_attention_node(spec)
+        assert "window_size" not in node.attrs
+
+    def test_shared_full_block_uses_full_head_rope(self):
+        spec = _make_gemma4_shared_kv_block(sliding_window=None, partial_rotary_factor=0.25).compile()
+        rope_nodes = [node for node in spec.forward._traced_graph.nodes if node.op == "rope"]
+        assert len(rope_nodes) == 1
+        assert rope_nodes[0].attrs.get("rotary_dim") == 64
+
+
+class TestGemma4ProportionalRoPE:
+    """Gemma4 proportional RoPE must use full-head rotate_half semantics."""
+
+    def test_full_block_exports_full_head_rope_freqs(self):
+        spec = _make_gemma4_full_block().compile()
+        params = spec.params
+        assert params["rope_freqs"].shape == (256, 32, 2)
+
+        rope_nodes = [node for node in spec.forward._traced_graph.nodes if node.op == "rope"]
+        assert len(rope_nodes) == 1
+        assert rope_nodes[0].attrs.get("rotary_dim") == 64
+
+
+class TestGemma4RoPEExport:
+    """Gemma4 model compilation must preserve layer-specific RoPE metadata."""
+
+    @staticmethod
+    def _compile_gemma4_payload():
+        from surogate.dsl.py_compiler import compile_model_for_hf
+
+        cfg = {
+            **GEMMA4_HF_CONFIG,
+            "rope_parameters": {
+                "sliding_attention": {"rope_theta": 10000.0, "rope_type": "default"},
+                "full_attention": {
+                    "rope_theta": 1000000.0,
+                    "rope_type": "proportional",
+                    "partial_rotary_factor": 0.25,
+                },
+            },
+        }
+        return json.loads(compile_model_for_hf("Gemma4ForCausalLM", cfg, raise_on_error=True))
+
+    def test_model_ir_exports_per_layer_rope_config(self):
+        payload = self._compile_gemma4_payload()
+        config = payload["modules"][0]["config"]
+
+        assert config["sliding_rope_theta"] == pytest.approx(10000.0)
+        assert config["sliding_rope_type"] == "default"
+        assert config["global_head_dim"] == 64
+        assert config["full_rope_theta"] == pytest.approx(1000000.0)
+        assert config["full_rope_type"] == "proportional"
+        assert config["full_partial_rotary_factor"] == pytest.approx(0.25)
+
+
+class TestGemma4PerLayerInputLowering:
+    """Per-layer-input slices should be emitted immediately before first use."""
+
+    @staticmethod
+    def _compile_gemma4_ops():
+        from surogate.dsl.py_compiler import compile_model_for_hf
+
+        payload = compile_model_for_hf("Gemma4ForCausalLM", GEMMA4_HF_CONFIG, raise_on_error=True)
+        return json.loads(payload)["modules"][0]["forward"]["operations"]
+
+    @staticmethod
+    def _find_op_index(ops, *, name=None, output=None):
+        for idx, op in enumerate(ops):
+            if name is not None and op["name"] == name:
+                return idx
+            if output is not None and output in op["outputs"]:
+                return idx
+        raise AssertionError(f"op not found: name={name!r} output={output!r}")
+
+    def test_layer15_pli_slice_is_emitted_at_first_use(self):
+        ops = self._compile_gemma4_ops()
+
+        narrow_idx = self._find_op_index(ops, name="narrow_pli_15")
+        view_idx = self._find_op_index(ops, name="view_pli_15")
+        pli_flat_idx = self._find_op_index(ops, output="blocks[15].pli_flat")
+
+        assert view_idx == narrow_idx + 1
+        assert pli_flat_idx == view_idx + 1
+        assert ops[pli_flat_idx]["inputs"] == ["pli_slice_layer15"]
 
 
 class TestConditionalBias:

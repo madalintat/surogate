@@ -105,7 +105,8 @@ void attention_forward_matmul(Tensor& out,
                               int HS,
                               cublasHandle_t cublas,
                               cudaStream_t stream,
-                              float scale = 0.0f);
+                              float scale = 0.0f,
+                              int window_size = 0);
 
 // cuBLAS matmul-based attention backward. Matches forward_matmul precision.
 void attention_backward_matmul(Tensor& d_qkv,
@@ -120,7 +121,8 @@ void attention_backward_matmul(Tensor& d_qkv,
                                int HS,
                                cublasHandle_t cublas,
                                cudaStream_t stream,
-                               float scale = 0.0f);
+                               float scale = 0.0f,
+                               int window_size = 0);
 
 std::size_t cudnn_get_workspace_size(int B, int T, int Hq, int Hkv, int HS, cudnnHandle_t handle);
 void attention_backward_cudnn(nv_bfloat16* dqkv,

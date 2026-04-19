@@ -105,6 +105,79 @@ void apply_sinks_forward(Tensor& out,
     }
 }
 
+std::string tensor_shape_debug(const Tensor& t) {
+    std::ostringstream oss;
+    oss << "[";
+    for (int i = 0; i < t.Rank; ++i) {
+        if (i > 0) {
+            oss << ",";
+        }
+        oss << t.Sizes[i];
+    }
+    oss << "]";
+    return oss.str();
+}
+
+void debug_dump_runtime_tensor(const std::string& name, const Tensor& t, const char* dump_dir) {
+    if (!dump_dir || !*dump_dir || !t.Data || t.nelem() <= 0) {
+        return;
+    }
+    std::string safe;
+    safe.reserve(name.size());
+    for (char c : name) {
+        if (std::isalnum(static_cast<unsigned char>(c)) || c == '_' || c == '-' || c == '.') {
+            safe += c;
+        } else {
+            safe += '_';
+        }
+    }
+    const std::size_t nelem = static_cast<std::size_t>(t.nelem());
+    std::vector<float> host_data(nelem);
+    if (t.DType == ETensorDType::FP32) {
+        CUDA_CHECK(cudaMemcpy(host_data.data(), t.Data, nelem * sizeof(float), cudaMemcpyDeviceToHost));
+    } else if (t.DType == ETensorDType::BF16) {
+        std::vector<uint16_t> bf16_data(nelem);
+        CUDA_CHECK(cudaMemcpy(bf16_data.data(), t.Data, nelem * sizeof(uint16_t), cudaMemcpyDeviceToHost));
+        for (std::size_t i = 0; i < nelem; ++i) {
+            uint32_t bits = static_cast<uint32_t>(bf16_data[i]) << 16;
+            float val;
+            std::memcpy(&val, &bits, sizeof(float));
+            host_data[i] = val;
+        }
+    } else {
+        return;
+    }
+    const std::string bin_path = std::string(dump_dir) + "/" + safe + ".bin";
+    FILE* bin_f = std::fopen(bin_path.c_str(), "wb");
+    if (bin_f) {
+        std::fwrite(host_data.data(), sizeof(float), nelem, bin_f);
+        std::fclose(bin_f);
+    }
+    const std::string json_path = std::string(dump_dir) + "/" + safe + ".json";
+    FILE* json_f = std::fopen(json_path.c_str(), "w");
+    if (json_f) {
+        std::fprintf(json_f, "{\"name\": \"%s\", \"dtype\": \"float32\", \"shape\": [", name.c_str());
+        for (int i = 0; i < t.Rank; ++i) {
+            std::fprintf(json_f, "%ld%s", t.Sizes[i], (i + 1 < t.Rank) ? ", " : "");
+        }
+        std::fprintf(json_f, "]}\n");
+        std::fclose(json_f);
+    }
+}
+
+bool should_dump_attention_layer(int layer_idx) {
+    const char* layer_env = std::getenv("SUROGATE_DEBUG_ATTENTION_DUMP_LAYER");
+    if (!layer_env || !*layer_env) {
+        return false;
+    }
+    char* end = nullptr;
+    const long requested = std::strtol(layer_env, &end, 10);
+    if (end == layer_env) {
+        return false;
+    }
+    return layer_idx == static_cast<int>(requested);
+}
+
 }  // namespace
 
 void CompiledExecutor::dispatch_flash_attention(const CompiledOp& op) {
@@ -166,6 +239,7 @@ void CompiledExecutor::dispatch_flash_attention(const CompiledOp& op) {
     params.lse = lse;
     params.sinks = sinks;
     params.cu_seqlens = mCuSeqlensGpu;
+    params.cu_seqlens_cpu = mCuSeqlensCpu;
     params.num_docs = mNumDocs;
     params.max_doc_seqlen = mMaxDocSeqlen;
     params.total_doc_tokens = mTotalDocTokens;
@@ -178,7 +252,20 @@ void CompiledExecutor::dispatch_flash_attention(const CompiledOp& op) {
     params.sm_version = mRunState.DeviceProp.major * 10 + mRunState.DeviceProp.minor;
 
     AttentionBackend& backend = AttentionBackendRegistry::instance().select(params);
+    if (env_enabled("SUROGATE_DEBUG_ATTENTION_RUNTIME")) {
+        std::cerr << "[ATTN] dir=fwd"
+                  << " layer=" << layer_idx << " backend=" << backend.name() << " window=" << window_size
+                  << " Hq=" << Hq << " Hkv=" << Hkv << " Hs=" << Hs << " qkv_shape=" << tensor_shape_debug(qkv)
+                  << " out_shape=" << tensor_shape_debug(out) << " lse_shape=" << tensor_shape_debug(lse)
+                  << " packed=" << (mCuSeqlensGpu ? 1 : 0) << std::endl;
+    }
     backend.forward(params);
+    if (should_dump_attention_layer(layer_idx)) {
+        const char* dump_dir = std::getenv("SUROGATE_DEBUG_DUMP_DIR");
+        debug_dump_runtime_tensor(fmt::format("attn_live.layer{}.qkv", layer_idx), qkv, dump_dir);
+        debug_dump_runtime_tensor(fmt::format("attn_live.layer{}.out", layer_idx), out, dump_dir);
+        debug_dump_runtime_tensor(fmt::format("attn_live.layer{}.lse", layer_idx), lse, dump_dir);
+    }
 
     if (sinks) {
         apply_sinks_forward(out,
@@ -245,6 +332,7 @@ void CompiledExecutor::dispatch_flash_attention_backward(const CompiledOp& op) {
     params.d_out = d_out;
     params.d_qkv = d_qkv;
     params.cu_seqlens = mCuSeqlensGpu;
+    params.cu_seqlens_cpu = mCuSeqlensCpu;
     params.num_docs = mNumDocs;
     params.max_doc_seqlen = mMaxDocSeqlen;
     params.total_doc_tokens = mTotalDocTokens;
@@ -254,11 +342,30 @@ void CompiledExecutor::dispatch_flash_attention_backward(const CompiledOp& op) {
     params.cudnn_workspace = mRunState.scratch().cudnn_workspace;
     params.run_state = &mRunState;
     params.temps = &mTemps;
-    params.deterministic_bwd = (std::getenv("SUROGATE_FLASH_ATTN_VARLEN_BWD_DETERMINISTIC") != nullptr);
+    // Packed sliding-window attention has shown unstable backward norms on the
+    // non-deterministic FlashAttention varlen path. Route that case through
+    // the deterministic kernel by default; the env flag still forces
+    // deterministic mode for all varlen backward calls when desired.
+    params.deterministic_bwd = (std::getenv("SUROGATE_FLASH_ATTN_VARLEN_BWD_DETERMINISTIC") != nullptr) ||
+                               (mCuSeqlensGpu != nullptr && window_size > 0);
     params.attn_bwd_chunks = mOptions.AttBwdChunks;
     params.sm_version = mRunState.DeviceProp.major * 10 + mRunState.DeviceProp.minor;
 
     AttentionBackend& backend = AttentionBackendRegistry::instance().select(params);
+    if (env_enabled("SUROGATE_DEBUG_ATTENTION_RUNTIME")) {
+        std::cerr << "[ATTN] dir=bwd"
+                  << " layer=" << layer_idx << " backend=" << backend.name() << " window=" << window_size
+                  << " Hq=" << Hq << " Hkv=" << Hkv << " Hs=" << Hs << " qkv_shape=" << tensor_shape_debug(qkv)
+                  << " out_shape=" << tensor_shape_debug(out) << " d_out_shape=" << tensor_shape_debug(d_out)
+                  << " lse_shape=" << tensor_shape_debug(lse) << " packed=" << (mCuSeqlensGpu ? 1 : 0) << std::endl;
+    }
+    if (should_dump_attention_layer(layer_idx)) {
+        const char* dump_dir = std::getenv("SUROGATE_DEBUG_DUMP_DIR");
+        debug_dump_runtime_tensor(fmt::format("attn_live.layer{}.d_out", layer_idx), d_out, dump_dir);
+        debug_dump_runtime_tensor(fmt::format("attn_live.layer{}.out_bwd", layer_idx), out, dump_dir);
+        debug_dump_runtime_tensor(fmt::format("attn_live.layer{}.lse_bwd", layer_idx), lse, dump_dir);
+        debug_dump_runtime_tensor(fmt::format("attn_live.layer{}.qkv_bwd", layer_idx), qkv, dump_dir);
+    }
     backend.backward(params);
 
     // Under EP with dp_size=1, attention activations are replicated
@@ -288,8 +395,8 @@ void CompiledExecutor::dispatch_flash_attention_backward(const CompiledOp& op) {
                                                                 "flash_attention_backward");
 
         bool accumulate = mAccumulateTensors.count(op.outputs[1].name) > 0;
-        if (!accumulate) {
-            if (auto base = base_param_from_grad(op.outputs[1].name)) {
+        if (!accumulate && mCurrentGraph) {
+            if (auto base = base_param_from_grad_kind(op.outputs[1].tensor_id, *mCurrentGraph)) {
                 accumulate = mAccumulateTensors.count("d_" + *base) > 0;
             }
         }

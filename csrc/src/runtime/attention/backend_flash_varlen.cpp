@@ -50,14 +50,15 @@ public:
             // plus the synthesized cu_seqlens buffer.
             return false;
         }
-        // Sliding-window attention without packed sequences is routed to
-        // the custom kernel, which has been the long-term path for that
-        // case. Accepting it here would change behaviour.
-        if (p.window_size > 0 && p.cu_seqlens == nullptr) {
+        // Sliding-window attention is routed to the custom backend. The
+        // flash-varlen local path is the source of the remaining packed
+        // Gemma4 boundary drift; packed sliding attention now lowers to
+        // explicit per-document dense calls instead.
+        if (p.window_size > 0) {
             return false;
         }
         // Everything else — dense full-causal (we'll synthesize dense
-        // cu_seqlens), packed full-causal, packed sliding-window — is
+        // cu_seqlens) and packed full-causal — is
         // handled by the flash-varlen kernels.
         return true;
     }
@@ -108,17 +109,12 @@ public:
         temps.push_back(dq_accum);
         temps.push_back(dsoftmax);
 
-        // Upstream FlashAttention zeroes dsoftmax for varlen backward
-        // regardless of deterministic mode — it's treated as an
-        // accumulation/work buffer.
+        // FlashAttention varlen backward uses both dsoftmax and dq_accum as
+        // accumulation/work buffers. The executor temp allocator intentionally
+        // reuses memory across ops, so these buffers must be cleared before
+        // each launch even in the non-deterministic path.
         fill_zero(dsoftmax, p.stream);
-        if (p.deterministic_bwd) {
-            // Deterministic backward writes one dQ accumulation buffer per
-            // split. The upstream API requires the full (nsplits * stride)
-            // buffer pre-zeroed before launch.
-            CUDA_CHECK(
-                cudaMemsetAsync(dq_accum.Data, 0, static_cast<size_t>(dq_accum_elems) * sizeof(float), p.stream));
-        }
+        CUDA_CHECK(cudaMemsetAsync(dq_accum.Data, 0, static_cast<size_t>(dq_accum_elems) * sizeof(float), p.stream));
 
         // GQA expanded dk/dv: flash backward writes dK/dV at Hq head
         // positions, but the interleaved ``qkv`` buffer only has Hkv

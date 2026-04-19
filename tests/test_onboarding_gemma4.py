@@ -160,7 +160,7 @@ def run_hf_forward(model_dir: Path, inputs: np.ndarray) -> dict[str, np.ndarray]
     - Full layer outputs (post-hook on each decoder layer)
     - Mid-layer states after attention (pre-hook on pre_feedforward_layernorm)
 
-    The mid-layer states correspond to Surogate's blocks[i].res_attn (the
+    The mid-layer states correspond to Surogate's blocks[i].res_att (the
     hidden state after the first residual add + attention, before MLP).
     """
     from transformers import AutoModelForCausalLM
@@ -194,7 +194,7 @@ def run_hf_forward(model_dir: Path, inputs: np.ndarray) -> dict[str, np.ndarray]
 
         # Pre-hook on pre_feedforward_layernorm: captures mid-layer state
         # = hidden_states after first residual add (attention output + input residual)
-        # This corresponds to Surogate's blocks[i].res_attn
+        # This corresponds to Surogate's blocks[i].res_att
         def make_mid_hook(idx):
             def hook_fn(module, args):
                 hs = args[0] if isinstance(args[0], torch.Tensor) else args[0][0]
@@ -212,7 +212,7 @@ def run_hf_forward(model_dir: Path, inputs: np.ndarray) -> dict[str, np.ndarray]
         for i in range(num_layers):
             result[f"layer_output_{i}"] = layer_outs[i].float().cpu().numpy()
 
-        # Per-layer mid-states (= blocks[i].res_attn in Surogate)
+        # Per-layer mid-states (= blocks[i].res_att in Surogate)
         for i in range(num_layers):
             result[f"mid_state_{i}"] = mid_states[i].float().cpu().numpy()
 
@@ -246,7 +246,7 @@ def run_surogate_forward(model_dir: Path, inputs: np.ndarray, targets: np.ndarra
     """Run Surogate forward pass and dump tensors to DUMP_DIR.
 
     Dumpable tensors for Gemma4:
-    - blocks[i].res_attn: mid-layer hidden state (after attention, before MLP)
+    - blocks[i].res_att: mid-layer hidden state (after attention, before MLP)
       Available for layers 0..num_layers-2. Last layer maps to residualN.
     - residual_final: full hidden state before final norm
     - xF: after final RMSNorm
@@ -257,7 +257,7 @@ def run_surogate_forward(model_dir: Path, inputs: np.ndarray, targets: np.ndarra
 
     dump_tensors = ["xF", "residual_final", "ln_final_rstd"]
     for i in range(num_layers):
-        dump_tensors.append(f"blocks[{i}].res_attn")
+        dump_tensors.append(f"blocks[{i}].res_att")
 
     os.environ["SUROGATE_DEBUG_DUMP_TENSORS"] = ",".join(dump_tensors)
     os.environ["SUROGATE_DEBUG_DUMP_DIR"] = str(DUMP_DIR)
@@ -371,7 +371,7 @@ class TestGemma4Onboarding:
     def test_per_layer_mid_state(self, forward_results):
         """Check that per-layer mid-states (after attention) match.
 
-        Surogate: blocks[i].res_attn = hidden_state + attn_out (before MLP)
+        Surogate: blocks[i].res_att = hidden_state + attn_out (before MLP)
         HF: input to pre_feedforward_layernorm (captured via pre-hook)
 
         Uses cosine similarity (robust to signal magnitude) and relative RMS.
@@ -382,13 +382,13 @@ class TestGemma4Onboarding:
 
         for i in range(num_layers - 1):
             try:
-                rt_res_attn = load_dump(f"blocks[{i}].res_attn")
+                rt_res_att = load_dump(f"blocks[{i}].res_att")
             except FileNotFoundError as e:
                 failures.append(f"layer {i}: dump not found ({e})")
                 continue
 
             hf_mid = hf[f"mid_state_{i}"]
-            cos, rel_rms, abs_rms = diff_stats(rt_res_attn, hf_mid)
+            cos, rel_rms, abs_rms = diff_stats(rt_res_att, hf_mid)
             if cos < COS_TOL:
                 failures.append(f"layer {i}: cos={cos:.6f} rel_rms={rel_rms:.4e} (cos_tol={COS_TOL})")
 
@@ -422,12 +422,12 @@ class TestGemma4Onboarding:
 
         for i in range(num_layers - 1):
             try:
-                rt_res_attn = load_dump(f"blocks[{i}].res_attn")
+                rt_res_att = load_dump(f"blocks[{i}].res_att")
                 hf_mid = hf[f"mid_state_{i}"]
-                cos, rel_rms, abs_rms = diff_stats(rt_res_attn, hf_mid)
-                rows.append((f"blocks[{i}].res_attn", cos, rel_rms, abs_rms))
+                cos, rel_rms, abs_rms = diff_stats(rt_res_att, hf_mid)
+                rows.append((f"blocks[{i}].res_att", cos, rel_rms, abs_rms))
             except (FileNotFoundError, KeyError):
-                rows.append((f"blocks[{i}].res_attn", float("nan"), float("nan"), float("nan")))
+                rows.append((f"blocks[{i}].res_att", float("nan"), float("nan"), float("nan")))
 
         try:
             rt_xf = load_dump("xF")

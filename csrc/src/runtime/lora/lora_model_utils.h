@@ -22,6 +22,45 @@ namespace modules {
 
 namespace detail {
 
+inline bool lora_uses_input_dropout(bool is_training, float dropout_prob) {
+    return is_training && dropout_prob > 0.0f;
+}
+
+inline Tensor materialize_lora_dropout_input(const Tensor& input,
+                                             Tensor& scratch,
+                                             int rows,
+                                             int cols,
+                                             float dropout_prob,
+                                             unsigned int dropout_seed,
+                                             bool is_training,
+                                             cudaStream_t stream) {
+    if (!lora_uses_input_dropout(is_training, dropout_prob)) {
+        return input;
+    }
+    const long required = static_cast<long>(rows) * static_cast<long>(cols);
+    if (!scratch.Data || scratch.nelem() < required) {
+        throw std::logic_error("materialize_lora_dropout_input: scratch tensor too small (required=" +
+                               std::to_string(required) + ", available=" + std::to_string(scratch.nelem()) +
+                               ", rows=" + std::to_string(rows) + ", cols=" + std::to_string(cols) + ")");
+    }
+
+    Tensor dropped = scratch;
+    dropped.DType = input.DType;
+    dropped.Rank = 2;
+    dropped.Sizes[0] = rows;
+    dropped.Sizes[1] = cols;
+    for (int i = 2; i < MAX_TENSOR_DIM; ++i)
+        dropped.Sizes[i] = 1;
+
+    CUDA_CHECK(cudaMemcpyAsync(dropped.Data,
+                               input.Data,
+                               required * get_dtype_size(input.DType),
+                               cudaMemcpyDeviceToDevice,
+                               stream));
+    lora_dropout_scale(dropped, dropout_prob, dropout_seed, stream);
+    return dropped;
+}
+
 inline void apply_lora_contribution(Tensor& output,
                                     int output_offset,
                                     const Tensor& input,
@@ -52,13 +91,21 @@ inline void apply_lora_contribution(Tensor& output,
     // We still retain explicit packed-delta accumulation (below) for BF16 LoRA.
     const bool use_transposed_a_path = false;
     const bool use_fp32_intermediate = false;
+    Tensor input_mat = materialize_lora_dropout_input(input,
+                                                      slice_buffer,
+                                                      BT,
+                                                      in_features,
+                                                      dropout_prob,
+                                                      dropout_seed,
+                                                      is_training,
+                                                      stream);
 
     bool used_small_rank_kernel = false;
     const bool enable_small_rank_kernel = (std::getenv("SUROGATE_ENABLE_LORA_SMALL_RANK") != nullptr);
     if (enable_small_rank_kernel && prefer_explicit_add && intermediate.DType == ETensorDType::BF16 &&
-        input.DType == ETensorDType::BF16 && lora.A.DType == ETensorDType::BF16) {
+        input_mat.DType == ETensorDType::BF16 && lora.A.DType == ETensorDType::BF16) {
         used_small_rank_kernel =
-            lora_project_small_rank_bf16(intermediate, lora.A, input, BT, in_features, rank, stream);
+            lora_project_small_rank_bf16(intermediate, lora.A, input_mat, BT, in_features, rank, stream);
     }
 
     if (std::getenv("SUROGATE_DEBUG_LORA_GEMM")) {
@@ -119,7 +166,7 @@ inline void apply_lora_contribution(Tensor& output,
         transpose(a_t, lora.A, rank, in_features, stream);
         matmul(intermediate,
                a_t,
-               input,
+               input_mat,
                std::nullopt,
                nullptr,
                nullptr,
@@ -143,7 +190,7 @@ inline void apply_lora_contribution(Tensor& output,
         // intermediate_fp32 = input @ A^T  (BT x rank)
         matmul(intermediate_fp32,
                lora.A,
-               input,
+               input_mat,
                std::nullopt,
                nullptr,
                nullptr,
@@ -160,7 +207,7 @@ inline void apply_lora_contribution(Tensor& output,
         // intermediate = input @ A^T  (BT x rank)
         matmul(intermediate,
                lora.A,
-               input,
+               input_mat,
                std::nullopt,
                nullptr,
                nullptr,
@@ -172,11 +219,6 @@ inline void apply_lora_contribution(Tensor& output,
                EMMTranspose::TN,
                /*accumulate=*/false,
                stream);
-    }
-
-    // Apply dropout to intermediate activations (inverted dropout)
-    if (is_training && dropout_prob > 0.0f) {
-        lora_dropout_scale(intermediate, dropout_prob, dropout_seed, stream);
     }
 
     // Scale intermediate so we can use GEMM accumulate for B @ intermediate^T.
@@ -302,12 +344,20 @@ inline void apply_lora_contribution_fp32(Tensor& output,
                                          cudaStream_t stream) {
     if (!lora.has_value()) return;
     if (out_features <= 0 || BT <= 0) return;
+    Tensor input_mat = materialize_lora_dropout_input(input,
+                                                      slice_buffer,
+                                                      BT,
+                                                      in_features,
+                                                      dropout_prob,
+                                                      dropout_seed,
+                                                      is_training,
+                                                      stream);
 
     // intermediate = input @ A^T  (BT x rank)
     // Compute in work dtype (typically BF16)
     matmul(intermediate,
            lora.A,
-           input,
+           input_mat,
            std::nullopt,
            nullptr,
            nullptr,
@@ -319,11 +369,6 @@ inline void apply_lora_contribution_fp32(Tensor& output,
            EMMTranspose::TN,
            /*accumulate=*/false,
            stream);
-
-    // Apply dropout to intermediate activations (inverted dropout)
-    if (is_training && dropout_prob > 0.0f) {
-        lora_dropout_scale(intermediate, dropout_prob, dropout_seed, stream);
-    }
 
     // Scale intermediate so the final B projection includes the LoRA scaling
     if (scaling != 1.0f) {
@@ -446,22 +491,19 @@ inline void backward_lora_router(Tensor& dA,
     if (!A.Data || !B.Data) return;
     if (BT <= 0 || out_features <= 0) return;
 
-    // Convert d_logits from FP32 to BF16 for matmul (router outputs are small, so this is OK)
-    // Use slice_buffer as temp for the BF16 version of d_logits
-    Tensor d_logits_bf16 = slice_buffer;
-    d_logits_bf16.DType = ETensorDType::BF16;
-    d_logits_bf16.Rank = 2;
-    d_logits_bf16.Sizes[0] = BT;
-    d_logits_bf16.Sizes[1] = out_features;
-    for (int i = 2; i < MAX_TENSOR_DIM; ++i)
-        d_logits_bf16.Sizes[i] = 1;
+    Tensor dropped_input = materialize_lora_dropout_input(input,
+                                                          slice_buffer,
+                                                          BT,
+                                                          in_features,
+                                                          dropout_prob,
+                                                          dropout_seed,
+                                                          is_training,
+                                                          stream);
 
-    convert_dtype(d_logits_bf16.get<nv_bfloat16>(), d_logits.get<float>(), BT * out_features, stream);
-
-    // intermediate = input @ A^T  (BT x rank)
+    // intermediate = dropout(input) @ A^T  (BT x rank)
     matmul(intermediate,
            A,
-           input,
+           dropped_input,
            std::nullopt,
            nullptr,
            nullptr,
@@ -474,11 +516,6 @@ inline void backward_lora_router(Tensor& dA,
            /*accumulate=*/false,
            stream);
 
-    // Apply dropout with same mask as forward pass
-    if (is_training && dropout_prob > 0.0f) {
-        lora_dropout_scale(intermediate, dropout_prob, dropout_seed, stream);
-    }
-
     // Apply scaling to intermediate
     if (scaling != 1.0f) {
         vector_add_sr(intermediate,
@@ -489,6 +526,19 @@ inline void backward_lora_router(Tensor& dA,
                       /*seed=*/0,
                       stream);
     }
+
+    // Convert d_logits from FP32 to BF16 for matmul (router outputs are small, so this is OK).
+    // Reuse slice_buffer after the dropped-input recompute has finished; dA rematerializes the
+    // dropped input below before consuming it.
+    Tensor d_logits_bf16 = slice_buffer;
+    d_logits_bf16.DType = ETensorDType::BF16;
+    d_logits_bf16.Rank = 2;
+    d_logits_bf16.Sizes[0] = BT;
+    d_logits_bf16.Sizes[1] = out_features;
+    for (int i = 2; i < MAX_TENSOR_DIM; ++i)
+        d_logits_bf16.Sizes[i] = 1;
+
+    convert_dtype(d_logits_bf16.get<nv_bfloat16>(), d_logits.get<float>(), BT * out_features, stream);
 
     // dB = intermediate^T @ d_logits_bf16  => (rank, E)
     // In column-major: dB^T(E, rank) = d_logits_bf16^T(E, BT) @ intermediate(BT, rank)
@@ -537,20 +587,24 @@ inline void backward_lora_router(Tensor& dA,
            /*accumulate=*/false,
            stream);
 
-    // Apply dropout with same mask as forward pass
-    if (is_training && dropout_prob > 0.0f) {
-        lora_dropout_scale(temp, dropout_prob, dropout_seed, stream);
-    }
-
     // Apply scaling
     if (scaling != 1.0f) {
         vector_add_sr(temp, temp, temp, 0.5f * scaling, temp.nelem(), /*seed=*/0, stream);
     }
 
+    dropped_input = materialize_lora_dropout_input(input,
+                                                   slice_buffer,
+                                                   BT,
+                                                   in_features,
+                                                   dropout_prob,
+                                                   dropout_seed,
+                                                   is_training,
+                                                   stream);
+
     // dA = temp^T @ input  => (rank, C)
     // In column-major: dA^T(C, rank) = input^T(C, BT) @ temp(BT, rank)
     matmul(dA,
-           input,
+           dropped_input,
            temp,
            std::nullopt,
            nullptr,
@@ -739,6 +793,7 @@ inline void backward_lora_layer(Tensor& dA,
     if (dL_dy_offset < 0 || dL_dy_offset + out_features > full_out_features) {
         throw std::logic_error("backward_lora_layer: dL_dy_offset out of bounds");
     }
+    const bool apply_input_dropout = lora_uses_input_dropout(is_training, dropout_prob);
 
     // Instead of copying the slice via cudaMemcpy2D, create a strided view and
     // use matmul_strided to read directly from the packed layout.
@@ -761,17 +816,25 @@ inline void backward_lora_layer(Tensor& dA,
     // some BF16 LoRA shapes (notably Qwen3.5 down_proj). Keep it opt-in for
     // targeted debugging until a fully validated kernel path is available.
     const bool use_transposed_a_path =
-        (std::getenv("SUROGATE_ENABLE_LORA_TRANSPOSED_A_BWD") != nullptr) &&
+        !apply_input_dropout && (std::getenv("SUROGATE_ENABLE_LORA_TRANSPOSED_A_BWD") != nullptr) &&
         (A.DType == ETensorDType::BF16 && x.DType == ETensorDType::BF16 && intermediate.DType == ETensorDType::BF16 &&
          rank > 0 && rank <= 64 && in_features >= 2048);
+    Tensor x_mat = materialize_lora_dropout_input(x,
+                                                  slice_buffer,
+                                                  BT,
+                                                  in_features,
+                                                  dropout_prob,
+                                                  dropout_seed,
+                                                  is_training,
+                                                  stream);
 
     // Prefer the dedicated small-rank kernel for BF16 LoRA recompute. This avoids
     // cuBLAS/cuBLASLt shape gaps seen on some rank-16 large-K paths.
     bool used_small_rank_kernel = false;
     const bool enable_small_rank_kernel = (std::getenv("SUROGATE_ENABLE_LORA_SMALL_RANK") != nullptr);
-    if (enable_small_rank_kernel && A.DType == ETensorDType::BF16 && x.DType == ETensorDType::BF16 &&
+    if (enable_small_rank_kernel && A.DType == ETensorDType::BF16 && x_mat.DType == ETensorDType::BF16 &&
         intermediate.DType == ETensorDType::BF16 && rank > 0 && rank <= 64) {
-        used_small_rank_kernel = lora_project_small_rank_bf16(intermediate, A, x, BT, in_features, rank, stream);
+        used_small_rank_kernel = lora_project_small_rank_bf16(intermediate, A, x_mat, BT, in_features, rank, stream);
     }
 
     if (std::getenv("SUROGATE_DEBUG_LORA_GEMM")) {
@@ -811,7 +874,7 @@ inline void backward_lora_layer(Tensor& dA,
         transpose(a_t, A, rank, in_features, stream);
         matmul(intermediate,
                a_t,
-               x,
+               x_mat,
                std::nullopt,
                nullptr,
                nullptr,
@@ -826,7 +889,7 @@ inline void backward_lora_layer(Tensor& dA,
     } else {
         matmul(intermediate,
                A,
-               x,
+               x_mat,
                std::nullopt,
                nullptr,
                nullptr,
@@ -838,11 +901,6 @@ inline void backward_lora_layer(Tensor& dA,
                EMMTranspose::TN,
                /*accumulate=*/false,
                stream);
-    }
-
-    // Apply same dropout mask as forward (same seed produces identical mask)
-    if (is_training && dropout_prob > 0.0f) {
-        lora_dropout_scale(intermediate, dropout_prob, dropout_seed, stream);
     }
 
     if (scaling != 1.0f) {
@@ -893,11 +951,6 @@ inline void backward_lora_layer(Tensor& dA,
                    /*ldc=*/-1,
                    stream);
 
-    // Apply same dropout mask to gradient (backprop through dropout)
-    if (is_training && dropout_prob > 0.0f) {
-        lora_dropout_scale(intermediate, dropout_prob, dropout_seed, stream);
-    }
-
     if (scaling != 1.0f) {
         vector_add_sr(intermediate,
                       intermediate,
@@ -910,7 +963,7 @@ inline void backward_lora_layer(Tensor& dA,
 
     // dA = x^T @ (dL_dy @ B)
     matmul(dA,
-           x,
+           x_mat,
            intermediate,
            std::nullopt,
            nullptr,
@@ -926,20 +979,47 @@ inline void backward_lora_layer(Tensor& dA,
 
     // dx += (dL_dy @ B) @ A
     if (!skip_dx) {
-        matmul(dx,
-               A,
-               intermediate,
-               std::nullopt,
-               nullptr,
-               nullptr,
-               handle,
-               workspace,
-               in_features,
-               BT,
-               rank,
-               EMMTranspose::NN,
-               /*accumulate=*/true,
-               stream);
+        if (apply_input_dropout) {
+            Tensor dx_temp = slice_buffer;
+            dx_temp.DType = dx.DType;
+            dx_temp.Rank = 2;
+            dx_temp.Sizes[0] = BT;
+            dx_temp.Sizes[1] = in_features;
+            for (int i = 2; i < MAX_TENSOR_DIM; ++i)
+                dx_temp.Sizes[i] = 1;
+
+            matmul(dx_temp,
+                   A,
+                   intermediate,
+                   std::nullopt,
+                   nullptr,
+                   nullptr,
+                   handle,
+                   workspace,
+                   in_features,
+                   BT,
+                   rank,
+                   EMMTranspose::NN,
+                   /*accumulate=*/false,
+                   stream);
+            lora_dropout_scale(dx_temp, dropout_prob, dropout_seed, stream);
+            vector_add_sr(dx, dx, dx_temp, 1.0f, dx_temp.nelem(), /*seed=*/0, stream);
+        } else {
+            matmul(dx,
+                   A,
+                   intermediate,
+                   std::nullopt,
+                   nullptr,
+                   nullptr,
+                   handle,
+                   workspace,
+                   in_features,
+                   BT,
+                   rank,
+                   EMMTranspose::NN,
+                   /*accumulate=*/true,
+                   stream);
+        }
     }
 }
 

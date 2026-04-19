@@ -124,6 +124,7 @@ struct DslConfigView {
     std::optional<long> num_query_heads;
     std::optional<long> num_kv_heads;
     std::optional<long> head_size;
+    std::optional<long> global_head_dim;
     std::optional<long> max_seq;
     std::optional<long> vocab_size;
     std::optional<double> eps;
@@ -141,6 +142,11 @@ struct DslConfigView {
     std::optional<std::string> hybrid_pattern;
     std::optional<double> routed_scaling_factor;
     std::optional<std::string> mlp_activation;
+    std::optional<double> sliding_rope_theta;
+    std::optional<std::string> sliding_rope_type;
+    std::optional<double> full_rope_theta;
+    std::optional<std::string> full_rope_type;
+    std::optional<double> full_partial_rotary_factor;
 };
 
 std::optional<long> get_long_attr(const AttrMap& map, const char* key) {
@@ -250,6 +256,7 @@ DslConfigView parse_dsl_config(const Module& module) {
     view.num_query_heads = get_long_attr(cfg, "num_query_heads");
     view.num_kv_heads = get_long_attr(cfg, "num_kv_heads");
     view.head_size = get_long_attr(cfg, "head_size");
+    view.global_head_dim = get_long_attr(cfg, "global_head_dim");
     if (!view.head_size) view.head_size = get_long_attr(cfg, "head_dim");  // Nemotron-H uses head_dim
     view.max_seq = get_long_attr(cfg, "max_seq");
     view.vocab_size = get_long_attr(cfg, "vocab_size");
@@ -272,6 +279,11 @@ DslConfigView parse_dsl_config(const Module& module) {
     view.mlp_activation = get_string_attr(cfg, "mlp_activation");
     if (!view.mlp_activation) view.mlp_activation = get_string_attr(cfg, "mlp_hidden_act");
     if (!view.mlp_activation) view.mlp_activation = get_string_attr(cfg, "activation");
+    view.sliding_rope_theta = get_double_attr(cfg, "sliding_rope_theta");
+    view.sliding_rope_type = get_string_attr(cfg, "sliding_rope_type");
+    view.full_rope_theta = get_double_attr(cfg, "full_rope_theta");
+    view.full_rope_type = get_string_attr(cfg, "full_rope_type");
+    view.full_partial_rotary_factor = get_double_attr(cfg, "full_partial_rotary_factor");
     return view;
 }
 
@@ -400,6 +412,45 @@ DslRuntimeConfig build_runtime_config(const Module& module, const PretrainedConf
                     // GatedMLP: up_weight is (M, C)
                     // Use mlp_down_weight to disambiguate (set above)
                 }
+            }
+        }
+    }
+
+    const bool has_layer_specific_rope = view.global_head_dim.has_value() || view.full_rope_theta.has_value() ||
+                                         view.full_rope_type.has_value() || view.full_partial_rotary_factor.has_value();
+    if (has_layer_specific_rope && view.layer_type_names.has_value() && !view.layer_type_names->empty()) {
+        const int num_layers = static_cast<int>(view.layer_type_names->size());
+        runtime.per_layer_rope.resize(num_layers);
+
+        const float sliding_theta = static_cast<float>(view.sliding_rope_theta.value_or(base.RopeTheta));
+        const std::string sliding_type =
+            view.sliding_rope_type.value_or(base.Rope.rope_type.empty() ? std::string("default") : base.Rope.rope_type);
+        const float full_theta = static_cast<float>(view.full_rope_theta.value_or(1000000.0));
+        const std::string full_type = view.full_rope_type.value_or("proportional");
+        const float full_partial = static_cast<float>(view.full_partial_rotary_factor.value_or(0.25));
+        const long default_hs = view.head_size.value_or(base.head_size());
+        const long full_hs = view.global_head_dim.value_or(default_hs);
+
+        for (int i = 0; i < num_layers; ++i) {
+            auto& rope_cfg = runtime.per_layer_rope[static_cast<std::size_t>(i)];
+            rope_cfg.head_size = default_hs;
+            rope_cfg.rope = base.Rope;
+            rope_cfg.rope.theta = sliding_theta;
+            rope_cfg.rope.rope_type = sliding_type;
+
+            const std::string layer_type = internal::to_lower(view.layer_type_names->at(static_cast<std::size_t>(i)));
+            const bool full_attention = layer_type.find("full") != std::string::npos;
+            if (full_attention) {
+                rope_cfg.head_size = full_hs;
+                rope_cfg.rope = (full_partial > 0.0f && full_partial < 1.0f)
+                                    ? RoPEConfig::partial(full_partial, full_theta)
+                                    : RoPEConfig::full(full_theta);
+                rope_cfg.rope.rope_type = full_type;
+            }
+
+            if (runtime.has_per_layer_dims() && static_cast<std::size_t>(i) < runtime.per_layer_dims.size() &&
+                runtime.per_layer_dims[static_cast<std::size_t>(i)].head_size > 0) {
+                rope_cfg.head_size = runtime.per_layer_dims[static_cast<std::size_t>(i)].head_size;
             }
         }
     }

@@ -223,6 +223,14 @@ void DslModel::allocate_lora_run_state(NCCLCommunicator& comm, int B, int T) {
     const int BT = B * T;
     const int qkv_features = std::max(0, mModelConfig.qkv_channels());
     int max_features = std::max({mModelConfig.HiddenSize, mModelConfig.IntermediateSize, qkv_features});
+    if (mRuntimeConfig.has_per_layer_dims()) {
+        for (const auto& pld : mRuntimeConfig.per_layer_dims) {
+            max_features = std::max<int>(max_features, static_cast<int>(pld.intermediate));
+            max_features = std::max<int>(max_features, static_cast<int>(pld.attn_dim));
+            max_features = std::max<int>(max_features, static_cast<int>(pld.qkv_channels));
+            max_features = std::max<int>(max_features, static_cast<int>(pld.mlp_up));
+        }
+    }
     if (mModelConfig.moe_config.has_value() && mModelConfig.moe_config->use_shared_expert) {
         const int shared_D =
             mModelConfig.moe_config->shared_expert_size > 0

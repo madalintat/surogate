@@ -86,9 +86,17 @@ void CompiledExecutor::dispatch_rmsnorm_backward(const CompiledOp& op) {
     const int C = static_cast<int>(d_out.Sizes[d_out.Rank - 1]);
     const int total_rows = static_cast<int>(d_out.nelem() / C);
 
-    // Standalone rmsnorm backward: dresidual = zero (no upstream residual gradient)
-    Tensor scratch = mRunState.temp_alloc(ETensorDType::BF16, {total_rows}, "rmsnorm_bwd_scratch");
-    mTemps.push_back(scratch);
+    // Reuse the pre-sized global RMSNorm scratch buffer. The kernel requires
+    // get_rmsnorm_backward_scratch_size(C, device) bytes; a tiny ad-hoc temp
+    // scribbles adjacent memory and corrupts standalone sandwich norms.
+    Tensor& scratch = mRunState.scratch().rmsnorm_scratch;
+    const std::size_t required_scratch =
+        static_cast<std::size_t>(get_rmsnorm_backward_scratch_size(C, mRunState.DeviceProp));
+    if (scratch.bytes() < required_scratch) {
+        throw std::runtime_error("rmsnorm_backward: scratch buffer too small for C=" + std::to_string(C) + " (have " +
+                                 std::to_string(scratch.bytes()) + " bytes, need " + std::to_string(required_scratch) +
+                                 ")");
+    }
 
     Tensor zero_dresidual = mRunState.temp_alloc(d_out.DType, {total_rows, C}, "rmsnorm_bwd_zero_dres");
     mTemps.push_back(zero_dresidual);

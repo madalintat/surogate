@@ -143,14 +143,20 @@ public:
 
     /// Set document masking context for Flash Attention varlen dispatch.
     /// When set, dispatch_flash_attention routes to flash varlen instead of cuDNN.
-    void set_doc_masking_context(const std::int32_t* cu_seqlens_gpu, int num_docs, int max_seqlen, int total_q) {
+    void set_doc_masking_context(const std::int32_t* cu_seqlens_gpu,
+                                 const std::int32_t* cu_seqlens_cpu,
+                                 int num_docs,
+                                 int max_seqlen,
+                                 int total_q) {
         mCuSeqlensGpu = cu_seqlens_gpu;
+        mCuSeqlensCpu = cu_seqlens_cpu;
         mNumDocs = num_docs;
         mMaxDocSeqlen = max_seqlen;
         mTotalDocTokens = total_q;
     }
     void clear_doc_masking_context() {
         mCuSeqlensGpu = nullptr;
+        mCuSeqlensCpu = nullptr;
         mNumDocs = 0;
         mMaxDocSeqlen = 0;
         mTotalDocTokens = 0;
@@ -417,6 +423,7 @@ private:
 
     // Document masking context for Flash Attention varlen (null = disabled)
     const std::int32_t* mCuSeqlensGpu = nullptr;
+    const std::int32_t* mCuSeqlensCpu = nullptr;
     int mNumDocs = 0;
     int mMaxDocSeqlen = 0;
     int mTotalDocTokens = 0;

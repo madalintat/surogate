@@ -6,8 +6,11 @@
 #ifndef SUROGATE_SRC_DSL_DSL_RUNTIME_CONFIG_H
 #define SUROGATE_SRC_DSL_DSL_RUNTIME_CONFIG_H
 
+#include <string>
 #include <unordered_set>
 #include <vector>
+
+#include "config/rope_config.h"
 
 namespace dsl {
 
@@ -19,6 +22,11 @@ struct BlockTypeDims {
     long attn_dim = 0;      ///< Hq * D
     long intermediate = 0;  ///< M (may be 2x for double-wide MLP)
     long mlp_up = 0;        ///< up_factor * M
+};
+
+struct LayerRoPEConfig {
+    long head_size = 0;
+    RoPEConfig rope;
 };
 
 struct DslRuntimeConfig {
@@ -33,6 +41,10 @@ struct DslRuntimeConfig {
     /// Per-layer dimensions. Empty for homogeneous models (use global config).
     std::vector<BlockTypeDims> per_layer_dims;
 
+    /// Per-layer RoPE parameters for hybrid models where layer types use
+    /// different head sizes or rope formulas (e.g. Gemma4 full vs sliding).
+    std::vector<LayerRoPEConfig> per_layer_rope;
+
     /// Layer indices whose QKV/qkv_rope activations must be persisted across
     /// layer boundaries (not shared) because other layers read them as
     /// kv_source for shared-KV attention.
@@ -43,6 +55,9 @@ struct DslRuntimeConfig {
     }
     [[nodiscard]] bool has_per_layer_dims() const {
         return !per_layer_dims.empty();
+    }
+    [[nodiscard]] bool has_per_layer_rope() const {
+        return !per_layer_rope.empty();
     }
     [[nodiscard]] bool is_kv_source(int layer_idx) const {
         return kv_source_layers.count(layer_idx) > 0;
