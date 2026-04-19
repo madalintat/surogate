@@ -354,9 +354,7 @@ void DslModel::allocate_run_state(const RuntimeOptions& options,
                 std::cerr << "[DEBUG-STACK] Resizing stack: " << required_size / (1024 * 1024) << " MiB" << " -> "
                           << needed / (1024 * 1024) << " MiB" << std::endl;
             }
-            Tensor new_stack =
-                mAllocator->allocate(ETensorDType::BYTE, "dsl_stack", EAllocationType::ON_DEVICE, {needed});
-            mRunState->set_stack_buffer(std::move(new_stack));
+            mRunState->resize_stack_to(needed);
             required_size = needed;
         }
     }

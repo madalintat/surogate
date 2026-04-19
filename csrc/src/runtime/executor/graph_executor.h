@@ -297,9 +297,15 @@ public:
     void clear_doc_masking();
     void set_inv_temperature_context(const float* inv_temperature_gpu);
 
+    /// Destroy every CUDA-graph capture this executor owns (whole-graph,
+    /// per-layer forward/backward, split-attention per-segment) plus the
+    /// stack checkpoints that referenced them. Intended for callers that
+    /// have just invalidated the DSL stack pointers (e.g. after
+    /// `DslRunState::shrink_stack_to_high_water_mark`).
+    void reset_cuda_graphs();
+
 private:
     void init(const GraphExecutorOptions& options);
-    void reset_cuda_graphs();
     void reset_forward_plan();
     void record_matmul_plan(int layer_idx, modules::MatmulOp op, const MatmulForwardPlan& plan);
     void record_attn_plan(int layer_idx, const AttnForwardPlan& plan);

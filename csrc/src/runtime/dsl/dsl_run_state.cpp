@@ -408,6 +408,36 @@ void DslRunState::set_stack_buffer(Tensor buffer, const DeviceMemoryStack::Alloc
     }
 }
 
+void DslRunState::resize_stack_to(long new_size_bytes) {
+    if (new_size_bytes <= 0) {
+        throw std::runtime_error("DslRunState::resize_stack_to: non-positive size");
+    }
+    // Free the old buffer *before* requesting the new one. The TensorAllocator
+    // retains tracked allocations until its destructor runs, so a naive
+    // allocate+swap would leak the pre-resize buffer to the end of the run
+    // and briefly hold 2x VRAM on tight-memory setups.
+    mAllocator->free(mStackBuffer);
+    Stack = DeviceMemoryStack();
+    Tensor new_stack =
+        mAllocator->allocate(ETensorDType::BYTE, "dsl_stack", EAllocationType::ON_DEVICE, {new_size_bytes});
+    set_stack_buffer(std::move(new_stack));
+}
+
+long DslRunState::shrink_stack_to_high_water_mark(long safety_bytes, long min_savings_bytes) {
+    const long peak = static_cast<long>(Stack.max_utilization());
+    if (peak <= 0) {
+        // Stack has never seen an allocation — nothing to measure.
+        return 0;
+    }
+    const long current = static_cast<long>(mStackBuffer.bytes());
+    const long target = peak + safety_bytes;
+    if (current - target < min_savings_bytes) {
+        return 0;
+    }
+    resize_stack_to(target);
+    return target;
+}
+
 Tensor& DslRunState::get_residual(int layer_idx, cudaStream_t stream) {
     if (!mResidualManager) {
         throw std::runtime_error("DslRunState: residual manager not initialized");

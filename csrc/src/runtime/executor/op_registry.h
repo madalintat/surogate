@@ -25,6 +25,7 @@ namespace dsl {
 
 class CompiledExecutor;
 struct BackwardRuleContext;
+struct BufferPlan;  // fwd — see runtime/dsl/buffer_plan.h. Used by StackBoundFn.
 
 // Uniform dispatch signature. The hook pointer is type-erased because
 // forward and backward hooks are distinct types; each wrapper casts it
@@ -38,12 +39,26 @@ using OpExecFn = void (*)(CompiledExecutor&, const CompiledOp&, const void* hook
 // BackwardRuleRegistry, unifying everything in OpRegistry.
 using AutodiffFn = std::function<std::vector<Operation>(const BackwardRuleContext&)>;
 
+// Upper bound on stack bytes the op's dispatch will allocate internally
+// (workspace buffers, scratch, fused-kernel temps) that are *not* visible
+// as graph-output TensorRefs. Used by `dsl::graph_backward_stack_peak` to
+// size the DSL stack conservatively. Return 0 if the op uses no stack
+// beyond its declared outputs.
+//
+// This is an opt-in hook: ops without a bound register nothing, and the
+// sizing walk treats them as 0 (covered by the outer safety margin in
+// `dsl::required_stack_bytes`). Add a bound when an op ships large enough
+// internal temps to distort sizing (ChunkGatedDeltaRuleBackward, Mamba
+// scan, Flash-Attention backward workspace, etc.).
+using StackBoundFn = long (*)(const CompiledOp& op, const BufferPlan& plan);
+
 struct OpDescriptor {
     std::string name;                               // e.g. "embedding", "softmax"
     CompiledOpType type = CompiledOpType::Unknown;  // may be Unknown for name-only rules
     OpExecFn forward_fn = nullptr;                  // forward-graph dispatch
     OpExecFn backward_fn = nullptr;                 // backward-graph dispatch
     AutodiffFn autodiff_fn;                         // backward-graph generator (autodiff rule)
+    StackBoundFn stack_bound_fn = nullptr;          // op-internal stack bytes (optional)
 };
 
 class OpRegistry {
@@ -112,5 +127,14 @@ private:
     static const int SUROGATE_OP_REG_CONCAT(_surogate_op_reg_, __COUNTER__) = \
         ::dsl::OpRegistry::instance().register_op(                            \
             ::dsl::OpDescriptor{name_str, ::dsl::CompiledOpType::Unknown, nullptr, nullptr, autodiff_fn_})
+
+// Attach a stack-bound function to an already-registered op. Pairs with a
+// prior REGISTER_OP (typically in op_registrations.cpp): the bound fn lives
+// next to the kernel source, keeping the op's workspace model co-located
+// with its dispatch. `stack_fn` is a `::dsl::StackBoundFn`.
+#define REGISTER_STACK_BOUND(name_str, op_type_enum, stack_fn)                         \
+    static const int SUROGATE_OP_REG_CONCAT(_surogate_stack_bound_reg_, __COUNTER__) = \
+        ::dsl::OpRegistry::instance().register_op(                                     \
+            ::dsl::OpDescriptor{name_str, ::dsl::CompiledOpType::op_type_enum, nullptr, nullptr, {}, stack_fn})
 
 #endif  // SUROGATE_SRC_EXECUTOR_OP_REGISTRY_H

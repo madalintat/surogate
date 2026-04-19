@@ -26,6 +26,7 @@ int OpRegistry::register_op(OpDescriptor desc) {
         if (desc.forward_fn) existing.forward_fn = desc.forward_fn;
         if (desc.backward_fn) existing.backward_fn = desc.backward_fn;
         if (desc.autodiff_fn) existing.autodiff_fn = std::move(desc.autodiff_fn);
+        if (desc.stack_bound_fn) existing.stack_bound_fn = desc.stack_bound_fn;
     }
 
     // Mirror type → name. Only record the first type-bearing registration

@@ -7,11 +7,13 @@
 
 #include "runtime/executor/compiled_ops_helpers.h"
 #include "runtime/dsl/autodiff.h"
+#include "runtime/dsl/buffer_plan.h"
 #include "runtime/dsl/op_shape_signatures.h"
 #include "runtime/executor/op_registry.h"
 #include "runtime/executor/graph_executor_utils.h"
 #include "kernels/kernels.h"
 #include "utilities/dtype.h"
+#include "utilities/stack.h"
 
 namespace dsl {
 
@@ -194,9 +196,25 @@ std::vector<Operation> gpt_oss_moe_act_backward(const BackwardRuleContext& ctx) 
 
 }  // namespace
 
+// Upper bound for dispatch_gpt_oss_moe_act_backward. The common path writes
+// d_inp directly into a pre-allocated output slot and uses zero stack. The
+// fallback path (when the output's nelem doesn't match `N * D * 2`) stages
+// through one stack temp of that size. Bound for the fallback — this is
+// what drives the 2 GiB MoE safety slack in the legacy heuristic.
+//
+// For MoE routing, N = B * T * TopK and D*2 = MoeMUp (gated activation).
+long gpt_oss_moe_act_backward_stack_bound(const CompiledOp& op, const BufferPlan& plan) {
+    (void)op;  // shape derived from plan only: MoE routes at plan-B*T*TopK granularity.
+    if (!plan.has_moe()) return 0;
+    const long total_tokens = plan.B * plan.T * plan.TopK;
+    const long input_bytes = static_cast<long>(get_dtype_size(plan.act_dtype));
+    return align_stack_bytes(total_tokens * plan.MoeMUp * input_bytes);
+}
+
 }  // namespace dsl
 
 REGISTER_AUTODIFF("gpt_oss_moe_act", ::dsl::gpt_oss_moe_act_backward);
+REGISTER_STACK_BOUND("gpt_oss_moe_act_backward", GptOssMoeActBackward, ::dsl::gpt_oss_moe_act_backward_stack_bound);
 
 // ---------------------------------------------------------------------------
 // Shape signatures (Phase 2c)

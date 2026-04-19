@@ -248,6 +248,34 @@ TensorAllocator::allocate_impl(ETensorDType dtype, const char* name, EAllocation
     }
 }
 
+void TensorAllocator::free(Tensor& tensor) {
+    if (tensor.Data == nullptr) return;
+    auto it = std::find_if(m_Pointers.begin(), m_Pointers.end(), [&](const sAllocationData& rec) {
+        return rec.Pointer == tensor.Data;
+    });
+    if (it == m_Pointers.end()) {
+        // Allocation not tracked by this allocator (view, external ptr, etc.).
+        tensor.Data = nullptr;
+        return;
+    }
+    const long bytes = it->Size;
+    switch (it->Kind) {
+        case EAllocationType::ON_DEVICE:
+        case EAllocationType::MANAGED: CUDA_CHECK(cudaFree(it->Pointer)); break;
+        case EAllocationType::PINNED:
+        case EAllocationType::WRITE_CMB: CUDA_CHECK(cudaFreeHost(it->Pointer)); break;
+        case EAllocationType::ON_HOST: delete[] it->Pointer; break;
+    }
+    // Keep per-tensor stats honest: subtracting zeros out so subsequent
+    // total_allocation() calls don't count this buffer twice.
+    record_stats(m_Stats->TensorStats, it->Name.c_str(), it->Kind, -bytes);
+    if (!it->Context.empty()) {
+        record_stats(m_Stats->ContextStats, it->Context, it->Kind, -bytes);
+    }
+    m_Pointers.erase(it);
+    tensor.Data = nullptr;
+}
+
 /**
  * @brief Construct a TensorAllocator with empty allocation statistics.
  */

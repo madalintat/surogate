@@ -13,11 +13,13 @@
 
 #include "runtime/executor/compiled_ops_helpers.h"
 #include "runtime/dsl/autodiff.h"
+#include "runtime/dsl/buffer_plan.h"
 #include "runtime/executor/op_registry.h"
 #include "runtime/executor/graph_executor_utils.h"
 #include "kernels/kernels.h"
 #include "utilities/comm.h"
 #include "utilities/dtype.h"
+#include "utilities/stack.h"
 
 namespace dsl {
 
@@ -555,6 +557,48 @@ std::vector<Operation> mamba_gated_rmsnorm_backward(const BackwardRuleContext& c
 
 }  // namespace
 
+// Upper bound for dispatch_mamba_gated_rmsnorm_backward. Worst case covers
+// both norm_before_gate branches (they allocate disjoint extras, so the
+// larger decides the peak). Per-call temps:
+//   silu_gate                 <input dtype>  B*T*D
+//   recomputed_rstd           FP32           B*T*groups
+//   recomputed_normed_or_gated <input dtype>  B*T*D
+//   d_x, d_gate               <out dtype>    B*T*D each
+//   d_weight_fp32             FP32           D
+//   + branch-specific extras (each branch allocates up to two more B*T*D):
+//     norm_before_gate=True  → d_normed, d_out_times_normed
+//     norm_before_gate=False → tmp_normed (recompute), d_gated
+//   Both branches allocate 2 more B*T*D tensors, so we bound with 2.
+long mamba_gated_rmsnorm_backward_stack_bound(const CompiledOp& op, const BufferPlan& plan) {
+    if (op.inputs.size() < 2) return 0;
+    const auto& x_shape = op.inputs[1].shape;
+    if (x_shape.empty()) return 0;
+    const long D = x_shape.back();
+    if (D <= 0) return 0;
+
+    const long B = plan.B;
+    const long T = plan.T;
+    const long groups = std::max<long>(1, op.attrs.n_groups > 0 ? op.attrs.n_groups : 1);
+    const long input_bytes = static_cast<long>(get_dtype_size(plan.act_dtype));
+    constexpr long FP32 = 4;
+    const long BTD = B * T * D;
+
+    long bytes = 0;
+    bytes += align_stack_bytes(BTD * input_bytes);      // silu_gate
+    bytes += align_stack_bytes(B * T * groups * FP32);  // recomputed_rstd
+    bytes += align_stack_bytes(BTD * input_bytes);      // recomputed_normed_or_gated
+    bytes += align_stack_bytes(BTD * input_bytes) * 2;  // d_x, d_gate
+    bytes += align_stack_bytes(D * FP32);               // d_weight_fp32
+    // Worst-case branch extras: two more B*T*D tensors (norm_before_gate=True
+    // path: d_normed + d_out_times_normed; norm_before_gate=False path:
+    // tmp_normed + d_gated). Same count in both.
+    bytes += align_stack_bytes(BTD * input_bytes) * 2;
+    return bytes;
+}
+
 }  // namespace dsl
 
 REGISTER_AUTODIFF("mamba_gated_rmsnorm", ::dsl::mamba_gated_rmsnorm_backward);
+REGISTER_STACK_BOUND("mamba_gated_rmsnorm_backward",
+                     MambaGatedRMSNormBackward,
+                     ::dsl::mamba_gated_rmsnorm_backward_stack_bound);

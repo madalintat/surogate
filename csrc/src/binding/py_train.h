@@ -134,6 +134,16 @@ public:
 
     std::vector<std::pair<std::string, sSegmentMemory>> get_allocations(int gpu_id);
     std::vector<std::pair<std::string, long>> get_stack_info(int gpu_id);
+
+    /// Shrink the DSL stack on every rank to the measured high-water mark plus
+    /// `safety_bytes`, provided the savings exceed `min_savings_bytes`.
+    /// Intended to be called exactly once by the trainer after the first full
+    /// training step has returned — at that point the stack is empty and
+    /// `max_utilization` reflects the true runtime peak for this (B, T).
+    ///
+    /// Returns per-rank (new_size, old_size) pairs. (new_size == 0) means
+    /// the rank did not resize (either not worth it or stack unused).
+    std::vector<std::pair<long, long>> shrink_stack_after_warmup(long safety_bytes, long min_savings_bytes);
     std::vector<std::pair<std::string, Tensor>> get_gradients(int gpu_id);
     std::vector<std::pair<std::string, Tensor>> get_lora_gradients(int gpu_id);
     std::vector<std::pair<std::string, Tensor>> get_lora_weights(int gpu_id);
@@ -202,6 +212,21 @@ private:
         std::vector<Tensor> inputs;
         std::vector<Tensor> targets;
         std::vector<Tensor> position_ids;
+
+        /// Destroy the captured graph and clear capture/stack-checkpoint
+        /// state. Leaves the pinned I/O buffers (`opt_params`, `opt_step`,
+        /// `inputs`, `targets`, `position_ids`) intact — those are still
+        /// valid after a stack resize since they live in the allocator.
+        void reset_capture() {
+            if (graph_exec) {
+                (void)cudaGraphExecDestroy(graph_exec);
+                graph_exec = nullptr;
+            }
+            captured = false;
+            has_stack_checkpoint = false;
+            stack_top = nullptr;
+            stack_alloc_count = 0;
+        }
     };
     struct sThreadContext {
         NCCLCommunicator* Communicator;

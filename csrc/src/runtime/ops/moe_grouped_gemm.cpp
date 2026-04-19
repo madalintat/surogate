@@ -10,11 +10,13 @@
 
 #include "runtime/executor/compiled_ops_helpers.h"
 #include "runtime/dsl/autodiff.h"
+#include "runtime/dsl/buffer_plan.h"
 #include "runtime/executor/op_registry.h"
 #include "runtime/executor/graph_executor_utils.h"
 #include "kernels/kernels.h"
 #include "recipes/recipe.h"
 #include "utilities/dtype.h"
+#include "utilities/stack.h"
 #include "runtime/lora/lora_config.h"
 #include "runtime/lora/lora_grads_manager.h"
 #include "runtime/lora/lora_run_state.h"
@@ -1111,6 +1113,36 @@ std::vector<Operation> moe_grouped_gemm_backward(const BackwardRuleContext& ctx)
 
 }  // namespace
 
+// Upper bound for dispatch_moe_grouped_gemm_backward. Dominant temp is
+// `d_inp` = [total_tokens, in_features] in the d_out dtype; the FP8-hybrid
+// recipe path also stages a quantized d_out + scalar stats which is smaller
+// than d_inp and so rolled into a 1.5x factor.
+//
+// Shapes taken from op.inputs: d_out is inputs[0] of rank 2
+// [total_tokens, out_features]; inp is inputs[1] of rank 2
+// [total_tokens, in_features].
+long moe_grouped_gemm_backward_stack_bound(const CompiledOp& op, const BufferPlan& plan) {
+    if (op.inputs.size() < 2) return 0;
+    const auto& dout_shape = op.inputs[0].shape;
+    const auto& inp_shape = op.inputs[1].shape;
+    if (dout_shape.size() < 2 || inp_shape.size() < 2) return 0;
+    const long total_tokens = dout_shape[0];
+    const long in_features = inp_shape[1];
+    const long out_features = dout_shape[1];
+    const long dtype_bytes = static_cast<long>(get_dtype_size(op.inputs[0].dtype));
+    if (total_tokens <= 0 || in_features <= 0 || dtype_bytes <= 0) return 0;
+
+    long bytes = align_stack_bytes(total_tokens * in_features * dtype_bytes);  // d_inp
+    // FP8 hybrid: add dout_quant (E5M2, 1 byte/elem) and 2 FP32 scalars.
+    // Gated by recipe at runtime; bound unconditionally to keep the upper
+    // bound valid regardless of recipe selection.
+    bytes += align_stack_bytes(total_tokens * out_features);
+    bytes += align_stack_bytes(2 * 4);
+    (void)plan;
+    return bytes;
+}
+
 }  // namespace dsl
 
 REGISTER_AUTODIFF("moe_grouped_gemm", ::dsl::moe_grouped_gemm_backward);
+REGISTER_STACK_BOUND("moe_grouped_gemm_backward", MoEGroupedGemmBackward, ::dsl::moe_grouped_gemm_backward_stack_bound);

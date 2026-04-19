@@ -54,6 +54,25 @@ public:
     /// backward graph is compiled and peak-modelled more accurately).
     void set_stack_buffer(Tensor buffer, const DeviceMemoryStack::AllocationList& high_mark = {});
 
+    /// Reallocate the DSL stack at `new_size_bytes`, freeing the old buffer
+    /// first so VRAM is actually reclaimed (otherwise `TensorAllocator`
+    /// retains the old allocation until its own destructor runs).
+    void resize_stack_to(long new_size_bytes);
+
+    /// Shrink the stack to `Stack.max_utilization() + safety_bytes` if the
+    /// savings exceed `min_savings_bytes`. Intended to be called *once* after
+    /// the first full forward+backward completes, to recover headroom left by
+    /// the upfront heuristic (which must be conservative — see
+    /// `dsl::required_stack_bytes`).
+    ///
+    /// Only shrinks; never grows. The caller must ensure the stack is empty
+    /// at the point of this call (post-backward is a natural point — the
+    /// DSL frees everything when a step ends).
+    ///
+    /// @returns the new stack size in bytes if a resize happened, 0 otherwise.
+    long shrink_stack_to_high_water_mark(long safety_bytes = 64L * 1024 * 1024,
+                                         long min_savings_bytes = 128L * 1024 * 1024);
+
     modules::SimplifiedLayerActivations& simplified_acts(int layer_idx) {
         return mSimplifiedActivations[layer_idx];
     }

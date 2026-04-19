@@ -10,10 +10,12 @@
 
 #include "runtime/executor/compiled_ops_helpers.h"
 #include "runtime/dsl/autodiff.h"
+#include "runtime/dsl/buffer_plan.h"
 #include "runtime/executor/op_registry.h"
 #include "runtime/executor/graph_executor_utils.h"
 #include "kernels/kernels.h"
 #include "utilities/dtype.h"
+#include "utilities/stack.h"
 
 namespace dsl {
 
@@ -325,6 +327,53 @@ std::vector<Operation> mamba_ssm_scan_backward(const BackwardRuleContext& ctx) {
 
 }  // namespace
 
+// Upper bound for dispatch_mamba_ssm_scan_backward. Per-call temps:
+//   A          FP32  D*dstate               (expanded A_log)
+//   D_exp      FP32  D                      (expanded head param)
+//   dt_bias    FP32  D                      (expanded head param)
+//   d_out_bdt  <input dtype>  B*D*T         (transposed d_out)
+//   du         <input dtype>  B*D*T
+//   ddelta     <input dtype>  B*D*T
+//   dA         FP32  D*dstate
+//   dB         FP32  B*groups*dstate*T
+//   dC         FP32  B*groups*dstate*T
+//   dD_exp     FP32  D
+//   ddt_bias_exp FP32 D
+//   dA_log/dD/ddt_bias  FP32 num_heads each (tiny)
+//
+// Dimensions read from op.attrs — matches dispatch_mamba_ssm_scan_backward.
+long mamba_ssm_scan_backward_stack_bound(const CompiledOp& op, const BufferPlan& plan) {
+    const long num_heads = op.attrs.mamba_num_heads;
+    const long head_dim = op.attrs.mamba_head_dim;
+    if (num_heads <= 0 || head_dim <= 0) return 0;
+    const long D =
+        op.attrs.intermediate_size > 0 ? static_cast<long>(op.attrs.intermediate_size) : num_heads * head_dim;
+    const long groups = std::max<long>(1, op.attrs.n_groups);
+    const long dstate = op.attrs.ssm_state_size;
+    if (D <= 0 || dstate <= 0) return 0;
+
+    const long B = plan.B;
+    const long T = plan.T;
+    const long input_bytes = static_cast<long>(get_dtype_size(plan.act_dtype));
+    constexpr long FP32 = 4;
+
+    long bytes = 0;
+    bytes += align_stack_bytes(D * dstate * FP32);               // A
+    bytes += align_stack_bytes(D * FP32);                        // D_exp
+    bytes += align_stack_bytes(D * FP32);                        // dt_bias_exp
+    bytes += align_stack_bytes(B * D * T * input_bytes);         // d_out_bdt
+    bytes += align_stack_bytes(B * D * T * input_bytes);         // du
+    bytes += align_stack_bytes(B * D * T * input_bytes);         // ddelta
+    bytes += align_stack_bytes(D * dstate * FP32);               // dA
+    bytes += align_stack_bytes(B * groups * dstate * T * FP32);  // dB
+    bytes += align_stack_bytes(B * groups * dstate * T * FP32);  // dC
+    bytes += align_stack_bytes(D * FP32);                        // dD_exp
+    bytes += align_stack_bytes(D * FP32);                        // ddelta_bias_exp
+    bytes += align_stack_bytes(num_heads * FP32) * 3;            // dA_log, dD, ddelta_bias
+    return bytes;
+}
+
 }  // namespace dsl
 
 REGISTER_AUTODIFF("mamba_ssm_scan", ::dsl::mamba_ssm_scan_backward);
+REGISTER_STACK_BOUND("mamba_ssm_scan_backward", MambaSsmScanBackward, ::dsl::mamba_ssm_scan_backward_stack_bound);

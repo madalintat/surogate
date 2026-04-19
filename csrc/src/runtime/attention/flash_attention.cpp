@@ -24,6 +24,7 @@
 #include "runtime/attention/attention_backend.h"
 #include "runtime/attention/attention_kernels.h"
 #include "runtime/dsl/autodiff.h"
+#include "runtime/dsl/buffer_plan.h"
 #include "runtime/dsl/op_shape_signatures.h"
 #include "runtime/executor/compiled_ops_helpers.h"
 #include "runtime/executor/graph_executor_helpers.h"
@@ -31,6 +32,7 @@
 #include "runtime/executor/op_registry.h"
 #include "utilities/comm.h"
 #include "utilities/dtype.h"
+#include "utilities/stack.h"
 #include "utilities/utils.h"
 
 namespace dsl {
@@ -527,10 +529,52 @@ std::vector<Operation> flash_attention_backward(const BackwardRuleContext& ctx) 
 
 }  // namespace
 
+// Upper bound on stack bytes for the FlashAttention varlen backward backend
+// (the most memory-hungry of the available backends — cuDNN uses a pre-
+// allocated persistent workspace, custom/sdpa are smaller). If dispatch
+// picks a cheaper backend at runtime, this over-provisions — accepted
+// because the bound must be safe for every backend selection.
+//
+// Per-layer temps allocated by FlashVarlenAttention::backward:
+//   dq_accum   FP32  padded_total * Hq * Hs_rounded  (× splits, assumed 1)
+//   dsoftmax   FP32  padded_total * Hq
+//   dk_exp     BF16  total_q * Hq * Hs               (GQA only, Hq != Hkv)
+//   dv_exp     BF16  total_q * Hq * Hs               (GQA only, Hq != Hkv)
+// where padded_total = total_q + 128 * num_docs, Hs_rounded rounds Hs up
+// to 32 (Hs <= 128) or 64 (Hs > 128). Without doc-masking at plan time we
+// assume num_docs = 1; the 128-token padding is small relative to B*T.
+//
+// Inputs from autodiff: [d_out, out, lse, qkv, sinks?]
+//   qkv shape = [B, T, Hq + 2*Hkv, Hs]
+long flash_attention_backward_stack_bound(const CompiledOp& op, const BufferPlan& plan) {
+    if (op.inputs.size() < 4 || op.inputs[3].shape.size() < 4) return 0;
+    const auto& qkv_shape = op.inputs[3].shape;
+    const long Hq = plan.Hq;
+    const long Hkv = plan.Hkv;
+    const long Hs = qkv_shape[qkv_shape.size() - 1];
+    if (Hq <= 0 || Hs <= 0) return 0;
+
+    constexpr long BF16 = 2, FP32 = 4;
+    // Conservative: num_docs = 1 (pre-packing). +128 padding per doc.
+    const long total_q = plan.B * plan.T;
+    const long padded_total = total_q + 128;
+    const long Hs_rounded = Hs <= 128 ? ((Hs + 31) / 32) * 32 : ((Hs + 63) / 64) * 64;
+
+    long bytes = 0;
+    bytes += align_stack_bytes(padded_total * Hq * Hs_rounded * FP32);  // dq_accum
+    bytes += align_stack_bytes(padded_total * Hq * FP32);               // dsoftmax
+    if (Hq != Hkv) {
+        bytes += align_stack_bytes(total_q * Hq * Hs * BF16);  // dk_expanded
+        bytes += align_stack_bytes(total_q * Hq * Hs * BF16);  // dv_expanded
+    }
+    return bytes;
+}
+
 }  // namespace dsl
 
 REGISTER_AUTODIFF("flash_attention", ::dsl::flash_attention_backward);
 REGISTER_AUTODIFF("flash_attention_qkv", ::dsl::flash_attention_backward);
+REGISTER_STACK_BOUND("flash_attention_backward", FlashAttentionBackward, ::dsl::flash_attention_backward_stack_bound);
 
 // ---------------------------------------------------------------------------
 // Shape signatures (Phase 2c)

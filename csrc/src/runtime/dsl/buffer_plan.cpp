@@ -8,6 +8,7 @@
 
 #include "runtime/core/model_config.h"
 #include "runtime/dsl/graph_compiler.h"
+#include "runtime/executor/op_registry.h"
 #include "utilities/stack.h"
 
 namespace dsl {
@@ -221,50 +222,14 @@ long graph_backward_stack_peak(const CompiledGraph* bwd_graph, const BufferPlan&
             }
         }
 
-        // (2) Op-internal temps allocated by dispatch functions. These are
-        //     NOT visible as graph-output TensorRefs, so we hand-model the
-        //     heavy ops here (checked in unit tests).
-        if (op.type == CompiledOpType::ChunkGatedDeltaRuleBackward) {
-            // Inputs: q=[B,T,H,K], v=[B,T,H_v,V] (H_v may differ from H for GQA)
-            long H = 0, K = 0, V = 0;
-            if (op.inputs.size() >= 1 && op.inputs[0].shape.size() == 4) {
-                H = op.inputs[0].shape[2];
-                K = op.inputs[0].shape[3];
-            }
-            if (op.inputs.size() >= 3 && op.inputs[2].shape.size() == 4) {
-                V = op.inputs[2].shape[3];
-            }
-            if (H > 0 && K > 0 && V > 0) {
-                const long T = plan.T;
-                const long B = plan.B;
-                const long chunk_size = op.attrs.chunk_size > 0 ? static_cast<long>(op.attrs.chunk_size) : 64L;
-                const long NT = (T + chunk_size - 1) / chunk_size;
-                const long BF16 = 2, FP32 = 4;
-                long internal = 0;
-                // Forward recompute temps
-                internal += align_stack_bytes(B * T * H * FP32);               // g_cum
-                internal += align_stack_bytes(B * T * H * chunk_size * FP32);  // A
-                internal += align_stack_bytes(B * T * H * chunk_size * BF16);  // Ai
-                internal += align_stack_bytes(B * T * H * K * BF16);           // w
-                internal += align_stack_bytes(B * T * H * V * BF16);           // u
-                internal += align_stack_bytes(B * NT * H * K * V * BF16);      // h
-                internal += align_stack_bytes(B * H * K * V * FP32);           // ht_dummy
-                internal += align_stack_bytes(B * T * H * V * BF16);           // v_new
-                internal += align_stack_bytes(B * H * K * V * BF16);           // h0_buf
-                // L2-norm temps (forward + backward)
-                internal += align_stack_bytes(B * T * H * K * BF16) * 4;  // q_norm, k_norm, dq_norm, dk_norm
-                internal += align_stack_bytes(B * T * H * FP32) * 4;      // q_rstd, k_rstd (fwd+bwd)
-                // Backward-specific temps
-                internal += align_stack_bytes(B * NT * H * K * V * BF16);  // dh
-                internal += align_stack_bytes(B * T * H * V * BF16);       // dv2
-                internal += align_stack_bytes(B * H * K * V * FP32);       // dht_zero
-                internal += align_stack_bytes(B * T * H * K * BF16);       // dw
-                internal += align_stack_bytes(B * T * H * FP32);           // dg_wy
-                internal += align_stack_bytes(B * T * H * FP32);           // dg_out
-                const long NK = std::max(1L, K / chunk_size);
-                internal += align_stack_bytes(NK * B * T * H * FP32);  // dg_nk
-                current += internal;
-            }
+        // (2) Op-internal temps allocated by dispatch functions — workspaces,
+        //     recompute scratch, fused-kernel temps — that are NOT visible
+        //     as graph-output TensorRefs. Ops opt in by registering a
+        //     `StackBoundFn` alongside their dispatch (see op_registry.h's
+        //     `REGISTER_STACK_BOUND`). Ops without a bound contribute 0; the
+        //     outer safety margin in `required_stack_bytes` covers them.
+        if (const auto* desc = OpRegistry::instance().find(op.type); desc && desc->stack_bound_fn) {
+            current += desc->stack_bound_fn(op, plan);
         }
 
         peak = std::max(peak, current);

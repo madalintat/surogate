@@ -17,10 +17,12 @@
 
 #include "runtime/executor/compiled_ops_helpers.h"
 #include "runtime/dsl/autodiff.h"
+#include "runtime/dsl/buffer_plan.h"
 #include "runtime/dsl/op_shape_signatures.h"
 #include "runtime/executor/op_registry.h"
 #include "runtime/executor/graph_executor_utils.h"
 #include "utilities/comm.h"
+#include "utilities/stack.h"
 #include "utilities/utils.h"
 
 namespace dsl {
@@ -835,9 +837,62 @@ std::vector<Operation> chunk_gated_delta_rule_backward_rule(const BackwardRuleCo
 
 }  // namespace
 
+// Upper bound on stack bytes that `bwd_chunk_gated_delta_rule` allocates
+// internally. The dispatch recomputes the forward (g_cum, A, Ai, w, u, h,
+// v_new, h0_buf, q/k norm temps) and allocates additional backward temps
+// (dh, dv2, dht_zero, dw, dg_*). Each is rounded up to the 4 KiB stack
+// alignment independently — see `DeviceMemoryStack::allocate`.
+//
+// Inputs (validated at compile time, see shape signatures below):
+//   inputs[0] = q    [B, T, H, K]
+//   inputs[2] = v    [B, T, H_v, V]   (H_v may differ from H for GQA)
+long cgr_backward_stack_bound(const CompiledOp& op, const BufferPlan& plan) {
+    long H = 0, K = 0, V = 0;
+    if (op.inputs.size() >= 1 && op.inputs[0].shape.size() == 4) {
+        H = op.inputs[0].shape[2];
+        K = op.inputs[0].shape[3];
+    }
+    if (op.inputs.size() >= 3 && op.inputs[2].shape.size() == 4) {
+        V = op.inputs[2].shape[3];
+    }
+    if (H <= 0 || K <= 0 || V <= 0) return 0;
+
+    const long B = plan.B;
+    const long T = plan.T;
+    const long chunk_size = op.attrs.chunk_size > 0 ? static_cast<long>(op.attrs.chunk_size) : 64L;
+    const long NT = (T + chunk_size - 1) / chunk_size;
+    constexpr long BF16 = 2, FP32 = 4;
+
+    long bytes = 0;
+    // Forward recompute temps
+    bytes += align_stack_bytes(B * T * H * FP32);               // g_cum
+    bytes += align_stack_bytes(B * T * H * chunk_size * FP32);  // A
+    bytes += align_stack_bytes(B * T * H * chunk_size * BF16);  // Ai
+    bytes += align_stack_bytes(B * T * H * K * BF16);           // w
+    bytes += align_stack_bytes(B * T * H * V * BF16);           // u
+    bytes += align_stack_bytes(B * NT * H * K * V * BF16);      // h
+    bytes += align_stack_bytes(B * H * K * V * FP32);           // ht_dummy
+    bytes += align_stack_bytes(B * T * H * V * BF16);           // v_new
+    bytes += align_stack_bytes(B * H * K * V * BF16);           // h0_buf
+    // L2-norm temps (forward + backward): q_norm, k_norm, dq_norm, dk_norm + rstds.
+    bytes += align_stack_bytes(B * T * H * K * BF16) * 4;
+    bytes += align_stack_bytes(B * T * H * FP32) * 4;
+    // Backward-specific temps
+    bytes += align_stack_bytes(B * NT * H * K * V * BF16);  // dh
+    bytes += align_stack_bytes(B * T * H * V * BF16);       // dv2
+    bytes += align_stack_bytes(B * H * K * V * FP32);       // dht_zero
+    bytes += align_stack_bytes(B * T * H * K * BF16);       // dw
+    bytes += align_stack_bytes(B * T * H * FP32);           // dg_wy
+    bytes += align_stack_bytes(B * T * H * FP32);           // dg_out
+    const long NK = std::max(1L, K / chunk_size);
+    bytes += align_stack_bytes(NK * B * T * H * FP32);  // dg_nk
+    return bytes;
+}
+
 }  // namespace dsl
 
 REGISTER_AUTODIFF("chunk_gated_delta_rule", ::dsl::chunk_gated_delta_rule_backward_rule);
+REGISTER_STACK_BOUND("chunk_gated_delta_rule_backward", ChunkGatedDeltaRuleBackward, ::dsl::cgr_backward_stack_bound);
 
 // ---------------------------------------------------------------------------
 // Shape signatures (Phase 2c)

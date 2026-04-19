@@ -1859,6 +1859,33 @@ NB_MODULE(_surogate, m) {
             "Get current memory allocator statistics.\n\n"
             "Parameters:\n- gpu_id: Which GPU to query.\n\n"
             "Returns: dict[str, dict] with per-segment counters; stack entries include {'stack': bytes}.")
+        .def(
+            "shrink_stack_after_warmup",
+            [](MultiGPUPyTrainer* trainer, long safety_mb, long min_savings_mb) {
+                // Convert MiB inputs to bytes at the binding boundary.
+                const long safety = safety_mb * 1024 * 1024;
+                const long min_savings = min_savings_mb * 1024 * 1024;
+                auto results = trainer->shrink_stack_after_warmup(safety, min_savings);
+                // Hand-marshal to Python tuples — std::pair requires
+                // nanobind/stl/pair.h which isn't included here.
+                nb::list out;
+                for (const auto& [new_size, old_size] : results) {
+                    out.append(nb::make_tuple(new_size, old_size));
+                }
+                return out;
+            },
+            nb::arg("safety_mb") = 64,
+            nb::arg("min_savings_mb") = 128,
+            "Shrink the DSL stack on every rank to the measured high-water mark\n"
+            "plus `safety_mb`, provided the savings exceed `min_savings_mb`.\n"
+            "Call this exactly once after the first full training step — the\n"
+            "stack is empty at that point and `max_utilization` reflects the\n"
+            "true runtime peak.\n\n"
+            "Parameters:\n"
+            "- safety_mb: headroom above the observed peak (default 64).\n"
+            "- min_savings_mb: skip resize if savings are below this (default 128).\n\n"
+            "Returns: list of (new_size_bytes, old_size_bytes) per rank;\n"
+            "new_size_bytes == 0 means the rank kept its existing stack.")
         .def_static(
             "create_multinode",
             [](int ngpu,

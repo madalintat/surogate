@@ -255,6 +255,13 @@ public:
     /// lazy runtime allocations from step 0 are settled.
     void auto_tune_offloading();
 
+    /// Destroy every CUDA-graph capture (whole-graph, per-layer forward/
+    /// backward, split-attention segment graphs) and clear the stack
+    /// checkpoints that referenced them. Intended to be called after the
+    /// DSL stack buffer has been swapped — any captured tensor addresses
+    /// from before the swap are invalid.
+    void invalidate_cuda_graphs();
+
     float get_loss() const override;
     float get_accuracy() const override;
 

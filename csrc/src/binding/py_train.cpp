@@ -714,14 +714,7 @@ std::pair<float, float> MultiGPUPyTrainer::train_step_graphed(const std::int32_t
 
         // Reset graph if shape or accumulation changed.
         if (gs.captured && (gs.captured_B != B || gs.captured_T != T || gs.captured_grad_accum != micro_steps)) {
-            if (gs.graph_exec) {
-                CUDA_CHECK(cudaGraphExecDestroy(gs.graph_exec));
-                gs.graph_exec = nullptr;
-            }
-            gs.captured = false;
-            gs.has_stack_checkpoint = false;
-            gs.stack_top = nullptr;
-            gs.stack_alloc_count = 0;
+            gs.reset_capture();
         }
 
         // Allocate per-micro-step pinned buffers if needed.
@@ -1349,10 +1342,7 @@ void MultiGPUPyTrainer::main_loop(NCCLCommunicator& comm) {
 
     // free resources
     if (ctx.FullStepGraph) {
-        if (ctx.FullStepGraph->graph_exec) {
-            CUDA_CHECK(cudaGraphExecDestroy(ctx.FullStepGraph->graph_exec));
-            ctx.FullStepGraph->graph_exec = nullptr;
-        }
+        ctx.FullStepGraph->reset_capture();
         ctx.FullStepGraph.reset();
     }
     ctx.Model.reset();
@@ -1403,6 +1393,40 @@ std::vector<std::pair<std::string, long>> MultiGPUPyTrainer::get_stack_info(int 
     run_work([&result](sThreadContext& ctx) { result = ctx.Model->get_run_state().Stack.get_allocation_stats(); },
              gpu_id);
     return result;
+}
+
+std::vector<std::pair<long, long>> MultiGPUPyTrainer::shrink_stack_after_warmup(long safety_bytes,
+                                                                                long min_savings_bytes) {
+    std::vector<std::pair<long, long>> results(mContexts.size(), {0L, 0L});
+    run_work([&results, safety_bytes, min_savings_bytes](sThreadContext& ctx) {
+        auto* dsl_rs = dynamic_cast<dsl::DslRunState*>(&ctx.Model->get_run_state());
+        if (!dsl_rs) {
+            return;  // Only the DSL run-state has a shrinkable stack.
+        }
+        const long old_size = static_cast<long>(dsl_rs->Stack.capacity());
+        const long new_size = dsl_rs->shrink_stack_to_high_water_mark(safety_bytes, min_savings_bytes);
+        if (new_size > 0) {
+            // The new stack buffer lives at a different device address, so
+            // every CUDA-graph capture that hardcoded the old buffer's
+            // pointers is invalid. Tear down:
+            //   1. The per-trainer "full-step" graph capture (inputs +
+            //      forward + backward + optimizer rolled into one graph).
+            //   2. Every graph owned by the GraphExecutor — whole-graph,
+            //      per-layer forward/backward, and split-attention
+            //      per-segment captures — plus their stack checkpoints.
+            // They re-capture on step 1 against the new buffer; one extra
+            // capture pass is cheap vs. carrying the inflated upfront
+            // allocation for the whole training run.
+            if (ctx.FullStepGraph) {
+                ctx.FullStepGraph->reset_capture();
+            }
+            if (auto* dsl_model = dynamic_cast<dsl::DslModel*>(ctx.Model.get())) {
+                dsl_model->invalidate_cuda_graphs();
+            }
+        }
+        results[static_cast<std::size_t>(ctx.Communicator->rank())] = {new_size, old_size};
+    });
+    return results;
 }
 
 /**

@@ -36,6 +36,9 @@ public:
     std::size_t unused_capacity() const;
     std::size_t bytes_used() const;
     std::size_t max_utilization() const;
+    [[nodiscard]] std::size_t capacity() const {
+        return mCapacity;
+    }
     int device_id() const;
     bool owns(const std::byte* ptr) const;
     bool is_live(const std::byte* ptr) const;

@@ -114,6 +114,11 @@ class SurogateTrainerWrapper:
             # Calculate steps
             self.steps_per_epoch = self.train_loader.num_tokens // self.total_batch_size
 
+        # First training step triggers a one-shot DSL stack shrink; see
+        # `_maybe_shrink_stack_after_warmup`. Gated here so resumed-from-
+        # checkpoint runs still measure the first *executed* step.
+        self._stack_shrunk = False
+
         # Create trainer
         self.start_step = 0
         if config.resume_from_checkpoint:
@@ -573,6 +578,7 @@ class SurogateTrainerWrapper:
 
             self._maybe_log_lora_grad_stats(step)
             result = self.trainer.update_with_config(opt_config, step + 1)
+            self._maybe_shrink_stack_after_warmup()
 
             step_time = time.time() - step_start
             tokens_processed = (
@@ -871,6 +877,7 @@ class SurogateTrainerWrapper:
                 # Optional LoRA gradient debug (before optimizer update)
                 self._maybe_log_lora_grad_stats(step)
                 result = self.trainer.update_with_config(opt_config, step + 1)
+            self._maybe_shrink_stack_after_warmup()
 
             # Build structured metrics for this step
             step_time = time.time() - step_start
@@ -938,6 +945,29 @@ class SurogateTrainerWrapper:
                     )
 
         logger.info(f"Training loop completed successfully after step {self.max_steps - 1}")
+
+    def _maybe_shrink_stack_after_warmup(self) -> None:
+        """Shrink the DSL stack to the observed peak after the first step.
+
+        The upfront stack sizing (`dsl::required_stack_bytes`) must be a safe
+        upper bound — it pads for unmodeled op-internal temps. After one full
+        forward+backward, the real peak is known via `Stack.max_utilization`,
+        and the allocator can recover the slack for other buffers.
+        """
+        if self._stack_shrunk:
+            return
+        self._stack_shrunk = True
+        try:
+            results = self.trainer.shrink_stack_after_warmup()
+        except Exception as exc:  # pragma: no cover - best-effort optimization
+            logger.warning(f"Stack shrink failed: {exc}")
+            return
+        resized = [r for r in results if r[0] > 0]
+        if not resized:
+            return
+        new_mib = resized[0][0] // (1024 * 1024)
+        old_mib = resized[0][1] // (1024 * 1024)
+        logger.info(f"DSL stack shrunk to measured peak: {old_mib} MiB -> {new_mib} MiB")
 
     def _maybe_log_lora_grad_stats(self, step: int) -> None:
         if not self.config.lora:

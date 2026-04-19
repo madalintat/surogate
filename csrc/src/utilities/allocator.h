@@ -60,6 +60,16 @@ public:
                                const std::vector<long>& shape,
                                EAllocationType kind = EAllocationType::ON_DEVICE);
 
+    /// Free a single tensor's backing storage via `cudaFree` / `cudaFreeHost`
+    /// / `delete[]` and remove it from the tracked allocation list. `tensor`
+    /// is reset to null so accidental reuse is a null-pointer deref, not a
+    /// use-after-free. A no-op if `tensor.Data` is null or not managed here.
+    ///
+    /// The allocator otherwise retains every allocation until destruction;
+    /// use this only for buffers with well-defined lifetimes that need to be
+    /// reclaimed mid-run (e.g. the DSL stack buffer on resize).
+    void free(Tensor& tensor);
+
     std::size_t total_allocation() const;
     std::size_t total_allocation(EAllocationType kind) const;
 

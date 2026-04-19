@@ -1326,6 +1326,12 @@ void DslModel::auto_tune_offloading() {
     }
 }
 
+void DslModel::invalidate_cuda_graphs() {
+    if (auto* exec = dynamic_cast<GraphExecutor*>(mExecutor.get())) {
+        exec->reset_cuda_graphs();
+    }
+}
+
 std::size_t DslModel::saved_buffers_total_bytes() const {
     return mExecutor ? mExecutor->saved_buffers_total_bytes() : 0;
 }
