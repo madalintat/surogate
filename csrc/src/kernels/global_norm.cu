@@ -46,7 +46,14 @@ __device__ float global_norm_squared_for_range(const T* data, size_t count) {
     size_t grid_width = blockDim.x * gridDim.x;
     float accumulator = 0.f;
     for (size_t i = index; i < count; i += grid_width) {
-        accumulator += (float)data[i] * (float)data[i];
+        // Skip NaN/Inf so a single bad gradient element (which the per-element
+        // AdamW kernel already filters via isnan/isinf and replaces with 0)
+        // can't poison the global norm and, in turn, the gnorm_scale that
+        // every finite gradient is multiplied by.
+        const float v = (float)data[i];
+        if (isfinite(v)) {
+            accumulator += v * v;
+        }
     }
 
     cooperative_groups::thread_block block = cooperative_groups::this_thread_block();
@@ -265,7 +272,9 @@ global_norm_squared_prescaled_kernel(float* out, const T* data, size_t count, co
     size_t grid_width = blockDim.x * gridDim.x;
     float accumulator = 0.f;
     for (size_t i = index; i < count; i += grid_width) {
-        float val = (float)data[i] * prescale;
+        const float raw = (float)data[i];
+        if (!isfinite(raw)) continue;  // see global_norm_squared_for_range
+        const float val = raw * prescale;
         accumulator += val * val;
     }
 
@@ -638,13 +647,17 @@ __global__ void global_norm_squared_prescaled_multi_tensor_kernel(float* __restr
         if (dtype_flags[t] == 1) {
             const auto* data = static_cast<const nv_bfloat16*>(data_ptrs[t]);
             for (size_t i = blockIdx.x * BLOCK_SIZE + threadIdx.x; i < count; i += grid_width) {
-                float val = (float)data[i] * prescale;
+                const float raw = (float)data[i];
+                if (!isfinite(raw)) continue;  // see global_norm_squared_for_range
+                const float val = raw * prescale;
                 accumulator += val * val;
             }
         } else {
             const auto* data = static_cast<const float*>(data_ptrs[t]);
             for (size_t i = blockIdx.x * BLOCK_SIZE + threadIdx.x; i < count; i += grid_width) {
-                float val = data[i] * prescale;
+                const float raw = data[i];
+                if (!isfinite(raw)) continue;  // see global_norm_squared_for_range
+                const float val = raw * prescale;
                 accumulator += val * val;
             }
         }
@@ -684,12 +697,14 @@ __global__ void global_norm_squared_multi_tensor_kernel(float* __restrict__ out,
         if (dtype_flags[t] == 1) {
             const auto* data = static_cast<const nv_bfloat16*>(data_ptrs[t]);
             for (size_t i = blockIdx.x * BLOCK_SIZE + threadIdx.x; i < count; i += grid_width) {
-                accumulator += (float)data[i] * (float)data[i];
+                const float v = (float)data[i];
+                if (isfinite(v)) accumulator += v * v;  // see global_norm_squared_for_range
             }
         } else {
             const auto* data = static_cast<const float*>(data_ptrs[t]);
             for (size_t i = blockIdx.x * BLOCK_SIZE + threadIdx.x; i < count; i += grid_width) {
-                accumulator += data[i] * data[i];
+                const float v = data[i];
+                if (isfinite(v)) accumulator += v * v;  // see global_norm_squared_for_range
             }
         }
     }

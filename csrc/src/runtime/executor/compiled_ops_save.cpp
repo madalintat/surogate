@@ -351,13 +351,12 @@ void CompiledExecutor::prepare_saved_buffers_for_capture(const std::vector<std::
             return false;
         }
         const long C = mConfig.HiddenSize;
-        const long D = mConfig.IntermediateSize;
+        const long D = mRunState.buffer_plan().layer_intermediate(layer_idx);
         const long Hq = mConfig.NumQueryHeads;
         const long Hkv = mConfig.NumKeyValHeads;
-        const long Hs = mConfig.head_size();
-        const long QKV = Hs * (Hq + 2 * Hkv);
-        const long AttnDim = Hq * Hs;
-        const long MUp = mConfig.mlp_up_rows();
+        const long QKV = mRunState.buffer_plan().layer_qkv(layer_idx);
+        const long AttnDim = mRunState.buffer_plan().layer_attn_dim(layer_idx);
+        const long MUp = mRunState.buffer_plan().layer_mlp_up(layer_idx);
 
         // `_flat` fields share the backing buffer of their 3D counterpart but
         // carry a 2D shape (B*T, innermost). Strip the suffix so the slot
@@ -1165,7 +1164,7 @@ Tensor& CompiledExecutor::resolve_tensor(const TensorRef& ref) {
             default: break;
         }
         if (base && base->Data) {
-            Tensor view = view_tensor(*base, ref.shape);
+            Tensor view = view_for_shape(*base, ref.shape, ref.name);
             if (tid >= 0) {
                 mTensors[static_cast<std::size_t>(tid)] = view;
                 return mTensors[static_cast<std::size_t>(tid)];
@@ -1350,13 +1349,13 @@ Tensor& CompiledExecutor::ensure_output_tensor(const TensorRef& ref) {
         ref.slot != TensorSlot::Saved) {
         Tensor& t = resolve_tensor(ref);
         if (t.Data) {
+            Tensor resolved = t;
             if (!ref.shape.empty()) {
-                Tensor view = view_tensor(t, ref.shape);
-                if (tid >= 0) {
-                    mTensors[static_cast<std::size_t>(tid)] = view;
-                    return mTensors[static_cast<std::size_t>(tid)];
-                }
-                return t;
+                resolved = view_for_shape(t, ref.shape, ref.name);
+            }
+            if (tid >= 0) {
+                mTensors[static_cast<std::size_t>(tid)] = resolved;
+                return mTensors[static_cast<std::size_t>(tid)];
             }
             return t;
         }

@@ -32,9 +32,8 @@ from ..mlp import MLPConfig
 
 
 GEMMA4_BLOCK_NAME_REMAP: dict[str, str] = {
-    # --- input_layernorm (fused residual + rmsnorm) -> ln1 / res_ffn ---
+    # --- input_layernorm (standalone rmsnorm) -> ln1 ---
     "input_layernorm_weight": "ln1_weight",
-    "input_layernorm_res": "res_ffn",
     "input_layernorm_y": "ln1",
     "input_layernorm_rstd": "ln1_rstd",
     # --- self_attn (Gemma4Attention) -> strip prefix ---
@@ -45,6 +44,14 @@ GEMMA4_BLOCK_NAME_REMAP: dict[str, str] = {
     "self_attn_rope_freqs": "rope_freqs",
     "self_attn_qkv": "qkv",
     "self_attn_qkv_flat": "qkv_flat",
+    "self_attn_qkv_norm": "qkv_norm",
+    "self_attn_q_rstd": "q_rstd",
+    "self_attn_k_rstd": "k_rstd",
+    "self_attn_qkv_normed_flat": "qkv_normed_flat",
+    "self_attn_qk_normed_flat": "qk_normed_flat",
+    "self_attn_v_flat_3d": "v_flat_3d",
+    "self_attn_qkv_normed_3d": "qkv_normed_3d",
+    "self_attn_qkv_normed_4d": "qkv_normed_4d",
     "self_attn_qkv_rope": "qkv_rope",
     "self_attn_att": "att",
     "self_attn_att_flat": "att_flat",
@@ -52,6 +59,16 @@ GEMMA4_BLOCK_NAME_REMAP: dict[str, str] = {
     "self_attn_att_out": "att_out",
     "self_attn_att_out_flat": "att_out_flat",
     "self_attn_x_flat": "x_flat",
+    "self_attn_ones_d": "ones_d",
+    "self_attn_q_flat": "q_flat",
+    "self_attn_q_4d": "q_4d",
+    "self_attn_q_rn_flat": "q_rn_flat",
+    "self_attn_q_normed_flat": "q_normed_flat",
+    "self_attn_q_normed": "q_normed",
+    "self_attn_kv_source_flat": "kv_source_flat",
+    "self_attn_kv_flat": "kv_flat",
+    "self_attn_kv_4d": "kv_4d",
+    "self_attn_q_roped": "q_roped",
     "self_attn_v_flat_2d": "v_flat_2d",
     "self_attn_v_normed_2d": "v_normed_2d",
     "self_attn_v_normed": "v_normed",
@@ -71,6 +88,7 @@ GEMMA4_BLOCK_NAME_REMAP: dict[str, str] = {
     "mlp_gate_flat": "mlp_gate_flat",
     "mlp_up_flat": "mlp_up_flat",
     "mlp_gate_act": "mlp_gate_act",
+    "mlp_act_flat": "swiglu_flat",
     "mlp_down_flat": "mlp_down_flat",
     "mlp_down": "mlp_down",
     # --- post_ff_layernorm (standalone rmsnorm) ---
@@ -128,10 +146,19 @@ def _sandwich_attn_phase(block, x, residual, position_ids):
     """Sandwich norm attention phase: input_ln → attn → post_attn_ln → residual add.
 
     Gemma4 uses zero residual between blocks (state flows through x, not residual).
-    We create fresh zeros to avoid stale data from cross-layer slot reuse.
+    We still materialize the incoming hidden state into the canonical
+    ``res_ffn`` slot so dumps / backward replay can read it, but the norm
+    itself must follow HF's standalone RMSNorm path.
     """
     fresh_zeros = block._zeros(["B", "T", "d_model"], name="fresh_zero")
-    residual, h = block.input_layernorm(fresh_zeros, x)
+    block._register_activation(
+        "res_ffn",
+        ("B", "T", "d_model"),
+        aliases=["residual_ffn", "res_in"],
+        share_policy="when_recomputed",
+    )
+    residual = block._add(fresh_zeros, x, name="res_ffn")
+    h = block.input_layernorm(residual)
     h = block.self_attn(h, position_ids)
     h = block.post_attn_layernorm(h)
     # Gemma4 forms the post-attention residual with a raw add instead of the
@@ -156,10 +183,13 @@ def _per_layer_input_phase(block, residual, per_layer_input):
     # Register activation slots for PLI intermediates so backward replay can
     # allocate output buffers when recomputing the forward pass.
     pli_d = block.PLI_D
+    block._register_activation("pli_h_flat", ("B * T", "C"), share_policy="always_recompute")
+    block._register_activation("pli_flat", ("B * T", pli_d), share_policy="always_recompute")
     block._register_activation("pli_gate_out", ("B * T", pli_d), share_policy="always_recompute")
     block._register_activation("pli_gate_act", ("B * T", pli_d), share_policy="always_recompute")
     block._register_activation("pli_gated", ("B * T", pli_d), share_policy="always_recompute")
     block._register_activation("pli_proj_out", ("B * T", "C"), share_policy="always_recompute")
+    block._register_activation("pli_proj_3d", ("B", "T", "C"), share_policy="always_recompute")
 
     h_flat = block._view(residual, [B * T, block.C], name="pli_h_flat")
     gate_out = block._matmul(h_flat, "pli_gate_weight", name="pli_gate_out")
@@ -514,7 +544,14 @@ class Gemma4FullBlock(nn.Block):
 def _sandwich_shared_attn_phase(block, x, residual, position_ids, kv_source):
     """Shared-KV attention: input_ln -> Q-only attn(kv_source) -> post_attn_ln -> residual."""
     fresh_zeros = block._zeros(["B", "T", "d_model"], name="fresh_zero")
-    residual, h = block.input_layernorm(fresh_zeros, x)
+    block._register_activation(
+        "res_ffn",
+        ("B", "T", "d_model"),
+        aliases=["residual_ffn", "res_in"],
+        share_policy="when_recomputed",
+    )
+    residual = block._add(fresh_zeros, x, name="res_ffn")
+    h = block.input_layernorm(residual)
     h = block.self_attn(h, position_ids, kv_source)
     h = block.post_attn_layernorm(h)
     block._register_activation("res_att", ("B", "T", "d_model"), share_policy="when_recomputed")

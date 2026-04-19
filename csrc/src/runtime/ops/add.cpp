@@ -34,6 +34,22 @@ void CompiledExecutor::dispatch_add(const CompiledOp& op) {
             mCurrentGraph->tensor_meta[static_cast<std::size_t>(op.outputs[0].tensor_id)].kind == TensorKind::AccumTemp;
     }
     const bool aliases_input = out.Data && (out.Data == a.Data || out.Data == b.Data);
+    const bool debug_h_out = []() {
+        const char* env = std::getenv("SUROGATE_DEBUG_H_OUT");
+        return env && std::string(env) != "0";
+    }();
+    if (debug_h_out && !op.outputs.empty() && op.outputs[0].name.find("h_out") != std::string::npos) {
+        std::fprintf(stderr,
+                     "[H_OUT_ADD] name=%s out=%p a=%p b=%p alias=%d accum=%d out_nelem=%zu a_nelem=%zu\n",
+                     op.outputs[0].name.c_str(),
+                     static_cast<void*>(out.Data),
+                     static_cast<void*>(a.Data),
+                     static_cast<void*>(b.Data),
+                     aliases_input ? 1 : 0,
+                     is_accum_output ? 1 : 0,
+                     static_cast<std::size_t>(out.nelem()),
+                     static_cast<std::size_t>(a.nelem()));
+    }
 
     // For element-wise add, output shape must match inputs. Reallocate when shape
     // is missing/wrong, when aliasing would make add in-place unsafe, or for
@@ -43,6 +59,13 @@ void CompiledExecutor::dispatch_add(const CompiledOp& op) {
         out = mRunState.temp_alloc(a.DType, shape);
         fill_zero(out, mRunState.MainStream);
         mTemps.push_back(out);
+        if (debug_h_out && !op.outputs.empty() && op.outputs[0].name.find("h_out") != std::string::npos) {
+            std::fprintf(stderr,
+                         "[H_OUT_ADD] temp name=%s out=%p shape_nelem=%zu\n",
+                         op.outputs[0].name.c_str(),
+                         static_cast<void*>(out.Data),
+                         static_cast<std::size_t>(out.nelem()));
+        }
     }
 
     vector_add_sr(out, a, b, 1.0f, static_cast<long>(a.nelem()), 0, mRunState.MainStream);

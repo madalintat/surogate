@@ -47,6 +47,7 @@ void CompiledExecutor::dispatch_rmsnorm(const CompiledOp& op) {
     }
 
     rmsnorm_forward(y, rstd, x, weight, /*abs_max_ptr=*/nullptr, eps, total_rows, 1, C, mRunState.MainStream);
+    store_tensor(op.outputs[0], y);
     store_tensor(op.outputs[1], rstd);
 }
 

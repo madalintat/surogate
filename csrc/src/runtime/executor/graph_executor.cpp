@@ -8,6 +8,7 @@
 #include "runtime/dsl/buffer_plan.h"
 #include "runtime/executor/compiled_ops.h"
 #include "runtime/dsl/dsl_runtime.h"
+#include "runtime/dsl/tensor_slot_dispatch.h"
 #include "runtime/dsl/dsl_weight_manager.h"
 #include "runtime/executor/graph_executor_internal.h"
 #include "runtime/executor/graph_executor_tensors.h"
@@ -663,23 +664,169 @@ void GraphExecutor::init_compiled_execution() {
     mCompiledExecutor->set_rng_seed_fn([this]() { return next_rng_seed(); });
     mCompiledExecutor->set_embedding_outputs(mEmbeddingOutputs);
     mCompiledExecutor->set_slot_registry(&mCompiler->slot_registry());
-    // Wire up debug dump callback (used by ops for non-finite diagnostics).
-    mCompiledExecutor->set_debug_dump_fn([this](const std::vector<std::string>& names, int /*layer_idx*/) {
-        static const char* dir_env = std::getenv("SUROGATE_DEBUG_DUMP_DIR");
-        if (!dir_env || !*dir_env) {
-            return;
+    auto resolve_debug_dump_tensor = [this](const std::string& name) -> std::optional<Tensor> {
+        const bool debug_dump_resolve = []() {
+            const char* env = std::getenv("SUROGATE_DEBUG_DUMP_RESOLVE");
+            return env && std::string(env) != "0";
+        }();
+        auto log_debug_dump_choice = [&](const char* branch, const Tensor& t) {
+            if (!debug_dump_resolve) {
+                return;
+            }
+            if (name != "xF" && name != "ln_final" && name != "xF_flat" && name != "residual_final" &&
+                name != "final_residual" && name != "xN" && name != "residualN") {
+                return;
+            }
+            std::fprintf(stderr,
+                         "[DUMP_RESOLVE] name=%s branch=%s ptr=%p rank=%d sizes=[%ld,%ld,%ld,%ld]\n",
+                         name.c_str(),
+                         branch,
+                         t.Data,
+                         t.Rank,
+                         t.Sizes[0],
+                         t.Sizes[1],
+                         t.Sizes[2],
+                         t.Sizes[3]);
+        };
+        auto make_flat_view = [](Tensor t) -> Tensor {
+            if (t.Rank >= 3) {
+                return view_tensor(t, {t.Sizes[0] * t.Sizes[1], t.Sizes[2]});
+            }
+            return t;
+        };
+        auto resolve_last_block_output = [this]() -> std::optional<Tensor> {
+            if (mConfig.NumLayers <= 0) {
+                return std::nullopt;
+            }
+            const int last_layer = mConfig.NumLayers - 1;
+            const auto& acts = mRunState.simplified_acts(last_layer);
+            if (acts.h_out.Data) {
+                return acts.h_out;
+            }
+            if (acts.mlp_down.Data) {
+                return acts.mlp_down;
+            }
+            if (acts.residual_att.Data) {
+                return acts.residual_att;
+            }
+            return std::nullopt;
+        };
+
+        const auto maybe_rope = [&](std::string_view probe) -> std::optional<Tensor> {
+            if (probe.find("rope_freqs") != std::string_view::npos ||
+                probe.find("freq_cis") != std::string_view::npos) {
+                Tensor t = mRunState.rope_freqs(name);
+                if (t.Data) {
+                    log_debug_dump_choice("rope", t);
+                    return t;
+                }
+            }
+            return std::nullopt;
+        };
+        if (const Tensor* t = mCompiledExecutor->try_get_tensor(name); t && t->Data) {
+            log_debug_dump_choice("direct", *t);
+            return *t;
         }
-        CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
-        for (const auto& name : names) {
-            const Tensor* t = mCompiledExecutor->try_get_tensor_fuzzy(name);
-            if (t && t->Data) {
-                debug_dump_tensor(name, *t, std::string(dir_env), mRunState.MainStream);
+
+        std::string lookup_name = name;
+        const bool is_grad_block_name = starts_with(name, "d_blocks[");
+        if (is_grad_block_name) {
+            lookup_name = name.substr(2);
+        }
+
+        int layer_idx = -1;
+        std::string field;
+        if (parse_block_param(lookup_name, layer_idx, field)) {
+            if (auto rope = maybe_rope(field)) {
+                return rope;
+            }
+
+            std::string base_field = strip_ssa_suffix(field);
+            bool is_flat = false;
+            if (base_field.size() >= 5 && base_field.compare(base_field.size() - 5, 5, "_flat") == 0) {
+                base_field = base_field.substr(0, base_field.size() - 5);
+                is_flat = true;
+            }
+
+            // For backward names like "d_blocks[N].h_out", prepend "d_" to the
+            // field so we look up the gradient slot (BlockDHOut) in the registry
+            // instead of the activation slot (BlockHOut) — block_gradient_ptr
+            // only handles BlockD* slots.
+            const std::string slot_lookup = is_grad_block_name ? ("d_" + base_field) : base_field;
+            const TensorSlot slot = builtin_slot_from_name(slot_lookup);
+            if (slot != TensorSlot::Mapped) {
+                Tensor* base = is_grad_block_name ? block_gradient_ptr(mRunState, layer_idx, slot)
+                                                  : block_activation_ptr(mRunState, layer_idx, slot);
+                if (base && base->Data) {
+                    Tensor resolved = *base;
+                    if (is_flat) {
+                        resolved = make_flat_view(resolved);
+                    }
+                    log_debug_dump_choice(is_grad_block_name ? "block_grad_slot" : "block_slot", resolved);
+                    return resolved;
+                }
+            }
+        } else {
+            if (auto rope = maybe_rope(name)) {
+                return rope;
+            }
+
+            std::string base_name = strip_ssa_suffix(name);
+            bool is_flat = false;
+            if ((base_name == "xN" || base_name == "residualN" || base_name == "residual0" ||
+                 base_name == "residual_final" || base_name == "final_residual") &&
+                !is_grad_block_name) {
+                if (auto last = resolve_last_block_output()) {
+                    Tensor resolved = *last;
+                    if (base_name.size() >= 5 && base_name.compare(base_name.size() - 5, 5, "_flat") == 0) {
+                        resolved = make_flat_view(resolved);
+                    }
+                    log_debug_dump_choice("last_block_output", resolved);
+                    return resolved;
+                }
+            }
+            TensorSlot slot = builtin_slot_from_name(base_name);
+            if (slot == TensorSlot::Mapped && base_name.size() >= 5 &&
+                base_name.compare(base_name.size() - 5, 5, "_flat") == 0) {
+                base_name = base_name.substr(0, base_name.size() - 5);
+                slot = builtin_slot_from_name(base_name);
+                is_flat = true;
+            }
+            if (slot != TensorSlot::Mapped && slot != TensorSlot::FreqCis) {
+                if (Tensor* base = global_activation_ptr(mRunState, slot); base && base->Data) {
+                    Tensor resolved = *base;
+                    if (is_flat) {
+                        resolved = make_flat_view(resolved);
+                    }
+                    log_debug_dump_choice("global_slot", resolved);
+                    return resolved;
+                }
             }
         }
-    });
-    // Per-layer dump callback: dump block-prefixed tensors at layer boundaries
+        if (const Tensor* t = mCompiledExecutor->try_get_tensor_fuzzy(name); t && t->Data) {
+            log_debug_dump_choice("fuzzy", *t);
+            return *t;
+        }
+        return std::nullopt;
+    };
+
+    // Wire up debug dump callback (used by ops for non-finite diagnostics).
+    mCompiledExecutor->set_debug_dump_fn(
+        [this, resolve_debug_dump_tensor](const std::vector<std::string>& names, int /*layer_idx*/) {
+            static const char* dir_env = std::getenv("SUROGATE_DEBUG_DUMP_DIR");
+            if (!dir_env || !*dir_env) {
+                return;
+            }
+            CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
+            for (const auto& name : names) {
+                if (auto t = resolve_debug_dump_tensor(name); t.has_value() && t->Data) {
+                    debug_dump_tensor(name, *t, std::string(dir_env), mRunState.MainStream);
+                }
+            }
+        });
+    // Per-layer forward dump callback: dump block-prefixed tensors at layer boundaries
     // (before shared activation buffers are overwritten by the next layer).
-    mCompiledExecutor->set_debug_dump_layer_fn([this](int layer_idx) {
+    mCompiledExecutor->set_debug_dump_layer_fn([this, resolve_debug_dump_tensor](int layer_idx) {
         static const char* dump_tensors_env = std::getenv("SUROGATE_DEBUG_DUMP_TENSORS");
         // Parse the (static, immutable) tensor list once — the layer hook fires
         // 70–700× per multi-step run and re-splitting the comma-separated env on
@@ -691,13 +838,9 @@ void GraphExecutor::init_compiled_execution() {
         if (!dump_tensors_env || !dump_dir_env || !*dump_tensors_env || !*dump_dir_env) {
             return;
         }
-        // Forward block tensors use "blocks[N]." prefix; backward gradient
-        // tensors use "d_blocks[N]." prefix. Accept both so the same hook
-        // serves forward activations and backward intermediates.
         const std::string fwd_prefix = "blocks[" + std::to_string(layer_idx) + "].";
-        const std::string bwd_prefix = "d_blocks[" + std::to_string(layer_idx) + "].";
         auto matches_this_layer = [&](const std::string& n) {
-            return n.rfind(fwd_prefix, 0) == 0 || n.rfind(bwd_prefix, 0) == 0;
+            return n.rfind(fwd_prefix, 0) == 0;
         };
         bool found = false;
         for (const auto& name : tensor_names) {
@@ -714,8 +857,37 @@ void GraphExecutor::init_compiled_execution() {
             if (!matches_this_layer(name)) {
                 continue;
             }
-            const Tensor* t = mCompiledExecutor->try_get_tensor_fuzzy(name);
-            if (t && t->Data) {
+            if (auto t = resolve_debug_dump_tensor(name); t.has_value() && t->Data) {
+                debug_dump_tensor(name, *t, std::string(dump_dir_env), mRunState.MainStream);
+            }
+        }
+    });
+    // Backward layer dumps are separate so forward files don't get overwritten
+    // during trainer.step().
+    mCompiledExecutor->set_debug_dump_backward_layer_fn([this, resolve_debug_dump_tensor](int layer_idx) {
+        static const char* dump_tensors_env = std::getenv("SUROGATE_DEBUG_DUMP_TENSORS");
+        static const std::vector<std::string> tensor_names = debug_dump_parse_tensor_list(dump_tensors_env);
+        const char* dump_dir_env = std::getenv("SUROGATE_DEBUG_DUMP_DIR");
+        if (!dump_tensors_env || !dump_dir_env || !*dump_tensors_env || !*dump_dir_env) {
+            return;
+        }
+        const std::string bwd_prefix = "d_blocks[" + std::to_string(layer_idx) + "].";
+        bool found = false;
+        for (const auto& name : tensor_names) {
+            if (name.rfind(bwd_prefix, 0) == 0) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            return;
+        }
+        CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
+        for (const auto& name : tensor_names) {
+            if (name.rfind(bwd_prefix, 0) != 0) {
+                continue;
+            }
+            if (auto t = resolve_debug_dump_tensor(name); t.has_value() && t->Data) {
                 debug_dump_tensor(name, *t, std::string(dump_dir_env), mRunState.MainStream);
             }
         }

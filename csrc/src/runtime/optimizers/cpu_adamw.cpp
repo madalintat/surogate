@@ -126,21 +126,30 @@ double cpu_gradient_norm_squared(const std::unordered_map<std::string, Tensor>& 
         infos.push_back({it->second.Data, static_cast<std::size_t>(it->second.nelem()), it->second.DType});
     }
 
-    // Per-parameter norm in parallel, reduce sequentially
+    // Per-parameter norm in parallel, reduce sequentially. NaN/Inf elements
+    // are skipped so a single bad gradient can't poison the global norm —
+    // the per-element AdamW step already filters those to zero-update, so
+    // excluding them here keeps `gnorm_scale` finite for the remaining
+    // good gradients.
     for (const auto& info : infos) {
         double param_norm = 0.0;
         if (info.dtype == ETensorDType::FP32) {
             const auto* d = static_cast<const float*>(info.data);
 #pragma omp parallel for reduction(+ : param_norm) schedule(static)
             for (std::size_t i = 0; i < info.nelem; ++i) {
-                param_norm += static_cast<double>(d[i]) * static_cast<double>(d[i]);
+                const float v = d[i];
+                if (std::isfinite(v)) {
+                    param_norm += static_cast<double>(v) * static_cast<double>(v);
+                }
             }
         } else if (info.dtype == ETensorDType::BF16) {
             const auto* d = reinterpret_cast<const nv_bfloat16*>(info.data);
 #pragma omp parallel for reduction(+ : param_norm) schedule(static)
             for (std::size_t i = 0; i < info.nelem; ++i) {
-                const double val = static_cast<double>(static_cast<float>(d[i]));
-                param_norm += val * val;
+                const float val = static_cast<float>(d[i]);
+                if (std::isfinite(val)) {
+                    param_norm += static_cast<double>(val) * static_cast<double>(val);
+                }
             }
         }
         total += param_norm;

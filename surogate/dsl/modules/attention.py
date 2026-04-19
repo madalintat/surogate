@@ -1277,13 +1277,20 @@ class Gemma4SharedKVAttention(Module):
 
         # Q-norm: direct weight scale (Gemma4 stores the full scale, no +1 offset)
         q_rn_flat = g.view(
-            q, shape=[B * T * self.num_query_heads, self.head_size], out_name=tracer.prefixed("q_rn_flat")
+            q,
+            shape=[B * T * self.num_query_heads, self.head_size],
+            out_name=tracer.prefixed("q_rn_flat"),
         )
         q_normed_flat, _ = g.rmsnorm(
-            q_rn_flat, tracer.prefixed("q_norm_weight"), eps=self.eps, y_name=tracer.prefixed("q_normed_flat")
+            q_rn_flat,
+            tracer.prefixed("q_norm_weight"),
+            eps=self.eps,
+            y_name=tracer.prefixed("q_normed_flat"),
         )
         q_normed = g.view(
-            q_normed_flat, shape=[B, T, self.num_query_heads, self.head_size], out_name=tracer.prefixed("q_normed")
+            q_normed_flat,
+            shape=[B, T, self.num_query_heads, self.head_size],
+            out_name=tracer.prefixed("q_normed"),
         )
 
         # Extract K,V from kv_source. Use dimension sizes (not head counts)

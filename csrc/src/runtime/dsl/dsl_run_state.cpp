@@ -844,7 +844,9 @@ void DslRunState::allocate_simplified_gradients(const PretrainedConfig& cfg) {
             mSharedDAttOut = mSharedDResAtt;
         }
         mSharedDLn2 = mAllocator->allocate(dtype, "d_ln2_shared", kind, {B, T, C});
-        mSharedDAtt = mAllocator->allocate(dtype, "d_att_shared", kind, {B, T, AttnDim});
+        if (plan.share_d_att) {
+            mSharedDAtt = mAllocator->allocate(dtype, "d_att_shared", kind, {B, T, AttnDim});
+        }
         mSharedDLn1 = mAllocator->allocate(dtype, "d_ln1_shared", kind, {B, T, C});
     }
 
@@ -887,7 +889,7 @@ void DslRunState::allocate_simplified_gradients(const PretrainedConfig& cfg) {
         // separate from MLP's d_mlp_down so the backward chain doesn't
         // collide across the MLP / _finalize split).
         g.d_h_out = mAllocator->allocate(dtype, "d_h_out", kind, {B, T, C});
-        g.d_att = plan.share_grads ? mSharedDAtt : mAllocator->allocate(dtype, "d_att", kind, {B, T, lAttnDim});
+        g.d_att = plan.share_d_att ? mSharedDAtt : mAllocator->allocate(dtype, "d_att", kind, {B, T, lAttnDim});
         g.d_ln1 = plan.share_grads ? mSharedDLn1 : mAllocator->allocate(dtype, "d_ln1", kind, {B, T, C});
     }
 

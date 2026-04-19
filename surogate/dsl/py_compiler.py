@@ -863,8 +863,43 @@ def _inline_stacked_blocks(
 
     new_nodes: list[OpIR] = []
     new_params: dict[str, TensorRef] = dict(graph.params)
+    new_intermediates: dict[str, TensorRef] = {}
     new_save: list[str] = []
     op_id = 0
+
+    def _has_shape(ref: TensorRef | None) -> bool:
+        return ref is not None and bool(ref.shape)
+
+    def _pick_ref(*refs: TensorRef | None) -> TensorRef | None:
+        for ref in refs:
+            if _has_shape(ref):
+                return ref
+        for ref in refs:
+            if ref is not None:
+                return ref
+        return None
+
+    def _copy_ref(src: TensorRef, *, name: str) -> TensorRef:
+        return TensorRef(
+            dtype=src.dtype,
+            shape=list(src.shape) if src.shape is not None else [],
+            is_param=False,
+            is_input=False,
+            is_output=False,
+        )
+
+    def _remember_intermediate(name: str, src: TensorRef | None) -> None:
+        if name in graph.inputs or name in new_params or name in graph.outputs:
+            return
+        existing = new_intermediates.get(name)
+        if existing is not None:
+            if not _has_shape(existing) and _has_shape(src):
+                new_intermediates[name] = _copy_ref(src, name=name)
+            return
+        if src is not None:
+            new_intermediates[name] = _copy_ref(src, name=name)
+            return
+        new_intermediates[name] = TensorRef(shape=[], is_param=False, is_input=False, is_output=False)
 
     for node in graph.nodes:
         if node.name not in ("StackedBlocks", "HybridStackedBlocks"):
@@ -879,6 +914,8 @@ def _inline_stacked_blocks(
                     attrs=dict(node.attrs),
                 )
             )
+            for out in node.outputs:
+                _remember_intermediate(out, graph.intermediates.get(out) or graph.outputs.get(out))
             continue
 
         n_layers = node.attrs.get("n_layers") or config.get("n_layers")
@@ -986,19 +1023,20 @@ def _inline_stacked_blocks(
 
                 blocks_param = block_type_to_param[block_type]
 
-                # Outputs for this layer
-                if layer_idx == int(n_layers) - 1:
-                    layer_outputs = list(node.outputs)
-                else:
-                    # Residual outputs need blocks[N].* prefix so the C++ residual
-                    # manager intercepts them.  Non-residual outputs (hidden state)
-                    # use a neutral name to avoid the block-activation resolver.
-                    layer_outputs = [
-                        f"blocks[{layer_idx}].{name}"
-                        if name in ("res_in", "res_ffn", "res_att", "mlp_down", "h_out")
-                        else f"layer{layer_idx}.{name}"
-                        for name in block_outputs
-                    ]
+                # Always materialize the block's own outputs under their
+                # per-layer internal names, even for the final layer. The last
+                # layer still needs canonical block slots like `blocks[N].h_out`
+                # for dumps / backward replay; we alias those internal outputs
+                # to the enclosing graph outputs after inlining the block.
+                # Residual outputs need blocks[N].* prefix so the C++ residual
+                # manager intercepts them. Non-residual outputs (hidden state)
+                # use a neutral name to avoid the block-activation resolver.
+                layer_outputs = [
+                    f"blocks[{layer_idx}].{name}"
+                    if name in ("res_in", "res_ffn", "res_att", "mlp_down", "h_out")
+                    else f"layer{layer_idx}.{name}"
+                    for name in block_outputs
+                ]
 
                 # Build name mapping — use physical layer index with uniform "blocks[N]"
                 # prefix so the C++ parse_block_param (which expects "blocks[N]") works.
@@ -1025,7 +1063,6 @@ def _inline_stacked_blocks(
                 pli_needs_slice = bool(pli_tensor_ref and pli_block_name in block_inputs)
                 pli_slice_emitted = False
                 narrow_out = f"pli_narrow_layer{layer_idx}"
-                pli_slice_name = f"pli_slice_layer{layer_idx}"
 
                 # KV sharing: wire kv_source to the source layer's qkv_rope
                 if layer_idx in kv_sharing_map and "kv_source" in block_inputs:
@@ -1046,25 +1083,14 @@ def _inline_stacked_blocks(
                                 attrs={"dim": 2, "start": layer_idx, "length": 1},
                             )
                         )
-                        op_id += 1
-                        new_nodes.append(
-                            OpIR(
-                                id=op_id,
-                                name=f"view_pli_{layer_idx}",
-                                kernel_type="view",
-                                inputs=[narrow_out],
-                                outputs=[pli_slice_name],
-                                # narrow dim=2 produced [B, T, 1, PLI_D]; collapse the
-                                # singleton to [B, T, PLI_D]. Without this, shape
-                                # inference defaults to [1] and backward replay
-                                # misinterprets the saved activation.
-                                attrs={"shape": ["B", "T", "PLI_D"]},
-                            )
+                        _remember_intermediate(
+                            narrow_out,
+                            TensorRef(shape=["B", "T", 1, "PLI_D"], is_param=False, is_input=False),
                         )
-                        mapping[pli_block_name] = pli_slice_name
-                        # Save PLI narrow+view outputs for backward replay.
-                        new_save.append(narrow_out)
-                        new_save.append(pli_slice_name)
+                        # Feed the block directly from the copied [B,T,1,PLI_D]
+                        # slice. The block immediately views it to [B*T, PLI_D],
+                        # so we do not need an extra aliasing view here.
+                        mapping[pli_block_name] = narrow_out
                         pli_slice_emitted = True
                     op_id += 1
                     mapped_inputs = [mapping.get(i, f"{prefix}{i}") for i in bnode.inputs]
@@ -1079,6 +1105,37 @@ def _inline_stacked_blocks(
                             attrs=dict(bnode.attrs),
                         )
                     )
+                    for src_out, mapped_out in zip(bnode.outputs, mapped_outputs):
+                        _remember_intermediate(
+                            mapped_out,
+                            _pick_ref(block_graph.outputs.get(src_out), block_graph.intermediates.get(src_out)),
+                        )
+
+                if layer_idx == int(n_layers) - 1:
+                    for b_out, internal_out, final_out in zip(block_outputs, layer_outputs, node.outputs):
+                        if internal_out == final_out:
+                            continue
+                        final_ref = _pick_ref(
+                            graph.outputs.get(final_out),
+                            block_graph.outputs.get(b_out),
+                            graph.intermediates.get(final_out),
+                            block_graph.intermediates.get(b_out),
+                        )
+                        view_attrs: dict[str, object] = {}
+                        if final_ref and final_ref.shape:
+                            view_attrs["shape"] = list(final_ref.shape)
+                        op_id += 1
+                        new_nodes.append(
+                            OpIR(
+                                id=op_id,
+                                name=f"alias_final_{layer_idx}_{b_out}",
+                                kernel_type="view",
+                                inputs=[internal_out],
+                                outputs=[final_out],
+                                attrs=view_attrs,
+                            )
+                        )
+                        _remember_intermediate(final_out, final_ref)
 
                 # Merge block's save_list into model's save_list with layer prefix
                 for save_name in getattr(block_graph, "save_list", []) or []:
@@ -1121,11 +1178,11 @@ def _inline_stacked_blocks(
             deepstack_layers = int(node.attrs.get("deepstack_layers", 0)) if node.attrs else 0
 
             for layer_idx in range(int(n_layers)):
-                # Outputs for this layer
-                if layer_idx == int(n_layers) - 1:
-                    layer_outputs = list(node.outputs)
-                else:
-                    layer_outputs = [f"{blocks_param}[{layer_idx}].{name}" for name in block_outputs]
+                # Keep the final block's canonical per-layer outputs as
+                # `blocks[N].*` too, then alias them to the outer graph outputs
+                # after inlining. This mirrors the HybridStackedBlocks path and
+                # avoids losing the final layer's block-level slots.
+                layer_outputs = [f"{blocks_param}[{layer_idx}].{name}" for name in block_outputs]
 
                 # Build name mapping
                 prefix = f"{blocks_param}[{layer_idx}]."
@@ -1154,6 +1211,37 @@ def _inline_stacked_blocks(
                             attrs=dict(bnode.attrs),
                         )
                     )
+                    for src_out, mapped_out in zip(bnode.outputs, mapped_outputs):
+                        _remember_intermediate(
+                            mapped_out,
+                            _pick_ref(block_graph.outputs.get(src_out), block_graph.intermediates.get(src_out)),
+                        )
+
+                if layer_idx == int(n_layers) - 1:
+                    for b_out, internal_out, final_out in zip(block_outputs, layer_outputs, node.outputs):
+                        if internal_out == final_out:
+                            continue
+                        final_ref = _pick_ref(
+                            graph.outputs.get(final_out),
+                            block_graph.outputs.get(b_out),
+                            graph.intermediates.get(final_out),
+                            block_graph.intermediates.get(b_out),
+                        )
+                        view_attrs: dict[str, object] = {}
+                        if final_ref and final_ref.shape:
+                            view_attrs["shape"] = list(final_ref.shape)
+                        op_id += 1
+                        new_nodes.append(
+                            OpIR(
+                                id=op_id,
+                                name=f"alias_final_{layer_idx}_{b_out}",
+                                kernel_type="view",
+                                inputs=[internal_out],
+                                outputs=[final_out],
+                                attrs=view_attrs,
+                            )
+                        )
+                        _remember_intermediate(final_out, final_ref)
 
                 # Inject deepstack visual embeddings after the layer output (first N layers only)
                 if deepstack_layers > 0 and extra_inputs:
@@ -1175,15 +1263,6 @@ def _inline_stacked_blocks(
                 # Next layer inputs
                 cur_inputs = list(layer_outputs[: len(block_inputs) - 1])
                 cur_inputs.append(position_ids_input)  # position_ids stays constant
-
-    # Rebuild intermediates
-    new_intermediates: dict[str, TensorRef] = {}
-    for op in new_nodes:
-        for out in op.outputs:
-            if out in graph.inputs or out in new_params or out in graph.outputs:
-                continue
-            if out not in new_intermediates:
-                new_intermediates[out] = TensorRef(shape=[], is_param=False, is_input=False, is_output=False)
 
     graph.nodes = new_nodes
     graph.params = new_params

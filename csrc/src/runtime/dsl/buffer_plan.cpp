@@ -51,14 +51,26 @@ BufferPlan BufferPlan::build(const PretrainedConfig& cfg,
     p.MUp = static_cast<long>(resolve_mlp_up_factor(cfg)) * p.M;
     p.NumLayers = cfg.NumLayers;
 
-    // Hybrid: max dims across all layers drive shared-buffer sizing.
+    bool uniform_qkv = true;
+    bool uniform_attn = true;
+    bool uniform_intermediate = true;
+    bool uniform_mlp_up = true;
+
+    // Hybrid: max dims across all layers drive shared-buffer sizing, but
+    // shape-sharing is only safe when every participating layer agrees on the
+    // logical extent of the slot.
     p.per_layer_dims = runtime_config.per_layer_dims;
     if (!p.per_layer_dims.empty()) {
+        const auto& first = p.per_layer_dims.front();
         for (const auto& pld : p.per_layer_dims) {
             p.QKV = std::max(p.QKV, pld.qkv_channels);
             p.AttnDim = std::max(p.AttnDim, pld.attn_dim);
             p.M = std::max(p.M, pld.intermediate);
             p.MUp = std::max(p.MUp, pld.mlp_up);
+            uniform_qkv = uniform_qkv && pld.qkv_channels == first.qkv_channels;
+            uniform_attn = uniform_attn && pld.attn_dim == first.attn_dim;
+            uniform_intermediate = uniform_intermediate && pld.intermediate == first.intermediate;
+            uniform_mlp_up = uniform_mlp_up && pld.mlp_up == first.mlp_up;
         }
     }
     p.kv_source_layers = runtime_config.kv_source_layers;
@@ -105,6 +117,24 @@ BufferPlan BufferPlan::build(const PretrainedConfig& cfg,
     p.share_mlp_down = share_for(builtin_slot_name(TensorSlot::BlockMLPDown));
     p.share_qk_rstd = p.use_qk_norm && share_for(builtin_slot_name(TensorSlot::BlockQRSTD));
 
+    // Hybrid models may interleave blocks with different logical activation
+    // widths (Gemma4 sliding vs full attention, Nemotron-H variants, ...).
+    // Tensor views are contiguous-only, so a max-sized shared backing buffer
+    // cannot safely masquerade as a smaller [B,T,dim] tensor. Disable sharing
+    // for any slot whose per-layer trailing dimension varies.
+    if (!uniform_qkv) {
+        p.share_qkv = false;
+    }
+    if (!uniform_attn) {
+        p.share_att = false;
+    }
+    if (!uniform_mlp_up) {
+        p.share_mlp_up = false;
+    }
+    if (!uniform_intermediate) {
+        p.share_swiglu = false;
+    }
+
     // ---------------- FFN temps on stack ----------------
     // Only safe when both mlp_up and swiglu are recomputable — otherwise the
     // backward pass can't reconstruct them and we'd have to fall back to
@@ -117,10 +147,11 @@ BufferPlan BufferPlan::build(const PretrainedConfig& cfg,
     // Separate per-layer qkv_rope whenever recompute is on and QK-norm is
     // used; the shared buffer exists only in LoRA mode (one layer at a time).
     p.need_separate_qkv_rope = p.recompute_enabled && p.use_qk_norm;
-    p.allocate_shared_qkv_rope = p.lora_only && p.recompute_enabled && p.use_qk_norm;
+    p.allocate_shared_qkv_rope = p.lora_only && p.recompute_enabled && p.use_qk_norm && uniform_qkv;
 
     // ---------------- Gradient sharing ----------------
     p.share_grads = p.recompute_enabled;
+    p.share_d_att = p.share_grads && uniform_attn;
     // d_res_ffn sharing stays off: zero_activation_gradients() zeroes every
     // layer's d_res_ffn at backward start, so an alternating shared pair
     // would destroy the loss gradient of layer N when zeroing layer N-2.

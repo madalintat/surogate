@@ -19,12 +19,18 @@ const std::unordered_map<std::string, TensorSlot> kSlotMappings = {
     // Block activations
     {"ln1", TensorSlot::BlockLN1},
     {"ln1_flat", TensorSlot::BlockLN1},
+    // Matmul backward / LoRA backward often save the flattened normalized
+    // input under `x_flat`; treat it as a flat view of ln1 so recompute/share
+    // policy follows the underlying normalized activation.
+    {"x_flat", TensorSlot::BlockLN1},
     {"ln1_rstd", TensorSlot::BlockLN1RSTD},
     {"ln", TensorSlot::BlockLN1},           // Alias for single-norm blocks (Mamba, MLP)
     {"ln_flat", TensorSlot::BlockLN1},      // Alias for single-norm blocks
     {"ln_rstd", TensorSlot::BlockLN1RSTD},  // Alias for single-norm blocks
     {"ln2", TensorSlot::BlockLN2},
     {"ln2_flat", TensorSlot::BlockLN2},
+    // Same for the MLP input view: `mlp_x_flat` is the flattened ln2 output.
+    {"mlp_x_flat", TensorSlot::BlockLN2},
     {"ln2_rstd", TensorSlot::BlockLN2RSTD},
     {"q_rstd", TensorSlot::BlockQRSTD},
     {"k_rstd", TensorSlot::BlockKRSTD},
@@ -264,6 +270,21 @@ std::optional<TensorSlotRegistry::SlotEntry> TensorSlotRegistry::lookup(const st
     auto it = mRegistry.find(name);
     if (it != mRegistry.end()) {
         return it->second;
+    }
+    // Some runtime-only tensor names are flat views of canonical DSL slots
+    // (`x_flat` -> ln1, `mlp_x_flat` -> ln2, ...). They intentionally don't
+    // appear in the Python activation layout because their logical shape is a
+    // 2D view of a 3D slot, but policy decisions (shared vs per-layer,
+    // recompute vs persist) must still follow the backing slot.
+    const TensorSlot builtin = builtin_slot_from_name(name);
+    if (builtin != TensorSlot::Mapped) {
+        const char* canonical = builtin_slot_name(builtin);
+        if (canonical && name != canonical) {
+            auto canonical_it = mRegistry.find(canonical);
+            if (canonical_it != mRegistry.end()) {
+                return canonical_it->second;
+            }
+        }
     }
     return std::nullopt;
 }

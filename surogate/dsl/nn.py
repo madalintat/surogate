@@ -348,7 +348,7 @@ class Module:
         tracer = _current_tracer.get()
         g = tracer.graph
         out_name = name or g._fresh_name("mul")
-        ref = g.mul(a.ref, b.ref)
+        ref = g.mul(a.ref, b.ref, out_name=out_name)
         return Proxy(out_name, ref)
 
     @staticmethod

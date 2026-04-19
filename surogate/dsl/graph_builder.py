@@ -726,6 +726,7 @@ class GraphBuilder:
         *,
         split_size: int | Sequence[int],
         dim: int = 0,
+        out_names: Sequence[str] | None = None,
     ) -> tuple[GraphRef, ...]:
         """Split tensor along dimension."""
         if isinstance(split_size, int):
@@ -734,7 +735,12 @@ class GraphBuilder:
         else:
             num_outputs = len(split_size)
 
-        outputs = [self._fresh_name("split") for _ in range(num_outputs)]
+        if out_names is not None:
+            if len(out_names) != num_outputs:
+                raise ValueError(f"split expected {num_outputs} output names, got {len(out_names)}")
+            outputs = list(out_names)
+        else:
+            outputs = [self._fresh_name("split") for _ in range(num_outputs)]
         self._add_node(
             GraphNode(
                 op="split",
@@ -795,6 +801,7 @@ class GraphBuilder:
         *tensors: str | GraphRef,
         dim: int = 0,
         split_size: list[int] | None = None,
+        out_name: str | None = None,
     ) -> GraphRef:
         """Concatenate tensors along dimension.
 
@@ -802,7 +809,7 @@ class GraphBuilder:
             split_size: Optional partition sizes for backward (split).
                         Required for hybrid models where per-layer dims differ.
         """
-        out = self._fresh_name("concat")
+        out = out_name if out_name else self._fresh_name("concat")
         attrs: dict = {"dim": dim}
         if split_size is not None:
             attrs["split_size"] = split_size
@@ -844,9 +851,9 @@ class GraphBuilder:
         )
         return self._make_output(out)
 
-    def mul(self, a: str | GraphRef, b: str | GraphRef) -> GraphRef:
+    def mul(self, a: str | GraphRef, b: str | GraphRef, *, out_name: str | None = None) -> GraphRef:
         """Element-wise multiplication."""
-        out = self._fresh_name("mul")
+        out = out_name if out_name else self._fresh_name("mul")
         self._add_node(
             GraphNode(
                 op="mul",
@@ -969,9 +976,10 @@ class GraphBuilder:
         *,
         shape: Sequence[ShapeDim],
         dtype: str = "bf16",
+        out_name: str | None = None,
     ) -> GraphRef:
         """Create one-filled tensor."""
-        out = self._fresh_name("ones")
+        out = out_name if out_name else self._fresh_name("ones")
         self._add_node(
             GraphNode(
                 op="ones",
